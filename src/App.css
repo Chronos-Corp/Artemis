@@ -1,0 +1,397 @@
+:root {
+  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  color: #171717;
+  background-color: #f6f6f6;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+.app-header {
+  padding: 0.75rem 1.25rem 0.5rem;
+  border-bottom: 1px solid #dcdcdc;
+}
+
+.app-header h1 {
+  margin: 0;
+  font-size: 1.4rem;
+  letter-spacing: 0.03em;
+}
+
+.tagline {
+  margin: 0.15rem 0 0;
+  font-size: 0.85rem;
+  color: #666;
+}
+
+.status-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.5rem 1.25rem;
+  border-bottom: 1px solid #dcdcdc;
+  flex-wrap: wrap;
+}
+
+.status-items {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  flex: 1;
+}
+
+.status-pill {
+  font-size: 0.75rem;
+  padding: 0.2rem 0.55rem;
+  border-radius: 999px;
+  background: #e8e8e8;
+  color: #444;
+}
+
+.status-pill.ok {
+  background: #d9f2e3;
+  color: #146c3f;
+}
+
+.status-pill.bad {
+  background: #f7dede;
+  color: #9c2b2b;
+}
+
+.sync-results {
+  width: 100%;
+  font-size: 0.75rem;
+  margin-top: 0.35rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.sync-ok {
+  color: #146c3f;
+}
+
+.sync-error {
+  color: #9c2b2b;
+}
+
+.breadcrumb {
+  padding: 0.4rem 1.25rem;
+  font-size: 0.85rem;
+  border-bottom: 1px solid #dcdcdc;
+  background: #fafafa;
+}
+
+.breadcrumb-up,
+.breadcrumb-segment {
+  background: none;
+  border: none;
+  box-shadow: none;
+  padding: 0.1rem 0.3rem;
+  font-size: 0.85rem;
+  color: #396cd8;
+}
+
+.breadcrumb-up:hover,
+.breadcrumb-segment:hover {
+  text-decoration: underline;
+  border-color: transparent;
+}
+
+.main-layout {
+  flex: 1;
+  display: grid;
+  grid-template-columns: minmax(280px, 1.1fr) minmax(320px, 0.9fr);
+  overflow: hidden;
+}
+
+.file-pane {
+  overflow-y: auto;
+  border-right: 1px solid #dcdcdc;
+}
+
+.detail-pane {
+  overflow-y: auto;
+}
+
+.file-list {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.file-list thead th {
+  position: sticky;
+  top: 0;
+  background: #f0f0f0;
+  text-align: left;
+  padding: 0.4rem 0.75rem;
+  border-bottom: 1px solid #dcdcdc;
+  font-weight: 600;
+}
+
+.file-list tbody tr {
+  cursor: pointer;
+}
+
+.file-list tbody tr:hover {
+  background: #eef2fb;
+}
+
+.file-list tbody tr.selected {
+  background: #dbe6fb;
+}
+
+.file-list td {
+  padding: 0.35rem 0.75rem;
+  border-bottom: 1px solid #ececec;
+  white-space: nowrap;
+}
+
+.file-icon {
+  margin-right: 0.4rem;
+}
+
+.file-list-empty {
+  padding: 1.5rem;
+  color: #888;
+  font-size: 0.9rem;
+}
+
+.verdict-panel {
+  padding: 1rem 1.25rem;
+}
+
+.verdict-empty {
+  color: #888;
+  font-size: 0.9rem;
+}
+
+.verdict-file-name {
+  margin: 0 0 0.15rem;
+  font-size: 1.1rem;
+  word-break: break-all;
+}
+
+.verdict-path {
+  font-size: 0.75rem;
+  color: #777;
+  word-break: break-all;
+  margin-bottom: 0.75rem;
+}
+
+.verdict-status {
+  font-size: 0.85rem;
+  color: #666;
+}
+
+.verdict-error {
+  color: #9c2b2b;
+}
+
+.verdict-hashes {
+  font-size: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  margin-bottom: 1rem;
+}
+
+.hash-label {
+  display: inline-block;
+  width: 4.5rem;
+  color: #777;
+}
+
+.verdict-clean {
+  font-size: 0.85rem;
+  color: #146c3f;
+  background: #d9f2e3;
+  padding: 0.6rem 0.75rem;
+  border-radius: 6px;
+}
+
+.provenance-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.provenance-entry {
+  border: 1px solid #dcdcdc;
+  border-left-width: 4px;
+  border-radius: 4px;
+  padding: 0.5rem 0.7rem;
+  font-size: 0.8rem;
+}
+
+.provenance-entry.tier-exact_hash {
+  border-left-color: #b3221e;
+}
+
+.provenance-entry.tier-fuzzy_hash {
+  border-left-color: #c9601b;
+}
+
+.provenance-entry.tier-yara_hit {
+  border-left-color: #b08b0a;
+}
+
+.provenance-entry.tier-path_pattern {
+  border-left-color: #3a6fb0;
+}
+
+.provenance-entry.tier-contextual {
+  border-left-color: #6b6b6b;
+}
+
+.provenance-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 0.3rem;
+}
+
+.tier-badge {
+  font-weight: 600;
+}
+
+.confidence {
+  color: #666;
+  font-size: 0.75rem;
+}
+
+.provenance-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.provenance-dates {
+  color: #888;
+  font-size: 0.72rem;
+  margin-top: 0.2rem;
+}
+
+code {
+  font-family: "SF Mono", Consolas, monospace;
+  font-size: 0.85em;
+  word-break: break-all;
+}
+
+button {
+  border-radius: 6px;
+  border: 1px solid #ccc;
+  padding: 0.35em 0.9em;
+  font-size: 0.85em;
+  font-weight: 500;
+  font-family: inherit;
+  color: #171717;
+  background-color: #ffffff;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: #396cd8;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color: #eaeaea;
+    background-color: #1c1c1c;
+  }
+
+  .app-header,
+  .status-bar,
+  .breadcrumb,
+  .file-pane {
+    border-color: #3a3a3a;
+  }
+
+  .breadcrumb {
+    background: #232323;
+  }
+
+  .tagline {
+    color: #999;
+  }
+
+  .status-pill {
+    background: #333;
+    color: #ccc;
+  }
+
+  .status-pill.ok {
+    background: #1e3d2b;
+    color: #7fd8a4;
+  }
+
+  .status-pill.bad {
+    background: #402323;
+    color: #e39a9a;
+  }
+
+  .file-list thead th {
+    background: #262626;
+    border-color: #3a3a3a;
+  }
+
+  .file-list td {
+    border-color: #2c2c2c;
+  }
+
+  .file-list tbody tr:hover {
+    background: #263049;
+  }
+
+  .file-list tbody tr.selected {
+    background: #2c3c63;
+  }
+
+  .verdict-path,
+  .hash-label,
+  .verdict-status,
+  .provenance-dates {
+    color: #999;
+  }
+
+  .verdict-clean {
+    background: #1e3d2b;
+    color: #7fd8a4;
+  }
+
+  .provenance-entry {
+    border-color: #3a3a3a;
+  }
+
+  button {
+    color: #eaeaea;
+    background-color: #2a2a2a;
+    border-color: #444;
+  }
+}

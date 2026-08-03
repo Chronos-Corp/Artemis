@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO feed_sync_state (source, last_synced_at, last_cursor)\n        VALUES ($1, now(), $2)\n        ON CONFLICT (source) DO UPDATE SET\n            last_synced_at = now(),\n            last_cursor = EXCLUDED.last_cursor\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "03cef82e0c38c5452cc357117402df46b299d381babcda7fa289d08f2b3d7370"
+}

@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT last_cursor FROM feed_sync_state WHERE source = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "last_cursor",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "0d85b45396235351665964bd771545068f609770bfdf934be318669e723d960c"
+}

@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO cve (id, description, cvss_score, published_at)\n        VALUES ($1, $2, $3, $4)\n        ON CONFLICT (id) DO UPDATE SET\n            description = COALESCE(EXCLUDED.description, cve.description),\n            cvss_score = COALESCE(EXCLUDED.cvss_score, cve.cvss_score),\n            published_at = COALESCE(EXCLUDED.published_at, cve.published_at),\n            updated_at = now()\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Float4",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d897eed057ec2ebac784eebb2d61b42b5486e1b40ab25af127a10d7a69b5ce65"
+}

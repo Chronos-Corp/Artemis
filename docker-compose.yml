@@ -1,0 +1,14 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: nsic
+      POSTGRES_PASSWORD: nsic
+      POSTGRES_DB: nsic
+    ports:
+      - "5432:5432"
+    volumes:
+      - nsic-postgres-data:/var/lib/postgresql/data
+
+volumes:
+  nsic-postgres-data:

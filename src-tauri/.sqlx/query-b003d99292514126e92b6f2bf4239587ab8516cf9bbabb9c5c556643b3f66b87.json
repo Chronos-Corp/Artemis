@@ -1,0 +1,48 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO indicator (kind, value)\n        VALUES ($1, $2)\n        ON CONFLICT (kind, value) DO UPDATE SET value = EXCLUDED.value\n        RETURNING id, (xmax = 0) AS \"inserted!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "inserted!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        {
+          "Custom": {
+            "name": "indicator_kind",
+            "kind": {
+              "Enum": [
+                "sha256",
+                "md5",
+                "sha1",
+                "imphash",
+                "tlsh",
+                "ssdeep",
+                "path",
+                "regkey",
+                "mutex",
+                "domain",
+                "ip"
+              ]
+            }
+          }
+        },
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "b003d99292514126e92b6f2bf4239587ab8516cf9bbabb9c5c556643b3f66b87"
+}
