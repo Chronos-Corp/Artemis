@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 import { FileList } from "./components/FileList";
@@ -19,11 +19,13 @@ function App() {
   const [entries, setEntries] = useState<FileEntry[]>([]);
   const [dirLoading, setDirLoading] = useState(false);
   const [dirError, setDirError] = useState<string | null>(null);
+  const dirRequestId = useRef(0);
 
   const [selectedFile, setSelectedFile] = useState<FileEntry | null>(null);
   const [verdict, setVerdict] = useState<Verdict | null>(null);
   const [verdictLoading, setVerdictLoading] = useState(false);
   const [verdictError, setVerdictError] = useState<string | null>(null);
+  const verdictRequestId = useRef(0);
 
   const [dbStatus, setDbStatus] = useState<DbStatus | null>(null);
   const [yaraStatus, setYaraStatus] = useState<YaraStatus | null>(null);
@@ -51,21 +53,30 @@ function App() {
   }, [refreshStatus]);
 
   const loadDir = useCallback(async (path: string) => {
+    const requestId = ++dirRequestId.current;
     setDirLoading(true);
     setDirError(null);
     try {
       const result = await invoke<FileEntry[]>("list_directory", { path });
-      setEntries(result);
+      if (requestId === dirRequestId.current) {
+        setEntries(result);
+      }
     } catch (e) {
-      setDirError(String(e));
-      setEntries([]);
+      if (requestId === dirRequestId.current) {
+        setDirError(String(e));
+        setEntries([]);
+      }
     } finally {
-      setDirLoading(false);
+      if (requestId === dirRequestId.current) {
+        setDirLoading(false);
+      }
     }
   }, []);
 
   useEffect(() => {
     if (currentDir) {
+      verdictRequestId.current += 1;
+      setVerdictLoading(false);
       loadDir(currentDir);
       setSelectedFile(null);
       setVerdict(null);
@@ -74,17 +85,24 @@ function App() {
   }, [currentDir, loadDir]);
 
   async function handleSelectFile(entry: FileEntry) {
+    const requestId = ++verdictRequestId.current;
     setSelectedFile(entry);
     setVerdict(null);
     setVerdictError(null);
     setVerdictLoading(true);
     try {
       const result = await invoke<Verdict>("get_verdict", { path: entry.path });
-      setVerdict(result);
+      if (requestId === verdictRequestId.current) {
+        setVerdict(result);
+      }
     } catch (e) {
-      setVerdictError(String(e));
+      if (requestId === verdictRequestId.current) {
+        setVerdictError(String(e));
+      }
     } finally {
-      setVerdictLoading(false);
+      if (requestId === verdictRequestId.current) {
+        setVerdictLoading(false);
+      }
     }
   }
 
