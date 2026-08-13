@@ -150,12 +150,13 @@ credential check was pulled out of `host.rs`'s `heartbeat` into a shared
 endpoints use the exact same check rather than two copies drifting.
 
 - **Deliberately narrow request shape.** `SightingRequest` (`nsic_core::
-  proto`) is `{ sha256, detection_name, path: Option<String>,
-  observed_at }` — exactly what `nsic-agent scan` produces today, not a
-  generic multi-indicator-kind sighting. Generalizing (a `kind` field,
-  non-YARA detection types) is deferred until something other than local
-  YARA scanning produces a sighting — Phase 0's still-unpopulated tier 2
-  (fuzzy hashing) would be the next candidate.
+  proto`) is `{ sha256, detection_name, ruleset_fingerprint,
+  path: Option<String>, observed_at }` — exactly what `nsic-agent scan`
+  produces today, not a generic multi-indicator-kind sighting.
+  Generalizing (a `kind` field, non-YARA detection types) is deferred
+  until something other than local YARA scanning produces a sighting —
+  Phase 0's still-unpopulated tier 2 (fuzzy hashing) would be the next
+  candidate.
 - **Source and confidence are not client-supplied.** The endpoint always
   writes `source = "agent:yara_scan"`, `confidence = 65` — matching
   `src-tauri`'s existing convention for local YARA hits
@@ -170,8 +171,15 @@ endpoints use the exact same check rather than two copies drifting.
   `upsert_detection` (the YARA rule, by name), a
   `detection_detects_indicator` edge (so a fleet hit joins the exact same
   graph a local desktop scan populates), and the new
-  `host_sighted_indicator` edge (which host, specifically, saw it, and
-  from where — see Data model below).
+  `host_sighted_indicator` edge (which host, specifically, saw it, from
+  where, and under which ruleset version — see Data model below). All
+  four writes happen inside one Postgres transaction
+  (`state.pool.begin()`); the three shared upsert helpers are generic
+  over `sqlx::PgExecutor` (mirroring `src-tauri`'s own
+  `upsert_report`/`upsert_indicator` signatures) specifically so they can
+  run against either a bare pool or a transaction. A failure partway
+  through rolls back the whole sighting rather than leaving, say, a new
+  indicator and detection recorded with no host tied to them.
 - **These four upserts are reimplemented in `crates/console/src/
   sighting.rs`** with runtime-checked queries (no `sqlx::query!` macro),
   not shared from `src-tauri/src/db/indicators.rs` where three of the
@@ -184,12 +192,61 @@ endpoints use the exact same check rather than two copies drifting.
   SQL shape (same tables, same `ON CONFLICT` targets) as `src-tauri`'s
   macro versions; drift between them is the accepted cost, flagged in
   code comments at each reimplemented function.
-- **Idempotency.** `PRIMARY KEY (host_id, indicator_id, source)` on
-  `host_sighted_indicator` — resubmitting the same sighting is an upsert,
-  not a duplicate row. `first_seen` takes `LEAST`, `last_seen` takes
-  `GREATEST` (the exact pattern every other edge in `0001_init.sql`
-  already uses); `path` is always overwritten with the latest reported
-  value ("last seen at" is the useful semantic, not "first seen at").
+- **Ruleset provenance.** A rule's name alone doesn't identify what it
+  actually checked for once the rule file has since been edited, so
+  `YaraEngine` (`crates/nsic-core/src/yara_scan.rs`) now carries a
+  `ruleset_fingerprint`: a SHA-256 of every loaded rule file's bytes,
+  concatenated in sorted path order for determinism, computed once at
+  `load()`. The agent includes it in every `SightingRequest`, and it's
+  part of `host_sighted_indicator`'s primary key
+  (`(host_id, indicator_id, source, ruleset_fingerprint)`), not just a
+  plain column — the same host reporting the same indicator again under
+  a materially different ruleset creates a new, distinct row instead of
+  silently merging into (and losing the provenance of) an earlier one.
+- **Same bytes, hashed and scanned once.** The agent used to open the
+  scanned file twice: once for `YaraEngine::scan(path)`, and — only if
+  reporting was enabled — again via `compute_hashes(path)` to get the
+  sha256 for the sighting. Two separate reads of the same path can
+  observe different content if the file changes in between, which for a
+  match this may persist durably and attribute to a specific host is an
+  evidence-integrity defect, not just a race. `nsic-agent scan` now reads
+  the file into memory exactly once (`std::fs::read`) and both hashes
+  (`nsic_core::hashing::hash_bytes`) and scans
+  (`YaraEngine::scan_bytes`, using the `yara` crate's `scan_mem` instead
+  of `scan_file`) that same buffer, so the reported hash is provably the
+  hash of whatever YARA actually inspected. `scan`/`scan_file`
+  (path-based) stay as they were for `src-tauri`'s own callers, which
+  don't (yet) share this problem in the same way; see below.
+- **Input validation at the trust boundary.** Authentication proves which
+  agent sent a request, not that the agent is bug-free or uncompromised.
+  `report_sighting` now rejects (`400`) a `sha256` or
+  `ruleset_fingerprint` that isn't exactly 64 lowercase hex characters,
+  an empty or over-256-character `detection_name`, and an `observed_at`
+  either more than 5 minutes ahead of the console's clock or before
+  2020-01-01 (a floor sanity bound, not a moving target) — all before
+  anything touches the database. Without this, `"sha256": "banana"`
+  would have become a real `IndicatorKind::Sha256` row, corrupting the
+  graph's type invariant.
+- **Idempotency and stale-observation ordering.** `PRIMARY KEY (host_id,
+  indicator_id, source, ruleset_fingerprint)` on `host_sighted_indicator`
+  — resubmitting the same sighting is an upsert, not a duplicate row.
+  `first_seen` takes `LEAST`, `last_seen` takes `GREATEST` (the exact
+  pattern every other edge in `0001_init.sql` already uses); `path`
+  advances to the newly reported value only when that report's
+  observation is at least as recent as what's already stored (`CASE WHEN
+  EXCLUDED.last_seen >= host_sighted_indicator.last_seen`), not
+  unconditionally — otherwise a report arriving out of order could
+  regress "where it was last seen" to a stale path even while
+  `last_seen` itself correctly kept advancing.
+- **`received_at`.** `host_sighted_indicator` also records when the
+  console first accepted a given `(host, indicator, source,
+  ruleset_fingerprint)` fact (`DEFAULT now()`, set once, never updated on
+  conflict), independent of the agent-claimed `first_seen`/`last_seen`.
+  Combined with the `observed_at` bounds check above, this means a single
+  misconfigured or compromised endpoint clock can't plant a bogus extreme
+  timestamp that later, legitimate sightings have no way to repair — and
+  even within the accepted range, analysts retain enough provenance to
+  notice a suspect endpoint clock.
 - **Batching is out of scope.** One HTTP request per (indicator,
   detection) pair; the agent loops client-side if a single scan matches
   multiple rules. `nsic-agent scan` still only scans one file per
@@ -199,16 +256,26 @@ endpoints use the exact same check rather than two copies drifting.
   `--credential` (env fallbacks `NSIC_CONSOLE_URL` / `NSIC_HOST_ID` /
   `NSIC_AGENT_CREDENTIAL`); if all three are given and the scan found any
   matches, each is reported as a sighting after the local JSON is
-  printed. Given none of them, `scan` behaves exactly as it did in PR #5.
-  Given some but not all, the agent prints a warning and skips
-  reporting rather than silently doing nothing or guessing.
+  printed (which now also includes the `sha256`, a side effect of always
+  hashing the buffer YARA scanned). Given none of them, `scan` behaves
+  exactly as it did in PR #5. Given some but not all, the agent prints a
+  warning and skips reporting rather than silently doing nothing or
+  guessing.
 - Tests (`crates/console/src/sighting.rs`, DB-backed, `--ignored`):
-  missing/forged credential, unknown `host_id`, and a combined happy-path
-  test that submits the same sighting twice with different
+  missing/forged credential and unknown `host_id`; malformed and
+  uppercase `sha256`; empty `detection_name`; `observed_at` too far in
+  the future and predating the earliest-plausible bound; a combined
+  happy-path test that submits the same sighting twice with different
   `observed_at` values and asserts against the database directly that
   `first_seen`/`last_seen` follow `LEAST`/`GREATEST`, exactly one edge
   row exists (not two), and `detection_detects_indicator` was populated
-  too.
+  too; a different-`ruleset_fingerprint` test confirming two distinct
+  edge rows result instead of one merged row; and a stale-observation
+  test confirming an out-of-order report can't regress `path`. Plus new
+  `nsic-core` tests (plain `#[test]`s, no DB): `scan_bytes` matches
+  `scan` for identical content, `hash_bytes` matches `compute_hashes` for
+  identical content, and `ruleset_fingerprint` is deterministic across
+  reloads and distinguishes a real ruleset from an empty one.
 
 ## What's deliberately not here yet
 
@@ -238,6 +305,16 @@ endpoints use the exact same check rather than two copies drifting.
   The data is in the same Postgres graph `src-tauri`'s verdict engine
   already queries, so it's reachable by hand, just not through any
   Phase 1-specific API yet.
+- **The same hash/scan TOCTOU exists in `src-tauri`'s desktop verdict
+  engine, unfixed.** `verdict.rs`'s `resolve()` still hashes a file
+  (`hash_file_cached`) and separately opens it again to YARA-scan it
+  (`yara_for_scan.scan(&path_owned)`) — two reads of the same path, same
+  class of issue `nsic-agent scan` fixed in PR #6 by reading once and
+  calling `hash_bytes`/`scan_bytes` on the same buffer. Left alone here
+  deliberately: it predates this PR, and the desktop app's interactive,
+  single-analyst click-to-verdict flow has different risk
+  characteristics than an authenticated, durably-persisted fleet
+  sighting. Worth the same fix eventually, but out of scope for this PR.
 - **Sample retrieval.** Locked architecture decision #3: file contents
   leave the host only on explicit analyst request, logged and attributed.
   No part of that request/audit flow exists yet.
@@ -264,10 +341,15 @@ enrolled_at, last_heartbeat_at. Additive to the Phase 0 schema in
 `host_sighted_indicator` (`src-tauri/migrations/
 0005_host_sighted_indicator.sql`): the host<->indicator edge PR #6 adds.
 `host_id`, `indicator_id`, `source`, `confidence`, `path` (nullable,
-always overwritten with the latest value), `first_seen`, `last_seen`,
-primary keyed on `(host_id, indicator_id, source)` -- same edge shape as
-every other edge in `0001_init.sql`, just between a host and an
-indicator instead of, say, a report and an indicator.
+only advances on a conflict when the new observation is at least as
+recent as what's stored), `ruleset_fingerprint` (SHA-256 hex of the
+loaded rule files, part of the primary key so a materially different
+ruleset creates a new row instead of merging into an old one),
+`received_at` (console-controlled ingestion time, set once, never
+updated), `first_seen`, `last_seen`. Primary keyed on `(host_id,
+indicator_id, source, ruleset_fingerprint)` -- the same edge shape every
+other edge in `0001_init.sql` uses, extended by one column for the
+reason above.
 
 ## Running it locally
 
@@ -289,7 +371,7 @@ cargo run -p agent --bin nsic-agent -- heartbeat \
 # -> heartbeat ok: received_at=...
 
 cargo run -p agent --bin nsic-agent -- scan path/to/file --rules-dir yara-rules
-# -> {"path": "...", "rules_dir": "yara-rules", "rule_count": 1, "matches": [...]}
+# -> {"path": "...", "rules_dir": "yara-rules", "rule_count": 1, "sha256": "...", "matches": [...]}
 
 cargo run -p agent --bin nsic-agent -- scan path/to/file --rules-dir yara-rules \
   --console-url http://localhost:8787 --host-id <uuid> --credential <token>

@@ -11,7 +11,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use nsic_core::hashing::compute_hashes;
+use nsic_core::hashing::{compute_hashes, hash_bytes};
 use nsic_core::proto::{
     EnrollRequest, EnrollResponse, HeartbeatRequest, HeartbeatResponse, SightingRequest,
     SightingResponse,
@@ -112,22 +112,42 @@ async fn main() -> Result<()> {
         } => {
             let engine = YaraEngine::load(&rules_dir)
                 .with_context(|| format!("loading YARA rules from {}", rules_dir.display()))?;
+            // Read the file exactly once and hash and scan the identical
+            // bytes, rather than hashing and scanning via two separate
+            // opens of the same path: a file can change between two reads,
+            // and for a match this hashes and may persist durably as a
+            // sighting, binding the detection to whichever bytes were
+            // actually inspected is an evidence-integrity requirement, not
+            // just a nice-to-have.
+            let data =
+                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
             let matches = engine
-                .scan(&path)
+                .scan_bytes(&data)
                 .with_context(|| format!("scanning {}", path.display()))?;
+            let hash = hash_bytes(&data);
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "path": path,
                     "rules_dir": rules_dir,
                     "rule_count": engine.rule_count,
+                    "sha256": hash.sha256,
                     "matches": matches.iter().map(|m| &m.rule_name).collect::<Vec<_>>(),
                 }))?
             );
 
             match (console_url, host_id, credential) {
                 (Some(console_url), Some(host_id), Some(credential)) => {
-                    report_sightings(&console_url, host_id, &credential, &path, &matches).await?;
+                    report_sightings(
+                        &console_url,
+                        host_id,
+                        &credential,
+                        &path,
+                        &hash.sha256,
+                        &engine.ruleset_fingerprint,
+                        &matches,
+                    )
+                    .await?;
                 }
                 (None, None, None) => {}
                 _ => eprintln!(
@@ -195,31 +215,37 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Hashes the scanned file once and reports one sighting per YARA match
-/// found in it, in sequence (this PR does not batch multiple sightings
-/// into one request -- see docs/phase1-design.md for why that's deferred
-/// until scanning stops being one file per CLI invocation). A no-op if
-/// `matches` is empty, so callers don't need to check that themselves.
+/// Reports one sighting per YARA match found, in sequence (this PR does
+/// not batch multiple sightings into one request -- see
+/// docs/phase1-design.md for why that's deferred until scanning stops
+/// being one file per CLI invocation). A no-op if `matches` is empty, so
+/// callers don't need to check that themselves. Takes the sha256 and
+/// ruleset fingerprint the caller already computed from the exact bytes
+/// that were scanned, rather than recomputing either here: recomputing
+/// the hash via a second read of `path` is exactly the TOCTOU this
+/// function must not reintroduce.
+#[allow(clippy::too_many_arguments)]
 async fn report_sightings(
     console_url: &str,
     host_id: Uuid,
     credential: &str,
     path: &std::path::Path,
+    sha256: &str,
+    ruleset_fingerprint: &str,
     matches: &[nsic_core::yara_scan::YaraMatch],
 ) -> Result<()> {
     if matches.is_empty() {
         return Ok(());
     }
 
-    let hash = compute_hashes(path)
-        .with_context(|| format!("hashing {} to report sighting", path.display()))?;
     let observed_at = Utc::now();
     let client = reqwest::Client::new();
 
     for m in matches {
         let req = SightingRequest {
-            sha256: hash.sha256.clone(),
+            sha256: sha256.to_string(),
             detection_name: m.rule_name.clone(),
+            ruleset_fingerprint: ruleset_fingerprint.to_string(),
             path: Some(path.to_string_lossy().to_string()),
             observed_at,
         };

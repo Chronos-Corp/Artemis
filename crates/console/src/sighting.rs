@@ -4,7 +4,7 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use nsic_core::models::{DetectionKind, IndicatorKind};
 use nsic_core::proto::{SightingRequest, SightingResponse};
-use sqlx::PgPool;
+use sqlx::PgExecutor;
 use uuid::Uuid;
 
 use crate::auth::{authenticate_host, internal_error};
@@ -20,12 +20,23 @@ use crate::AppState;
 const YARA_SIGHTING_SOURCE: &str = "agent:yara_scan";
 const YARA_SIGHTING_CONFIDENCE: i16 = 65;
 
+/// How far ahead of the console's own clock an agent's claimed
+/// `observed_at` is tolerated before being rejected outright. Generous
+/// enough for ordinary clock drift, nowhere near enough to let a
+/// misconfigured or compromised endpoint plant a bogus future extremum
+/// that `GREATEST(last_seen, ...)` would otherwise accept permanently.
+const MAX_FUTURE_SKEW: chrono::Duration = chrono::Duration::minutes(5);
+
 /// Records that `host_id` observed a YARA rule match, provided the caller
-/// presents that host's own per-agent credential. Upserts the indicator
-/// (the file's hash) and the detection (the rule) if either is new, then
-/// both a `detection_detects_indicator` edge (so this hit joins the same
-/// graph a local desktop scan would populate) and a `host_sighted_indicator`
-/// edge (which host, specifically, saw it, and from where).
+/// presents that host's own per-agent credential and the payload passes
+/// validation. Upserts the indicator (the file's hash) and the detection
+/// (the rule) if either is new, then both a `detection_detects_indicator`
+/// edge (so this hit joins the same graph a local desktop scan would
+/// populate) and a `host_sighted_indicator` edge (which host,
+/// specifically, saw it, from where, and under which ruleset version).
+/// All four writes happen in one transaction: a failure partway through
+/// must not leave the graph with, say, a new indicator and detection but
+/// no record of which host actually saw them together.
 pub async fn report_sighting(
     State(state): State<AppState>,
     Path(host_id): Path<Uuid>,
@@ -33,16 +44,19 @@ pub async fn report_sighting(
     Json(req): Json<SightingRequest>,
 ) -> Result<Json<SightingResponse>, (StatusCode, String)> {
     authenticate_host(&state.pool, host_id, &headers).await?;
+    validate_sighting_request(&req)?;
 
-    let indicator_id = upsert_indicator(&state.pool, IndicatorKind::Sha256, &req.sha256)
+    let mut tx = state.pool.begin().await.map_err(internal_error)?;
+
+    let indicator_id = upsert_indicator(&mut *tx, IndicatorKind::Sha256, &req.sha256)
         .await
         .map_err(internal_error)?;
-    let detection_id = upsert_detection(&state.pool, DetectionKind::Yara, &req.detection_name)
+    let detection_id = upsert_detection(&mut *tx, DetectionKind::Yara, &req.detection_name)
         .await
         .map_err(internal_error)?;
 
     upsert_detection_detects_indicator(
-        &state.pool,
+        &mut *tx,
         detection_id,
         indicator_id,
         YARA_SIGHTING_SOURCE,
@@ -54,22 +68,86 @@ pub async fn report_sighting(
     .map_err(internal_error)?;
 
     upsert_host_sighted_indicator(
-        &state.pool,
+        &mut *tx,
         host_id,
         indicator_id,
         YARA_SIGHTING_SOURCE,
         YARA_SIGHTING_CONFIDENCE,
         req.path.as_deref(),
+        &req.ruleset_fingerprint,
         req.observed_at,
         req.observed_at,
     )
     .await
     .map_err(internal_error)?;
 
+    tx.commit().await.map_err(internal_error)?;
+
     Ok(Json(SightingResponse {
         indicator_id,
         recorded_at: Utc::now(),
     }))
+}
+
+/// Authentication proves which agent sent a request, not that the agent
+/// is bug-free or uncompromised -- so the console still validates the
+/// payload itself rather than trusting it onto the graph verbatim.
+fn validate_sighting_request(req: &SightingRequest) -> Result<(), (StatusCode, String)> {
+    validate_lowercase_sha256(&req.sha256, "sha256")?;
+    validate_lowercase_sha256(&req.ruleset_fingerprint, "ruleset_fingerprint")?;
+
+    if req.detection_name.trim().is_empty() {
+        return Err(bad_request("detection_name must not be empty"));
+    }
+    if req.detection_name.chars().count() > 256 {
+        return Err(bad_request(
+            "detection_name must be 256 characters or fewer",
+        ));
+    }
+
+    let now = Utc::now();
+    if req.observed_at > now + MAX_FUTURE_SKEW {
+        return Err(bad_request(&format!(
+            "observed_at {} is too far in the future (more than 5 minutes ahead of the \
+             console's clock)",
+            req.observed_at
+        )));
+    }
+    if req.observed_at < earliest_plausible_observed_at() {
+        return Err(bad_request(&format!(
+            "observed_at {} predates any plausible deployment of this software",
+            req.observed_at
+        )));
+    }
+
+    Ok(())
+}
+
+/// A floor sanity bound, not a moving target: nothing this project ever
+/// produced can predate its own existence. Catches obviously-bogus clocks
+/// (an unset RTC defaulting to the epoch, etc.) without constraining
+/// legitimate delayed or batched reports.
+fn earliest_plausible_observed_at() -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+        .expect("valid constant")
+        .with_timezone(&Utc)
+}
+
+fn validate_lowercase_sha256(value: &str, field: &str) -> Result<(), (StatusCode, String)> {
+    let is_valid = value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !is_valid {
+        return Err(bad_request(&format!(
+            "{field} must be exactly 64 lowercase hexadecimal characters"
+        )));
+    }
+    Ok(())
+}
+
+fn bad_request(message: &str) -> (StatusCode, String) {
+    (StatusCode::BAD_REQUEST, message.to_string())
 }
 
 /// Reimplements `src-tauri`'s `db::indicators::upsert_indicator` with a
@@ -78,8 +156,17 @@ pub async fn report_sighting(
 /// `SQLX_OFFLINE` cache prepared against a live database -- the same
 /// tradeoff PR #4's `host.rs` queries already made. Both write the exact
 /// same table with the exact same conflict handling; see
-/// docs/phase1-design.md for the tradeoff this accepts.
-async fn upsert_indicator(pool: &PgPool, kind: IndicatorKind, value: &str) -> sqlx::Result<Uuid> {
+/// docs/phase1-design.md for the tradeoff this accepts. Generic over the
+/// executor (rather than a concrete `&PgPool`) so `report_sighting` can
+/// run all four upserts inside one transaction.
+async fn upsert_indicator<'e, E>(
+    executor: E,
+    kind: IndicatorKind,
+    value: &str,
+) -> sqlx::Result<Uuid>
+where
+    E: PgExecutor<'e>,
+{
     sqlx::query_scalar(
         "INSERT INTO indicator (kind, value) VALUES ($1, $2) \
          ON CONFLICT (kind, value) DO UPDATE SET value = EXCLUDED.value \
@@ -87,7 +174,7 @@ async fn upsert_indicator(pool: &PgPool, kind: IndicatorKind, value: &str) -> sq
     )
     .bind(kind)
     .bind(value)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
@@ -97,7 +184,10 @@ async fn upsert_indicator(pool: &PgPool, kind: IndicatorKind, value: &str) -> sq
 /// existing detection's own metadata from a fuller ingestion path is left
 /// untouched by the `ON CONFLICT` clause below, not overwritten with
 /// NULLs).
-async fn upsert_detection(pool: &PgPool, kind: DetectionKind, name: &str) -> sqlx::Result<Uuid> {
+async fn upsert_detection<'e, E>(executor: E, kind: DetectionKind, name: &str) -> sqlx::Result<Uuid>
+where
+    E: PgExecutor<'e>,
+{
     sqlx::query_scalar(
         "INSERT INTO detection (kind, name) VALUES ($1, $2) \
          ON CONFLICT (kind, name) DO UPDATE SET name = EXCLUDED.name \
@@ -105,22 +195,25 @@ async fn upsert_detection(pool: &PgPool, kind: DetectionKind, name: &str) -> sql
     )
     .bind(kind)
     .bind(name)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
 /// Mirrors `src-tauri`'s `upsert_detection_detects_indicator` verbatim
 /// (see `upsert_indicator`'s doc comment for why this isn't shared code).
 #[allow(clippy::too_many_arguments)]
-async fn upsert_detection_detects_indicator(
-    pool: &PgPool,
+async fn upsert_detection_detects_indicator<'e, E>(
+    executor: E,
     detection_id: Uuid,
     indicator_id: Uuid,
     source: &str,
     confidence: i16,
     first_seen: DateTime<Utc>,
     last_seen: DateTime<Utc>,
-) -> sqlx::Result<()> {
+) -> sqlx::Result<()>
+where
+    E: PgExecutor<'e>,
+{
     sqlx::query(
         "INSERT INTO detection_detects_indicator \
             (detection_id, indicator_id, source, confidence, first_seen, last_seen) \
@@ -136,33 +229,44 @@ async fn upsert_detection_detects_indicator(
     .bind(confidence)
     .bind(first_seen)
     .bind(last_seen)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
 
 /// New edge this PR introduces (`src-tauri/migrations/
-/// 0005_host_sighted_indicator.sql`). `path` is always overwritten with
-/// the latest reported value, not preserved via `LEAST`/`GREATEST` like
-/// the timestamps: "where it was last seen" is the useful semantic here.
+/// 0005_host_sighted_indicator.sql`). `ruleset_fingerprint` is part of the
+/// conflict target, not just a bound column: the same host reporting the
+/// same indicator again under a materially different ruleset creates a
+/// new row rather than silently merging into (and losing the provenance
+/// of) an earlier one. `path` only advances when the incoming
+/// observation is at least as recent as what's already stored, so an
+/// out-of-order report can't regress "where it was last seen" to a stale
+/// path while `last_seen` itself still (correctly) only ever advances.
 #[allow(clippy::too_many_arguments)]
-async fn upsert_host_sighted_indicator(
-    pool: &PgPool,
+async fn upsert_host_sighted_indicator<'e, E>(
+    executor: E,
     host_id: Uuid,
     indicator_id: Uuid,
     source: &str,
     confidence: i16,
     path: Option<&str>,
+    ruleset_fingerprint: &str,
     first_seen: DateTime<Utc>,
     last_seen: DateTime<Utc>,
-) -> sqlx::Result<()> {
+) -> sqlx::Result<()>
+where
+    E: PgExecutor<'e>,
+{
     sqlx::query(
         "INSERT INTO host_sighted_indicator \
-            (host_id, indicator_id, source, confidence, path, first_seen, last_seen) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
-         ON CONFLICT (host_id, indicator_id, source) DO UPDATE SET \
+            (host_id, indicator_id, source, confidence, path, ruleset_fingerprint, \
+             first_seen, last_seen) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+         ON CONFLICT (host_id, indicator_id, source, ruleset_fingerprint) DO UPDATE SET \
             confidence = EXCLUDED.confidence, \
-            path = EXCLUDED.path, \
+            path = CASE WHEN EXCLUDED.last_seen >= host_sighted_indicator.last_seen \
+                        THEN EXCLUDED.path ELSE host_sighted_indicator.path END, \
             first_seen = LEAST(host_sighted_indicator.first_seen, EXCLUDED.first_seen), \
             last_seen = GREATEST(host_sighted_indicator.last_seen, EXCLUDED.last_seen)",
     )
@@ -171,9 +275,10 @@ async fn upsert_host_sighted_indicator(
     .bind(source)
     .bind(confidence)
     .bind(path)
+    .bind(ruleset_fingerprint)
     .bind(first_seen)
     .bind(last_seen)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(())
 }
@@ -191,6 +296,14 @@ mod tests {
     use uuid::Uuid;
 
     const BOOTSTRAP_SECRET: &str = "test-bootstrap-secret";
+
+    fn valid_sha256(seed: &str) -> String {
+        format!("{seed:0<64}")
+    }
+
+    fn valid_fingerprint(seed: &str) -> String {
+        format!("{seed:0<64}")
+    }
 
     async fn test_state() -> AppState {
         let database_url = std::env::var("DATABASE_URL")
@@ -227,16 +340,21 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    fn sighting_request(
+    #[allow(clippy::too_many_arguments)]
+    fn sighting_request_full(
         host_id: Uuid,
         bearer: Option<&str>,
         sha256: &str,
+        detection_name: &str,
+        ruleset_fingerprint: &str,
+        path: Option<&str>,
         observed_at: DateTime<Utc>,
     ) -> Request<Body> {
         let body = serde_json::json!({
             "sha256": sha256,
-            "detection_name": "Example_EICAR_Test_File",
-            "path": "/tmp/eicar.txt",
+            "detection_name": detection_name,
+            "ruleset_fingerprint": ruleset_fingerprint,
+            "path": path,
             "observed_at": observed_at.to_rfc3339(),
         });
         let mut builder = Request::builder()
@@ -247,6 +365,23 @@ mod tests {
             builder = builder.header("authorization", format!("Bearer {token}"));
         }
         builder.body(Body::from(body.to_string())).unwrap()
+    }
+
+    fn sighting_request(
+        host_id: Uuid,
+        bearer: Option<&str>,
+        sha256: &str,
+        observed_at: DateTime<Utc>,
+    ) -> Request<Body> {
+        sighting_request_full(
+            host_id,
+            bearer,
+            sha256,
+            "Example_EICAR_Test_File",
+            &valid_fingerprint("f"),
+            Some("/tmp/eicar.txt"),
+            observed_at,
+        )
     }
 
     #[tokio::test]
@@ -260,7 +395,7 @@ mod tests {
             .oneshot(sighting_request(
                 enrolled.host_id,
                 None,
-                "a".repeat(64).as_str(),
+                &valid_sha256("a"),
                 Utc::now(),
             ))
             .await
@@ -278,7 +413,7 @@ mod tests {
             .oneshot(sighting_request(
                 enrolled.host_id,
                 Some("forged-credential"),
-                "a".repeat(64).as_str(),
+                &valid_sha256("a"),
                 Utc::now(),
             ))
             .await
@@ -295,7 +430,7 @@ mod tests {
             .oneshot(sighting_request(
                 Uuid::new_v4(),
                 Some("anything"),
-                "a".repeat(64).as_str(),
+                &valid_sha256("a"),
                 Utc::now(),
             ))
             .await
@@ -303,12 +438,105 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    #[tokio::test]
+    #[ignore]
+    async fn report_sighting_rejects_malformed_sha256() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+
+        let response = app
+            .oneshot(sighting_request(
+                enrolled.host_id,
+                Some(&enrolled.credential),
+                "banana",
+                Utc::now(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn report_sighting_rejects_uppercase_sha256() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+
+        let response = app
+            .oneshot(sighting_request(
+                enrolled.host_id,
+                Some(&enrolled.credential),
+                &valid_sha256("A"),
+                Utc::now(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn report_sighting_rejects_empty_detection_name() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+
+        let response = app
+            .oneshot(sighting_request_full(
+                enrolled.host_id,
+                Some(&enrolled.credential),
+                &valid_sha256("a"),
+                "",
+                &valid_fingerprint("f"),
+                Some("/tmp/eicar.txt"),
+                Utc::now(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn report_sighting_rejects_observed_at_too_far_in_future() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+
+        let response = app
+            .oneshot(sighting_request(
+                enrolled.host_id,
+                Some(&enrolled.credential),
+                &valid_sha256("a"),
+                Utc::now() + Duration::days(1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn report_sighting_rejects_observed_at_before_earliest_plausible() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+
+        let response = app
+            .oneshot(sighting_request(
+                enrolled.host_id,
+                Some(&enrolled.credential),
+                &valid_sha256("a"),
+                DateTime::UNIX_EPOCH,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
     /// The full happy path plus the idempotency/timestamp semantics this
-    /// endpoint promises: submitting the same (host, indicator, source)
-    /// sighting twice does not create a second edge row, extends
-    /// last_seen to the later observation, and leaves first_seen at the
-    /// earlier one -- exactly the LEAST/GREATEST upsert pattern every
-    /// other edge in the graph already uses.
+    /// endpoint promises: submitting the same (host, indicator, source,
+    /// ruleset_fingerprint) sighting twice does not create a second edge
+    /// row, extends last_seen to the later observation, and leaves
+    /// first_seen at the earlier one -- exactly the LEAST/GREATEST upsert
+    /// pattern every other edge in the graph already uses.
     #[tokio::test]
     #[ignore]
     async fn report_sighting_creates_graph_and_is_idempotent() {
@@ -317,7 +545,7 @@ mod tests {
         let app = crate::build_router(state);
         let enrolled = enroll(&app).await;
 
-        let sha256 = format!("{:0<64}", "sightingtest");
+        let sha256 = valid_sha256("51191171190");
         // Postgres TIMESTAMPTZ has microsecond precision; chrono's Utc::now()
         // has nanosecond precision. Truncate before comparing, or the
         // round-tripped value read back from the database never exactly
@@ -372,6 +600,7 @@ mod tests {
         // Resubmit the same sighting, observed an hour later.
         let last_seen = first_seen + Duration::hours(2);
         let response = app
+            .clone()
             .oneshot(sighting_request(
                 enrolled.host_id,
                 Some(&enrolled.credential),
@@ -420,6 +649,142 @@ mod tests {
         assert_eq!(
             stored_last_seen, last_seen,
             "last_seen should advance to the later observation"
+        );
+    }
+
+    /// The same (host, indicator, source) observed under two different
+    /// ruleset fingerprints must produce two distinct edge rows, not one
+    /// merged/overwritten row -- otherwise the fact that an earlier
+    /// sighting was produced by a since-edited rule becomes
+    /// unreconstructable.
+    #[tokio::test]
+    #[ignore]
+    async fn report_sighting_with_different_ruleset_fingerprint_creates_separate_edge() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let app = crate::build_router(state);
+        let enrolled = enroll(&app).await;
+
+        let sha256 = valid_sha256("522111991190");
+        let fingerprint_a = valid_fingerprint("aaaa");
+        let fingerprint_b = valid_fingerprint("bbbb");
+
+        for fingerprint in [&fingerprint_a, &fingerprint_b] {
+            let response = app
+                .clone()
+                .oneshot(sighting_request_full(
+                    enrolled.host_id,
+                    Some(&enrolled.credential),
+                    &sha256,
+                    "Example_EICAR_Test_File",
+                    fingerprint,
+                    Some("/tmp/eicar.txt"),
+                    Utc::now().trunc_subsecs(6),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let indicator_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM indicator WHERE kind = 'sha256' AND value = $1")
+                .bind(&sha256)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let edge_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM host_sighted_indicator WHERE host_id = $1 AND indicator_id = $2",
+        )
+        .bind(enrolled.host_id)
+        .bind(indicator_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            edge_count, 2,
+            "two materially different rulesets should leave two distinct sighting rows"
+        );
+    }
+
+    /// An out-of-order report (an older observation arriving after a
+    /// newer one) must not regress the stored path, even though
+    /// first_seen/last_seen still correctly track the full observed
+    /// range via LEAST/GREATEST.
+    #[tokio::test]
+    #[ignore]
+    async fn report_sighting_does_not_regress_path_on_stale_observation() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let app = crate::build_router(state);
+        let enrolled = enroll(&app).await;
+
+        let sha256 = valid_sha256("70a7104de121190");
+        let fingerprint = valid_fingerprint("f");
+        let earlier = (Utc::now() - Duration::hours(2)).trunc_subsecs(6);
+        let later = (Utc::now() - Duration::hours(1)).trunc_subsecs(6);
+
+        // The later observation, with the new path, arrives first.
+        let response = app
+            .clone()
+            .oneshot(sighting_request_full(
+                enrolled.host_id,
+                Some(&enrolled.credential),
+                &sha256,
+                "Example_EICAR_Test_File",
+                &fingerprint,
+                Some("/new/malware.exe"),
+                later,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The earlier observation, with a stale path, arrives second.
+        let response = app
+            .oneshot(sighting_request_full(
+                enrolled.host_id,
+                Some(&enrolled.credential),
+                &sha256,
+                "Example_EICAR_Test_File",
+                &fingerprint,
+                Some("/old/malware.exe"),
+                earlier,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let indicator_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM indicator WHERE kind = 'sha256' AND value = $1")
+                .bind(&sha256)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let row = sqlx::query(
+            "SELECT path, first_seen, last_seen FROM host_sighted_indicator \
+             WHERE host_id = $1 AND indicator_id = $2 AND source = $3",
+        )
+        .bind(enrolled.host_id)
+        .bind(indicator_id)
+        .bind(YARA_SIGHTING_SOURCE)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let stored_path: Option<String> = row.get("path");
+        let stored_first_seen: DateTime<Utc> = row.get("first_seen");
+        let stored_last_seen: DateTime<Utc> = row.get("last_seen");
+        assert_eq!(
+            stored_path.as_deref(),
+            Some("/new/malware.exe"),
+            "the stale, out-of-order report must not regress the path"
+        );
+        assert_eq!(
+            stored_first_seen, earlier,
+            "first_seen still tracks the earliest observation"
+        );
+        assert_eq!(
+            stored_last_seen, later,
+            "last_seen still tracks the latest observation"
         );
     }
 }

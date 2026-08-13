@@ -62,6 +62,11 @@ pub struct HeartbeatResponse {
 pub struct SightingRequest {
     pub sha256: String,
     pub detection_name: String,
+    /// `YaraEngine::ruleset_fingerprint` at scan time: which version of the
+    /// rules produced this match. Rule content can change after a match is
+    /// recorded; without this, a durable sighting citing only a rule name
+    /// becomes unreconstructable once that rule is edited.
+    pub ruleset_fingerprint: String,
     /// Where on the host the file was found, if known. Metadata, not file
     /// contents -- see the repo README's locked architecture decisions.
     pub path: Option<String>,
