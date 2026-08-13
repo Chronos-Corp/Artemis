@@ -15,6 +15,9 @@ dist-ssr
 # Secrets / local config
 .env
 
+# Cargo workspace build output (crates/, src-tauri/ share one root target/)
+/target
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

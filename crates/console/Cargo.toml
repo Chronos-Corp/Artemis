@@ -1,0 +1,25 @@
+[package]
+name = "console"
+version = "0.1.0"
+edition = "2021"
+description = "Phase 1 fleet console. Accepts agent enrollment and heartbeats and records them in the shared Postgres intel graph."
+
+[[bin]]
+name = "nsic-console"
+path = "src/main.rs"
+
+[dependencies]
+nsic-core = { path = "../nsic-core", features = ["db"] }
+anyhow = "1"
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "chrono", "uuid"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[dev-dependencies]
+serde_json = "1"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

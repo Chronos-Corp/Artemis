@@ -38,7 +38,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri
+          workspaces: .
 
       - name: cargo check
         working-directory: src-tauri
@@ -60,6 +60,54 @@ jobs:
         # live_abusech_sync_works needs a real ABUSECH_API_KEY and is
         # deliberately not run here; see live-ingest-check.yml.
         run: cargo test -- --include-ignored --skip live_abusech_sync_works
+
+  # Phase 1 scaffolding (crates/nsic-core, crates/agent, crates/console).
+  # Split from the `backend` job because none of these three need the
+  # WebKitGTK/GTK system libraries src-tauri does on Linux -- they're plain
+  # Rust binaries/libs, and keeping that true is part of the point of
+  # having pulled them out of src-tauri. See docs/phase1-design.md.
+  workspace-crates:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: nsic
+          POSTGRES_PASSWORD: nsic
+          POSTGRES_DB: nsic
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://nsic:nsic@localhost:5432/nsic
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+
+      - name: cargo check (nsic-core, agent, console)
+        run: cargo check -p nsic-core -p agent -p console --all-targets
+
+      - name: cargo clippy (nsic-core, agent, console)
+        run: cargo clippy -p nsic-core -p agent -p console --no-deps -- -D warnings
+
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features postgres,rustls
+
+      - name: Run migrations
+        working-directory: src-tauri
+        run: cargo sqlx migrate run
+
+      - name: cargo test (nsic-core, agent, console, including DB-backed integration tests)
+        run: cargo test -p nsic-core -p agent -p console -- --include-ignored
 
   frontend:
     runs-on: ubuntu-latest

@@ -1,15 +1,9 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use md5::Md5;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use std::io::Read;
 use std::path::Path;
 
-pub struct HashResult {
-    pub sha256: String,
-    pub md5: String,
-}
+pub use nsic_core::hashing::{compute_hashes, HashResult};
 
 /// Hashes a file, reusing the cached result when path + size + mtime match
 /// an existing entry so rescans are near-instant. usn is not populated on
@@ -39,26 +33,6 @@ pub async fn hash_file_cached(pool: &PgPool, path: &Path) -> Result<HashResult> 
         .context("hashing task panicked")??;
     store_cache(pool, &path_str, size, mtime, &result).await?;
     Ok(result)
-}
-
-fn compute_hashes(path: &Path) -> Result<HashResult> {
-    let mut file =
-        std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut sha256 = Sha256::new();
-    let mut md5 = Md5::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        sha256.update(&buf[..n]);
-        md5.update(&buf[..n]);
-    }
-    Ok(HashResult {
-        sha256: hex::encode(sha256.finalize()),
-        md5: hex::encode(md5.finalize()),
-    })
 }
 
 async fn lookup_cache(

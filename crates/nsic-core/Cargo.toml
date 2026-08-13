@@ -1,0 +1,21 @@
+[package]
+name = "nsic-core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared hashing and intel-graph types used by the Phase 0 desktop app and the Phase 1 agent/console, kept DB-free by default so the agent can link it without pulling in Postgres."
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+sha2 = "0.10"
+md-5 = "0.10"
+hex = "0.4"
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "chrono", "uuid", "macros"], optional = true }
+
+[features]
+db = ["dep:sqlx"]
+
+[dev-dependencies]
+tempfile = "3"
