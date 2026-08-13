@@ -184,7 +184,7 @@ mod tests {
     use crate::AppState;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use chrono::{DateTime, Duration, Utc};
+    use chrono::{DateTime, Duration, SubsecRound, Utc};
     use http_body_util::BodyExt;
     use sqlx::Row;
     use tower::ServiceExt;
@@ -318,7 +318,11 @@ mod tests {
         let enrolled = enroll(&app).await;
 
         let sha256 = format!("{:0<64}", "sightingtest");
-        let first_seen = Utc::now() - Duration::hours(1);
+        // Postgres TIMESTAMPTZ has microsecond precision; chrono's Utc::now()
+        // has nanosecond precision. Truncate before comparing, or the
+        // round-tripped value read back from the database never exactly
+        // equals the in-memory one submitted.
+        let first_seen = (Utc::now() - Duration::hours(1)).trunc_subsecs(6);
         let response = app
             .clone()
             .oneshot(sighting_request(
