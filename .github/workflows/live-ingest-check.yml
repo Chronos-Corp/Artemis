@@ -57,7 +57,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: env.SKIP != 'true'
         with:
-          workspaces: src-tauri
+          workspaces: .
 
       - name: Install sqlx-cli
         if: env.SKIP != 'true'

@@ -9,12 +9,16 @@ provenance). EDR tells you a file is bad. 4NSIC tells you which campaign it
 belongs to, which CVE it relates to, and what else on the host clusters
 with it.
 
-## Current phase: Phase 0
+## Current phase: Phase 0, with Phase 1 scaffolding underway
 
-Single-machine desktop app. No agent, no server, no fleet. This proves the
-file-manager-with-verdicts UX on one box using abuse.ch feeds (MalwareBazaar,
-ThreatFox) and local YARA. See "Build order" below for what comes next and
-why later phases are deliberately not started yet.
+Phase 0 is a single-machine desktop app: no agent, no server, no fleet.
+This proves the file-manager-with-verdicts UX on one box using abuse.ch
+feeds (MalwareBazaar, ThreatFox) and local YARA. See "Build order" below
+for what comes next.
+
+Phase 1 (agent plus console) has an initial scaffold in `crates/` --
+enrollment and heartbeat plumbing only, no authentication, no verdict
+submission yet. See [`docs/phase1-design.md`](docs/phase1-design.md).
 
 What works today:
 
@@ -167,6 +171,20 @@ Actions -> New repository secret; get a free key at
 [auth.abuse.ch](https://auth.abuse.ch/)). Without that secret the workflow
 reports it plainly and exits rather than failing confusingly.
 
+### Phase 1 scaffold (agent + console)
+
+`crates/agent` and `crates/console` are plain Rust workspace members, no
+Node/npm and (unlike `src-tauri`) no GTK system libraries needed on Linux:
+
+```bash
+cargo test -p nsic-core -p agent -p console          # unit tests, no DB required
+cargo test -p nsic-core -p agent -p console -- --ignored --nocapture  # DB-backed
+```
+
+See [`docs/phase1-design.md`](docs/phase1-design.md) for how to run the
+agent against the console locally and what this scaffold does and doesn't
+do yet.
+
 ### Working with sqlx offline mode
 
 Queries are checked at compile time against the live schema in
@@ -204,8 +222,15 @@ Do not jump ahead; each phase de-risks the next.
 - **Phase 0 (current):** this repo. Single-machine desktop app proving the
   file-manager-with-verdicts UX. Success criteria: an IR analyst uses it on
   a real case and wants it again.
-- **Phase 1:** Agent plus console. File-to-IOC across a fleet. Sample
-  retrieval.
+- **Phase 1 (in progress):** Agent plus console. File-to-IOC across a
+  fleet. Sample retrieval. First PR landed: `crates/nsic-core` (shared
+  hashing + intel-graph types, extracted out of `src-tauri`),
+  `crates/agent` (a CLI that can hash a file locally and enroll/heartbeat
+  against a console), `crates/console` (an HTTP service that records
+  enrollment/heartbeats in the same Postgres intel graph). No
+  authentication, no verdict submission, no sample retrieval yet -- see
+  [`docs/phase1-design.md`](docs/phase1-design.md) for exactly what's
+  covered and what's deliberately deferred.
 - **Phase 2:** CVE hunt packs, KEV first.
 - **Phase 3:** Folder correlation scoring. Must come after Phase 1 because
   the scoring model cannot be tuned without real telemetry; building it
@@ -223,18 +248,35 @@ already exist.
 
 ## Project layout
 
+The Rust side is a Cargo workspace (root `Cargo.toml`) so `src-tauri` (the
+Phase 0 desktop app) and the Phase 1 `crates/` share one dependency tree
+and one `target/` without depending on each other's platform requirements.
+
 ```
 src/                    React frontend (file manager UI, verdict panel)
 src-tauri/src/
-  models.rs              Shared types: indicators, verdict tiers, provenance
-  db/                     Postgres pool, migrations runner, query layer
+  models.rs              Phase 0-only types (FileEntry, SyncSummary); re-exports
+                          the shared intel-graph types from nsic-core
+  db/                     Postgres query layer; connect_and_migrate is re-exported
+                          from nsic-core
   ingest/                 MalwareBazaar and ThreatFox feed sync
   yara_scan.rs            YARA rule loading and scanning
-  hashing.rs              Cached file hashing (path + size + mtime)
+  hashing.rs              Postgres-cached file hashing (path + size + mtime);
+                          the actual digest computation is in nsic-core
   bloom.rs                Bloom filter of known-bad hashes
   verdict.rs              Ties hashing + bloom + YARA + DB into a verdict
   fs_browse.rs            Directory listing for the file manager
   commands.rs             Tauri IPC commands exposed to the frontend
-src-tauri/migrations/    Postgres schema (intel graph)
+src-tauri/migrations/    Postgres schema (intel graph), shared with crates/console
 yara-rules/               Local YARA rules loaded at startup
+
+crates/nsic-core/src/    Shared, DB-free by default: hashing, intel-graph
+                          vocabulary, agent<->console wire types (proto.rs).
+                          `db` feature adds connect_and_migrate.
+crates/agent/src/        Phase 1 fleet agent CLI (nsic-agent): hash / enroll /
+                          heartbeat. No Postgres, no GTK, single static binary.
+crates/console/src/      Phase 1 fleet console (nsic-console): HTTP service,
+                          axum, backed by the same Postgres intel graph.
+
+docs/phase1-design.md   What Phase 1's scaffold covers and what's deferred.
 ```

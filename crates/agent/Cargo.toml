@@ -1,0 +1,20 @@
+[package]
+name = "agent"
+version = "0.1.0"
+edition = "2021"
+description = "Phase 1 fleet agent. Single static binary, userland only; sends hashes and metadata to the console, never file contents (see repo README, 'Locked architecture decisions')."
+
+[[bin]]
+name = "nsic-agent"
+path = "src/main.rs"
+
+[dependencies]
+nsic-core = { path = "../nsic-core" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
