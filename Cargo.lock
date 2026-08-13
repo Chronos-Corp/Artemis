@@ -2694,6 +2694,7 @@ dependencies = [
  "sha2",
  "sqlx",
  "tempfile",
+ "tokio",
  "uuid",
 ]
 

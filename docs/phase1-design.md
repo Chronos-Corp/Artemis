@@ -92,6 +92,21 @@ token must not answer both):
   happy path, heartbeat with a missing/forged credential, heartbeat with
   one host's credential against a different host's id, heartbeat against
   an unknown `host_id`.
+- **Upgrade path for pre-existing PR #3 host rows.** The first draft of
+  `0004_host_credential.sql` renamed the unused, nullable
+  `enrollment_token_hash` column and immediately applied `NOT NULL` —
+  which fails against any host enrolled under PR #3, since that row has
+  no credential to satisfy the constraint. CI's fresh, empty database
+  never exercised this, so it shipped green. Fixed (caught in review) by
+  backfilling any pre-existing NULL with a sentinel
+  (`'legacy-host-requires-re-enrollment'`) that can never equal a real
+  credential hash, before applying `NOT NULL` — those hosts simply can't
+  authenticate until they re-enroll, but their row isn't dropped. See
+  `crates/nsic-core/src/db.rs`'s
+  `migration_0004_backfills_legacy_hosts_without_a_credential` test,
+  which applies `0003_hosts.sql` and `0004_host_credential.sql` verbatim
+  against an isolated schema seeded with a legacy row, so this upgrade
+  path is exercised rather than assumed.
 
 Everything here is still single-machine-testable: run the console, enroll
 one agent against it locally, heartbeat it. There is no fleet yet.
@@ -118,6 +133,16 @@ one agent against it locally, heartbeat it. There is no fleet yet.
   `host` row outright. No rotation flow exists either.
 - **Rate limiting on `/api/v1/agents/enroll`.** The bootstrap secret is a
   single shared value; nothing currently throttles guesses against it.
+- **Bootstrap-secret strength enforcement.** `NSIC_ENROLLMENT_SECRET` is
+  taken as-is; the console doesn't reject a short or weak value. Fine for
+  local testing, not before a real deployment.
+- **Protected agent-side credential persistence.** The CLI prints the
+  per-agent credential and leaves storing it to the caller; there's no
+  agent-managed credential file (with correct permissions, per OS) yet.
+  That needs a design once the agent stops being a one-shot CLI and
+  becomes a persistent process sending authenticated telemetry (PR #6 and
+  after) — storing a long-lived credential insecurely at that point is a
+  real vulnerability, not just a rough edge.
 - **Sample retrieval.** Locked architecture decision #3: file contents
   leave the host only on explicit analyst request, logged and attributed.
   No part of that request/audit flow exists yet.
