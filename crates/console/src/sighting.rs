@@ -549,8 +549,10 @@ mod tests {
         // Postgres TIMESTAMPTZ has microsecond precision; chrono's Utc::now()
         // has nanosecond precision. Truncate before comparing, or the
         // round-tripped value read back from the database never exactly
-        // equals the in-memory one submitted.
-        let first_seen = (Utc::now() - Duration::hours(1)).trunc_subsecs(6);
+        // equals the in-memory one submitted. Both timestamps stay in the
+        // past (not `first_seen + Duration::hours(2)`, which would land in
+        // the future and trip the observed_at future-skew check).
+        let first_seen = (Utc::now() - Duration::hours(2)).trunc_subsecs(6);
         let response = app
             .clone()
             .oneshot(sighting_request(
@@ -597,8 +599,9 @@ mod tests {
             "sighting submission should also populate detection_detects_indicator"
         );
 
-        // Resubmit the same sighting, observed an hour later.
-        let last_seen = first_seen + Duration::hours(2);
+        // Resubmit the same sighting, observed an hour later (still in the
+        // past: first_seen was 2h ago, this is 1h ago).
+        let last_seen = first_seen + Duration::hours(1);
         let response = app
             .clone()
             .oneshot(sighting_request(
