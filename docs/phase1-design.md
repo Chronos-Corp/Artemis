@@ -42,9 +42,24 @@ two ends of a wire talking to each other correctly.
   already anticipated in the schema (`host.enrollment_token_hash`, unused
   so far) — next step is the console minting a bearer credential at
   enroll time and every subsequent request (heartbeat, and later event
-  submission) requiring it.
+  submission) requiring it. That credential has to be a distinct concern
+  from *authorizing the enrollment itself* — an arbitrary client being
+  able to complete enrollment and walk away with a legitimate agent
+  identity is the same gap by another name, so bootstrap authorization
+  (who's allowed to enroll at all) and per-agent credentials (what an
+  already-enrolled agent presents afterward) need separate designs, not
+  one token doing both jobs.
 - **Transport security.** HTTP, not HTTPS. Fine for localhost testing,
-  not for anything crossing a real network.
+  not for anything crossing a real network. The console's default bind is
+  loopback-only (`127.0.0.1:8787`) precisely because of this; reaching it
+  from another host requires deliberately overriding `NSIC_CONSOLE_ADDR`.
+- **Protocol versioning.** `/agents/enroll` and `/agents/{id}/heartbeat`
+  are unversioned. Once sighting submission, rule sync, or sample
+  retrieval start expanding this API, it needs a `/api/v1/...` prefix
+  (or equivalent) before this scaffold's two routes calcify into an
+  unversioned surface everything else has to stay compatible with.
+  `agent_version` (already in the wire types) is a separate concern from
+  protocol version and should stay that way.
 - **Local YARA scanning on the agent.** `src-tauri/src/yara_scan.rs` is
   already DB-free and a good candidate to move into `nsic-core` next to
   `hashing`, once the agent actually needs to run rule matches locally
@@ -65,6 +80,13 @@ two ends of a wire talking to each other correctly.
   is intentionally cross-platform-trivial (it hashes a file and speaks
   HTTP) so Phase 1's wire protocol and data model can be proven before any
   platform-specific collection logic gets added on top.
+- **Migrations still live under `src-tauri/migrations/`.** That predates
+  this crate split and `nsic-core::db::connect_and_migrate` points there
+  by relative path (see `crates/nsic-core/src/db.rs`) purely to avoid
+  disturbing `src-tauri`'s existing sqlx offline query cache and CI steps
+  in this PR. Longer-term the migrations directory should move to a
+  location that isn't nested inside the Phase 0 desktop app, since the
+  console now owns and runs them just as much as `src-tauri` does.
 
 ## Data model addition
 

@@ -22,8 +22,11 @@ async fn main() -> anyhow::Result<()> {
 
     let app = build_router(pool);
 
+    // Unauthenticated HTTP with no TLS (see docs/phase1-design.md), so the
+    // default bind is loopback-only. Network-wide exposure has to be an
+    // explicit opt-in via NSIC_CONSOLE_ADDR, not the out-of-the-box default.
     let addr: SocketAddr = std::env::var("NSIC_CONSOLE_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:8787".to_string())
+        .unwrap_or_else(|_| "127.0.0.1:8787".to_string())
         .parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("console listening on {addr}");
