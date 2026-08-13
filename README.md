@@ -17,8 +17,8 @@ feeds (MalwareBazaar, ThreatFox) and local YARA. See "Build order" below
 for what comes next.
 
 Phase 1 (agent plus console) has an initial scaffold in `crates/` --
-authenticated enrollment and heartbeat plumbing, and the agent can run
-local YARA scans. No sighting submission to the console yet. See
+authenticated enrollment, heartbeat, and sighting-submission plumbing;
+the agent can run local YARA scans and report matches to the console. See
 [`docs/phase1-design.md`](docs/phase1-design.md).
 
 What works today:
@@ -230,12 +230,12 @@ Do not jump ahead; each phase de-risks the next.
   fleet. Sample retrieval. Landed so far: `crates/nsic-core` (shared
   hashing, YARA scanning, and intel-graph types, extracted out of
   `src-tauri`), `crates/agent` (a CLI that can hash a file, run a local
-  YARA scan, and enroll/heartbeat against a console), `crates/console`
-  (an HTTP service, `/api/v1`, recording enrollment/heartbeats in the
-  same Postgres intel graph). Enrollment requires a console-operator
-  bootstrap secret; each enrolled host gets its own credential for
-  authenticated heartbeats. No sighting submission (reporting a YARA hit
-  back to the console) or sample retrieval yet -- see
+  YARA scan, enroll/heartbeat against a console, and report scan matches
+  as sightings), `crates/console` (an HTTP service, `/api/v1`, recording
+  enrollment/heartbeats/sightings in the same Postgres intel graph).
+  Enrollment requires a console-operator bootstrap secret; each enrolled
+  host gets its own credential for authenticated heartbeats and sighting
+  submission. No sample retrieval or fleet UI yet -- see
   [`docs/phase1-design.md`](docs/phase1-design.md) for exactly what's
   covered and what's deliberately deferred.
 - **Phase 2:** CVE hunt packs, KEV first.
@@ -267,7 +267,7 @@ src-tauri/src/
   db/                     Postgres query layer; connect_and_migrate is re-exported
                           from nsic-core
   ingest/                 MalwareBazaar and ThreatFox feed sync
-  yara_scan.rs            Re-exports YaraEngine/YaraMatch from nsic-core
+  yara_scan.rs            Re-exports YaraEngine from nsic-core
   hashing.rs              Postgres-cached file hashing (path + size + mtime);
                           the actual digest computation is in nsic-core
   bloom.rs                Bloom filter of known-bad hashes
@@ -283,10 +283,13 @@ crates/nsic-core/src/    Shared, minimal by default: hashing and intel-graph
                           connect_and_migrate, `yara-scan` feature adds
                           YARA rule loading/scanning (yara_scan.rs).
 crates/agent/src/        Phase 1 fleet agent CLI (nsic-agent): hash / scan /
-                          enroll / heartbeat. No Postgres, no GTK, single
-                          static binary; links libyara (yara-scan feature).
+                          enroll / heartbeat, and scan can report matches
+                          as sightings. No Postgres, no GTK, single static
+                          binary; links libyara (yara-scan feature).
 crates/console/src/      Phase 1 fleet console (nsic-console): HTTP service,
                           axum, backed by the same Postgres intel graph.
+                          host.rs (enroll/heartbeat), sighting.rs (sighting
+                          submission), auth.rs (shared credential checks).
                           No YARA linked -- it doesn't scan anything itself.
 
 docs/phase1-design.md   What Phase 1's scaffold covers and what's deferred.
