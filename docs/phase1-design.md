@@ -328,6 +328,22 @@ endpoints use the exact same check rather than two copies drifting.
   indistinguishable from a genuinely clean one today. Sensor health /
   scan coverage reporting needs to land before a future fleet UI is
   allowed to make that inference.
+- **Ruleset fingerprint is not yet path-separator-portable.** The
+  canonical manifest in `YaraEngine::load` includes each rule file's
+  relative path as raw text. On Windows that path uses `\`, on Unix `/`,
+  so an identical rules directory fingerprints differently depending on
+  which OS the agent runs on. Normalizing relative paths to `/` before
+  they enter the manifest would make ruleset identity comparable across
+  a mixed-OS fleet; not done yet since Phase 1 has no Windows agent to
+  observe the mismatch against.
+- **`scan` buffers the whole target file into memory.** Reading the file
+  once and hashing/scanning those same bytes is the right evidence-
+  integrity call for a one-shot, one-file Phase 1 CLI invocation, but a
+  persistent scanner (Phase 2+) that watches many files should not
+  blindly buffer arbitrarily large ones. That needs either a file-size
+  policy (skip or chunk-hash above a threshold) or a stable-handle
+  strategy (e.g. hold an open handle and read from it for both hashing
+  and scanning) instead of `std::fs::read`'s single full-file buffer.
 - **Transport security.** Still HTTP, not HTTPS. The bootstrap secret,
   per-agent credentials, and now sighting data all cross the wire in
   plaintext today. Real TLS (or at minimum a documented "put this behind
