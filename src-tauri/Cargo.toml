@@ -18,7 +18,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-nsic-core = { path = "../crates/nsic-core", features = ["db"] }
+nsic-core = { path = "../crates/nsic-core", features = ["db", "yara-scan"] }
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
@@ -26,13 +26,11 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync"] }
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "chrono", "uuid", "macros"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-yara = "0.29"
 bloomfilter = { version = "3", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 anyhow = "1"
 thiserror = "2"
-walkdir = "2"
 dirs = "6"
 tracing = "0.1"
 tracing-subscriber = "0.3"

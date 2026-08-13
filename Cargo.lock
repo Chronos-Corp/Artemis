@@ -2678,8 +2678,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "walkdir",
- "yara",
 ]
 
 [[package]]
@@ -2696,6 +2694,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+ "walkdir",
+ "yara",
 ]
 
 [[package]]
