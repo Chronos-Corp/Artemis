@@ -19,3 +19,4 @@ db = ["dep:sqlx"]
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
