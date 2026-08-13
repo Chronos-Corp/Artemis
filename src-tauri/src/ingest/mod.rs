@@ -7,11 +7,14 @@ use sqlx::PgPool;
 
 use crate::models::SyncSummary;
 
-/// abuse.ch feeds format timestamps as naive `YYYY-MM-DD HH:MM:SS` strings
-/// (implicitly UTC); shared by every feed module rather than duplicated.
+/// abuse.ch currently returns timestamps as `YYYY-MM-DD HH:MM:SS UTC` in
+/// some feeds, while older responses omitted the explicit UTC suffix.
+/// Accept both forms and preserve parse failure as `None` so callers never
+/// have to manufacture a source observation time.
 pub(crate) fn parse_abusech_time(s: Option<&str>) -> Option<DateTime<Utc>> {
-    let s = s?;
-    NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+    let raw = s?.trim();
+    let normalized = raw.strip_suffix(" UTC").unwrap_or(raw);
+    NaiveDateTime::parse_from_str(normalized, "%Y-%m-%d %H:%M:%S")
         .ok()
         .map(|naive| naive.and_utc())
 }
@@ -28,6 +31,30 @@ pub async fn run_all(pool: &PgPool, api_key: &str) -> Vec<(&'static str, Result<
         ("malwarebazaar", malwarebazaar::sync(pool, api_key).await),
         ("threatfox", threatfox::sync(pool, api_key).await),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_abusech_time;
+
+    #[test]
+    fn parses_timestamp_with_explicit_utc_suffix() {
+        let parsed = parse_abusech_time(Some("2026-08-13 15:04:05 UTC"))
+            .expect("timestamp with UTC suffix should parse");
+        assert_eq!(parsed.to_rfc3339(), "2026-08-13T15:04:05+00:00");
+    }
+
+    #[test]
+    fn parses_legacy_timestamp_without_suffix() {
+        let parsed = parse_abusech_time(Some("2026-08-13 15:04:05"))
+            .expect("legacy timestamp should parse");
+        assert_eq!(parsed.to_rfc3339(), "2026-08-13T15:04:05+00:00");
+    }
+
+    #[test]
+    fn rejects_malformed_timestamp() {
+        assert!(parse_abusech_time(Some("not-a-timestamp")).is_none());
+    }
 }
 
 #[cfg(test)]
