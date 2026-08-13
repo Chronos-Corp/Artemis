@@ -21,10 +21,14 @@ const YARA_SIGHTING_SOURCE: &str = "agent:yara_scan";
 const YARA_SIGHTING_CONFIDENCE: i16 = 65;
 
 /// How far ahead of the console's own clock an agent's claimed
-/// `observed_at` is tolerated before being rejected outright. Generous
-/// enough for ordinary clock drift, nowhere near enough to let a
-/// misconfigured or compromised endpoint plant a bogus future extremum
-/// that `GREATEST(last_seen, ...)` would otherwise accept permanently.
+/// `observed_at` is tolerated before being rejected outright, and (with
+/// `earliest_plausible_observed_at` below) how far in the past. This
+/// bounds, but does not eliminate, what a misconfigured or compromised
+/// endpoint clock can claim: anything within the window is still
+/// accepted at face value. What actually limits the damage is
+/// `received_at` on `host_sighted_indicator` -- a server-controlled
+/// ingestion timestamp analysts can compare the claim against, not a
+/// guarantee the claim is honest.
 const MAX_FUTURE_SKEW: chrono::Duration = chrono::Duration::minutes(5);
 
 /// Records that `host_id` observed a YARA rule match, provided the caller
@@ -32,11 +36,12 @@ const MAX_FUTURE_SKEW: chrono::Duration = chrono::Duration::minutes(5);
 /// validation. Upserts the indicator (the file's hash) and the detection
 /// (the rule) if either is new, then both a `detection_detects_indicator`
 /// edge (so this hit joins the same graph a local desktop scan would
-/// populate) and a `host_sighted_indicator` edge (which host,
-/// specifically, saw it, from where, and under which ruleset version).
-/// All four writes happen in one transaction: a failure partway through
-/// must not leave the graph with, say, a new indicator and detection but
-/// no record of which host actually saw them together.
+/// populate) and a `host_sighted_indicator` edge carrying the full
+/// authenticated claim: which host, through which detection, saw which
+/// indicator, from where, and under which ruleset version. All four
+/// writes happen in one transaction: a failure partway through must not
+/// leave the graph with, say, a new indicator and detection but no
+/// record of which host actually saw them together.
 pub async fn report_sighting(
     State(state): State<AppState>,
     Path(host_id): Path<Uuid>,
@@ -70,6 +75,7 @@ pub async fn report_sighting(
     upsert_host_sighted_indicator(
         &mut *tx,
         host_id,
+        detection_id,
         indicator_id,
         YARA_SIGHTING_SOURCE,
         YARA_SIGHTING_CONFIDENCE,
@@ -235,18 +241,25 @@ where
 }
 
 /// New edge this PR introduces (`src-tauri/migrations/
-/// 0005_host_sighted_indicator.sql`). `ruleset_fingerprint` is part of the
-/// conflict target, not just a bound column: the same host reporting the
-/// same indicator again under a materially different ruleset creates a
-/// new row rather than silently merging into (and losing the provenance
-/// of) an earlier one. `path` only advances when the incoming
-/// observation is at least as recent as what's already stored, so an
-/// out-of-order report can't regress "where it was last seen" to a stale
-/// path while `last_seen` itself still (correctly) only ever advances.
+/// 0005_host_sighted_indicator.sql`). Carries `detection_id` as part of
+/// the row and the conflict target, not just `indicator_id`: the four
+/// upserts here otherwise record "host H saw indicator X" and
+/// "detection R flags indicator X" as two independent facts, losing
+/// exactly which detection this particular host's sighting went through
+/// -- unrecoverable if two hosts report the same indicator via two
+/// different rules. `ruleset_fingerprint` is part of the conflict target
+/// too: the same host reporting the same indicator+detection again under
+/// a materially different ruleset creates a new row rather than silently
+/// merging into (and losing the provenance of) an earlier one. `path`
+/// only advances when the incoming observation is at least as recent as
+/// what's already stored, so an out-of-order report can't regress "where
+/// it was last seen" to a stale path while `last_seen` itself still
+/// (correctly) only ever advances.
 #[allow(clippy::too_many_arguments)]
 async fn upsert_host_sighted_indicator<'e, E>(
     executor: E,
     host_id: Uuid,
+    detection_id: Uuid,
     indicator_id: Uuid,
     source: &str,
     confidence: i16,
@@ -260,10 +273,11 @@ where
 {
     sqlx::query(
         "INSERT INTO host_sighted_indicator \
-            (host_id, indicator_id, source, confidence, path, ruleset_fingerprint, \
-             first_seen, last_seen) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-         ON CONFLICT (host_id, indicator_id, source, ruleset_fingerprint) DO UPDATE SET \
+            (host_id, detection_id, indicator_id, source, confidence, path, \
+             ruleset_fingerprint, first_seen, last_seen) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+         ON CONFLICT (host_id, detection_id, indicator_id, source, ruleset_fingerprint) \
+         DO UPDATE SET \
             confidence = EXCLUDED.confidence, \
             path = CASE WHEN EXCLUDED.last_seen >= host_sighted_indicator.last_seen \
                         THEN EXCLUDED.path ELSE host_sighted_indicator.path END, \
@@ -271,6 +285,7 @@ where
             last_seen = GREATEST(host_sighted_indicator.last_seen, EXCLUDED.last_seen)",
     )
     .bind(host_id)
+    .bind(detection_id)
     .bind(indicator_id)
     .bind(source)
     .bind(confidence)
@@ -706,6 +721,92 @@ mod tests {
         assert_eq!(
             edge_count, 2,
             "two materially different rulesets should leave two distinct sighting rows"
+        );
+    }
+
+    /// Two different hosts matching the same hash through two different
+    /// rules must remain distinguishable: host A saw indicator X via rule
+    /// Alpha, host B saw the same indicator X via rule Beta. Before
+    /// detection_id was part of host_sighted_indicator, the graph could
+    /// only reconstruct "A saw X" and "B saw X" plus "Alpha detects X" and
+    /// "Beta detects X" -- not which host matched which rule.
+    #[tokio::test]
+    #[ignore]
+    async fn report_sighting_preserves_which_rule_each_host_saw() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let app = crate::build_router(state);
+        let host_a = enroll(&app).await;
+        let host_b = enroll(&app).await;
+
+        let sha256 = valid_sha256("a17e1000a1e1000");
+        let fingerprint = valid_fingerprint("f");
+        let now = Utc::now().trunc_subsecs(6);
+
+        let response = app
+            .clone()
+            .oneshot(sighting_request_full(
+                host_a.host_id,
+                Some(&host_a.credential),
+                &sha256,
+                "Alpha",
+                &fingerprint,
+                Some("/tmp/eicar.txt"),
+                now,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(sighting_request_full(
+                host_b.host_id,
+                Some(&host_b.credential),
+                &sha256,
+                "Beta",
+                &fingerprint,
+                Some("/tmp/eicar.txt"),
+                now,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let indicator_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM indicator WHERE kind = 'sha256' AND value = $1")
+                .bind(&sha256)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let host_a_rule: String = sqlx::query_scalar(
+            "SELECT d.name FROM host_sighted_indicator h \
+             JOIN detection d ON d.id = h.detection_id \
+             WHERE h.host_id = $1 AND h.indicator_id = $2",
+        )
+        .bind(host_a.host_id)
+        .bind(indicator_id)
+        .fetch_one(&pool)
+        .await
+        .expect("host A's sighting row, joined to the rule it actually matched");
+        let host_b_rule: String = sqlx::query_scalar(
+            "SELECT d.name FROM host_sighted_indicator h \
+             JOIN detection d ON d.id = h.detection_id \
+             WHERE h.host_id = $1 AND h.indicator_id = $2",
+        )
+        .bind(host_b.host_id)
+        .bind(indicator_id)
+        .fetch_one(&pool)
+        .await
+        .expect("host B's sighting row, joined to the rule it actually matched");
+
+        assert_eq!(
+            host_a_rule, "Alpha",
+            "host A's sighting must stay tied to the rule it matched"
+        );
+        assert_eq!(
+            host_b_rule, "Beta",
+            "host B's sighting must stay tied to the rule it matched"
         );
     }
 

@@ -15,13 +15,18 @@ pub struct YaraEngine {
     rules: Option<yara::Rules>,
     pub rules_dir: PathBuf,
     pub rule_count: usize,
-    /// SHA-256, hex-encoded, of the concatenated bytes of every rule file
-    /// that went into this compiled ruleset, in sorted path order (so it's
-    /// deterministic regardless of filesystem iteration order). Identifies
-    /// *which version* of the rules produced a match: a rule's name alone
-    /// is not enough to reconstruct what it actually checked for once the
-    /// rule file has since been edited. Callers that persist a match
-    /// durably (e.g. a fleet sighting) should persist this alongside it.
+    /// SHA-256, hex-encoded, over a canonical manifest of every rule file
+    /// that went into this compiled ruleset: for each file, in sorted
+    /// relative-path order, the manifest entry is the file's relative path,
+    /// then a NUL byte, then the hex SHA-256 of its contents, then a
+    /// newline. The per-file separators make this unambiguous (naive
+    /// concatenation of file A followed by file B is not distinguishable
+    /// from some other split X followed by Y with the same total bytes;
+    /// framing each entry closes that off). Identifies *which version* of
+    /// the rules produced a match: a rule's name alone is not enough to
+    /// reconstruct what it actually checked for once the rule file has
+    /// since been edited. Callers that persist a match durably (e.g. a
+    /// fleet sighting) should persist this alongside it.
     pub ruleset_fingerprint: String,
 }
 
@@ -68,19 +73,37 @@ impl YaraEngine {
             return Ok(Self::empty(rules_dir));
         }
 
-        // yara::Compiler::add_rules_file consumes self and does not hand it
+        // yara::Compiler::add_rules_str consumes self and does not hand it
         // back on error, so a single malformed rule file aborts the whole
         // batch. That is surfaced as a load error rather than silently
         // dropping rules the analyst thinks are active.
+        //
+        // Each file is read exactly once here and those same bytes both
+        // feed the fingerprint and get compiled (via add_rules_str, not
+        // add_rules_file, so the compiler never reopens the path itself).
+        // Reading once and fingerprinting/compiling the read bytes is the
+        // same TOCTOU fix `nsic-agent scan` applies to the scanned file:
+        // fingerprinting bytes at one instant and letting the compiler
+        // independently reopen the path an instant later could fingerprint
+        // version A of a rule while actually compiling version B if the
+        // file changed in between.
         let mut compiler = yara::Compiler::new().context("initializing YARA compiler")?;
         let mut fingerprint = Sha256::new();
         let mut loaded = 0usize;
         for file in &rule_files {
             let bytes = std::fs::read(file)
                 .with_context(|| format!("reading YARA rule file {}", file.display()))?;
-            fingerprint.update(&bytes);
+
+            let relative = file.strip_prefix(rules_dir).unwrap_or(file);
+            fingerprint.update(relative.to_string_lossy().as_bytes());
+            fingerprint.update(b"\0");
+            fingerprint.update(hex::encode(Sha256::digest(&bytes)).as_bytes());
+            fingerprint.update(b"\n");
+
+            let source = std::str::from_utf8(&bytes)
+                .with_context(|| format!("YARA rule file {} is not valid UTF-8", file.display()))?;
             compiler = compiler
-                .add_rules_file(file)
+                .add_rules_str(source)
                 .with_context(|| format!("loading YARA rule file {}", file.display()))?;
             loaded += 1;
         }

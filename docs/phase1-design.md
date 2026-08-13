@@ -171,15 +171,16 @@ endpoints use the exact same check rather than two copies drifting.
   `upsert_detection` (the YARA rule, by name), a
   `detection_detects_indicator` edge (so a fleet hit joins the exact same
   graph a local desktop scan populates), and the new
-  `host_sighted_indicator` edge (which host, specifically, saw it, from
-  where, and under which ruleset version — see Data model below). All
-  four writes happen inside one Postgres transaction
-  (`state.pool.begin()`); the three shared upsert helpers are generic
-  over `sqlx::PgExecutor` (mirroring `src-tauri`'s own
-  `upsert_report`/`upsert_indicator` signatures) specifically so they can
-  run against either a bare pool or a transaction. A failure partway
-  through rolls back the whole sighting rather than leaving, say, a new
-  indicator and detection recorded with no host tied to them.
+  `host_sighted_indicator` edge carrying the full authenticated claim:
+  which host, through which detection, saw which indicator, from where,
+  and under which ruleset version (see Data model below). All four
+  writes happen inside one Postgres transaction (`state.pool.begin()`);
+  the three shared upsert helpers are generic over `sqlx::PgExecutor`
+  (mirroring `src-tauri`'s own `upsert_report`/`upsert_indicator`
+  signatures) specifically so they can run against either a bare pool or
+  a transaction. A failure partway through rolls back the whole sighting
+  rather than leaving, say, a new indicator and detection recorded with
+  no host tied to them.
 - **These four upserts are reimplemented in `crates/console/src/
   sighting.rs`** with runtime-checked queries (no `sqlx::query!` macro),
   not shared from `src-tauri/src/db/indicators.rs` where three of the
@@ -192,17 +193,48 @@ endpoints use the exact same check rather than two copies drifting.
   SQL shape (same tables, same `ON CONFLICT` targets) as `src-tauri`'s
   macro versions; drift between them is the accepted cost, flagged in
   code comments at each reimplemented function.
-- **Ruleset provenance.** A rule's name alone doesn't identify what it
-  actually checked for once the rule file has since been edited, so
-  `YaraEngine` (`crates/nsic-core/src/yara_scan.rs`) now carries a
-  `ruleset_fingerprint`: a SHA-256 of every loaded rule file's bytes,
-  concatenated in sorted path order for determinism, computed once at
-  `load()`. The agent includes it in every `SightingRequest`, and it's
-  part of `host_sighted_indicator`'s primary key
-  (`(host_id, indicator_id, source, ruleset_fingerprint)`), not just a
-  plain column — the same host reporting the same indicator again under
-  a materially different ruleset creates a new, distinct row instead of
+- **Ruleset provenance, fingerprinted the same way the target file is.**
+  A rule's name alone doesn't identify what it actually checked for once
+  the rule file has since been edited, so `YaraEngine`
+  (`crates/nsic-core/src/yara_scan.rs`) now carries a
+  `ruleset_fingerprint`. First draft computed it by reading each rule
+  file once for the fingerprint and letting `yara::Compiler::
+  add_rules_file` reopen the same path a moment later to compile it —
+  the exact TOCTOU class the file-evidence fix below closes, just moved
+  one level up: a rule edited between those two reads could fingerprint
+  as version A while what actually got compiled (and produced the match)
+  was version B. Fixed the same way: each rule file is read exactly
+  once, and those same bytes both feed the fingerprint and get compiled
+  (`add_rules_str`, not `add_rules_file`, so the compiler never reopens
+  the path). The fingerprint itself is a SHA-256 over a canonical
+  manifest — for each file, in sorted relative-path order, its relative
+  path, a NUL byte, the hex SHA-256 of its contents, and a newline — not
+  a naive concatenation of file bytes, which is ambiguous (file A's bytes
+  followed by file B's are not distinguishable from some other split X
+  followed by Y with the same total length; the per-file framing closes
+  that off). The agent includes it in every `SightingRequest`, and it's
+  part of `host_sighted_indicator`'s primary key, not just a plain column
+  — the same host reporting the same indicator+detection again under a
+  materially different ruleset creates a new, distinct row instead of
   silently merging into (and losing the provenance of) an earlier one.
+  This is an agent-reported value from an authenticated host, not
+  something the console independently verifies against real rule content
+  — the console only checks it's shaped like a SHA-256 (see input
+  validation below). It becomes console-verifiable only once the console
+  itself distributes or maintains known rulesets, not yet the case.
+- **Which detection produced which sighting is preserved, not just which
+  indicator.** First draft's `host_sighted_indicator` had no
+  `detection_id` — it recorded "host H saw indicator X" and, separately
+  via `detection_detects_indicator`, "detection R flags indicator X," but
+  nothing tying a *specific host's* sighting to the *specific rule* that
+  produced it. Two hosts matching the same hash through two different
+  rules were indistinguishable from the console's perspective: the graph
+  could reconstruct that both hosts saw the hash and that both rules
+  detect it, but not which host matched which rule. `detection_id` is now
+  part of the row and the primary key
+  (`host_id, detection_id, indicator_id, source, ruleset_fingerprint`),
+  so the full authenticated claim — host H observed indicator X through
+  detection R under ruleset V — survives intact.
 - **Same bytes, hashed and scanned once.** The agent used to open the
   scanned file twice: once for `YaraEngine::scan(path)`, and — only if
   reporting was enabled — again via `compute_hashes(path)` to get the
@@ -227,9 +259,8 @@ endpoints use the exact same check rather than two copies drifting.
   anything touches the database. Without this, `"sha256": "banana"`
   would have become a real `IndicatorKind::Sha256` row, corrupting the
   graph's type invariant.
-- **Idempotency and stale-observation ordering.** `PRIMARY KEY (host_id,
-  indicator_id, source, ruleset_fingerprint)` on `host_sighted_indicator`
-  — resubmitting the same sighting is an upsert, not a duplicate row.
+- **Idempotency and stale-observation ordering.** Resubmitting the same
+  sighting is an upsert (matching primary key), not a duplicate row.
   `first_seen` takes `LEAST`, `last_seen` takes `GREATEST` (the exact
   pattern every other edge in `0001_init.sql` already uses); `path`
   advances to the newly reported value only when that report's
@@ -238,15 +269,18 @@ endpoints use the exact same check rather than two copies drifting.
   unconditionally — otherwise a report arriving out of order could
   regress "where it was last seen" to a stale path even while
   `last_seen` itself correctly kept advancing.
-- **`received_at`.** `host_sighted_indicator` also records when the
-  console first accepted a given `(host, indicator, source,
-  ruleset_fingerprint)` fact (`DEFAULT now()`, set once, never updated on
-  conflict), independent of the agent-claimed `first_seen`/`last_seen`.
-  Combined with the `observed_at` bounds check above, this means a single
-  misconfigured or compromised endpoint clock can't plant a bogus extreme
-  timestamp that later, legitimate sightings have no way to repair — and
-  even within the accepted range, analysts retain enough provenance to
-  notice a suspect endpoint clock.
+- **`received_at` bounds, but doesn't eliminate, a bad endpoint clock.**
+  `host_sighted_indicator` records when the console first accepted a
+  given fact (`DEFAULT now()`, set once, never updated on conflict),
+  independent of the agent-claimed `first_seen`/`last_seen`. Combined
+  with the `observed_at` bounds check above, this limits how far a
+  misconfigured or compromised endpoint clock can distort
+  `first_seen`/`last_seen` — but it's a bound, not a guarantee: an
+  endpoint can still report any `observed_at` within the accepted window
+  (2020-01-01 through 5 minutes ahead of the console's clock), and
+  nothing here verifies that claim is honest. What `received_at` actually
+  buys is provenance: a server-controlled anchor analysts can compare the
+  endpoint's claim against, not proof the claim is true.
 - **Batching is out of scope.** One HTTP request per (indicator,
   detection) pair; the agent loops client-side if a single scan matches
   multiple rules. `nsic-agent scan` still only scans one file per
@@ -270,15 +304,30 @@ endpoints use the exact same check rather than two copies drifting.
   `first_seen`/`last_seen` follow `LEAST`/`GREATEST`, exactly one edge
   row exists (not two), and `detection_detects_indicator` was populated
   too; a different-`ruleset_fingerprint` test confirming two distinct
-  edge rows result instead of one merged row; and a stale-observation
-  test confirming an out-of-order report can't regress `path`. Plus new
-  `nsic-core` tests (plain `#[test]`s, no DB): `scan_bytes` matches
-  `scan` for identical content, `hash_bytes` matches `compute_hashes` for
-  identical content, and `ruleset_fingerprint` is deterministic across
-  reloads and distinguishes a real ruleset from an empty one.
+  edge rows result instead of one merged row; a stale-observation test
+  confirming an out-of-order report can't regress `path`; and a
+  two-hosts-two-rules test (`report_sighting_preserves_which_rule_each_
+  host_saw`) confirming host A's sighting stays joined to the rule it
+  actually matched even when host B matches a different rule against the
+  identical hash. Plus new `nsic-core` tests (plain `#[test]`s, no DB):
+  `scan_bytes` matches `scan` for identical content, `hash_bytes` matches
+  `compute_hashes` for identical content, and `ruleset_fingerprint` is
+  deterministic across reloads and distinguishes a real ruleset from an
+  empty one. `loads_bundled_rules_and_detects_eicar` (unchanged) now also
+  covers `load()`'s new single-read-then-compile-via-add_rules_str path,
+  since that's what it exercises today.
 
 ## What's deliberately not here yet
 
+- **Sensor health / scan coverage.** PR #6 only sends positive sightings
+  -- a match. Zero active YARA rules and zero YARA detections currently
+  look identical from the console's side: both are just an absence of
+  sightings for that host. That's fine as long as nothing downstream
+  treats "no sightings from host H" as "host H is clean" -- a host that
+  never scanned anything, or whose rules failed to load, is
+  indistinguishable from a genuinely clean one today. Sensor health /
+  scan coverage reporting needs to land before a future fleet UI is
+  allowed to make that inference.
 - **Transport security.** Still HTTP, not HTTPS. The bootstrap secret,
   per-agent credentials, and now sighting data all cross the wire in
   plaintext today. Real TLS (or at minimum a documented "put this behind
@@ -339,17 +388,24 @@ enrolled_at, last_heartbeat_at. Additive to the Phase 0 schema in
 `0001_init.sql` / `0002_verdict_indexes.sql`, not a redesign of it.
 
 `host_sighted_indicator` (`src-tauri/migrations/
-0005_host_sighted_indicator.sql`): the host<->indicator edge PR #6 adds.
-`host_id`, `indicator_id`, `source`, `confidence`, `path` (nullable,
-only advances on a conflict when the new observation is at least as
-recent as what's stored), `ruleset_fingerprint` (SHA-256 hex of the
-loaded rule files, part of the primary key so a materially different
-ruleset creates a new row instead of merging into an old one),
-`received_at` (console-controlled ingestion time, set once, never
-updated), `first_seen`, `last_seen`. Primary keyed on `(host_id,
+0005_host_sighted_indicator.sql`): the edge PR #6 adds, carrying the full
+authenticated claim a sighting makes -- host H observed indicator X
+through detection R under ruleset V -- rather than splitting it across
+two edges that can't be joined back together. `host_id`, `detection_id`
+(which specific rule produced this host's sighting; without it, two
+hosts matching the same hash via two different rules would be
+indistinguishable -- see PR #6 above), `indicator_id`, `source`,
+`confidence`, `path` (nullable, only advances on a conflict when the new
+observation is at least as recent as what's stored), `ruleset_fingerprint`
+(SHA-256 hex over a canonical manifest of the loaded rule files, part of
+the primary key so a materially different ruleset creates a new row
+instead of merging into an old one), `received_at` (console-controlled
+ingestion time, set once, never updated -- see PR #6 above for what this
+does and doesn't guarantee about a misbehaving endpoint clock),
+`first_seen`, `last_seen`. Primary keyed on `(host_id, detection_id,
 indicator_id, source, ruleset_fingerprint)` -- the same edge shape every
-other edge in `0001_init.sql` uses, extended by one column for the
-reason above.
+other edge in `0001_init.sql` uses, extended by two columns for the
+reasons above.
 
 ## Running it locally
 
