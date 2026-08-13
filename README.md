@@ -17,7 +17,7 @@ feeds (MalwareBazaar, ThreatFox) and local YARA. See "Build order" below
 for what comes next.
 
 Phase 1 (agent plus console) has an initial scaffold in `crates/` --
-enrollment and heartbeat plumbing only, no authentication, no verdict
+authenticated enrollment and heartbeat plumbing, no local scanning, no verdict
 submission yet. See [`docs/phase1-design.md`](docs/phase1-design.md).
 
 What works today:
@@ -223,12 +223,14 @@ Do not jump ahead; each phase de-risks the next.
   file-manager-with-verdicts UX. Success criteria: an IR analyst uses it on
   a real case and wants it again.
 - **Phase 1 (in progress):** Agent plus console. File-to-IOC across a
-  fleet. Sample retrieval. First PR landed: `crates/nsic-core` (shared
+  fleet. Sample retrieval. Landed so far: `crates/nsic-core` (shared
   hashing + intel-graph types, extracted out of `src-tauri`),
   `crates/agent` (a CLI that can hash a file locally and enroll/heartbeat
-  against a console), `crates/console` (an HTTP service that records
-  enrollment/heartbeats in the same Postgres intel graph). No
-  authentication, no verdict submission, no sample retrieval yet -- see
+  against a console), `crates/console` (an HTTP service, `/api/v1`,
+  recording enrollment/heartbeats in the same Postgres intel graph).
+  Enrollment requires a console-operator bootstrap secret; each enrolled
+  host gets its own credential for authenticated heartbeats. No local
+  YARA scanning, no verdict submission, no sample retrieval yet -- see
   [`docs/phase1-design.md`](docs/phase1-design.md) for exactly what's
   covered and what's deliberately deferred.
 - **Phase 2:** CVE hunt packs, KEV first.
