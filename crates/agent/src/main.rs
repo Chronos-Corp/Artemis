@@ -3,13 +3,15 @@
 //! not enable), and never sends file contents, only hashes and metadata
 //! (see the repo README's "Locked architecture decisions").
 //!
-//! This is scaffolding: enroll and heartbeat only, no local YARA scanning
-//! or verdict submission yet. See docs/phase1-design.md for what's next.
+//! Local YARA scanning (via `nsic-core`'s `yara-scan` feature) is now
+//! real; sending what it finds to the console (sighting submission) is
+//! not yet -- see docs/phase1-design.md for what's next.
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use nsic_core::hashing::compute_hashes;
 use nsic_core::proto::{EnrollRequest, EnrollResponse, HeartbeatRequest, HeartbeatResponse};
+use nsic_core::yara_scan::YaraEngine;
 use reqwest::Response;
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -28,6 +30,16 @@ enum Command {
     /// a verdict lookup; useful standalone while the console has nothing
     /// but enroll/heartbeat to talk to yet.
     Hash { path: PathBuf },
+    /// Load local YARA rules and scan a single file, printing any matches
+    /// as JSON. Local-only, no console involved -- reporting a match like
+    /// this back to the console is sighting submission, not designed yet.
+    Scan {
+        path: PathBuf,
+        /// Directory of .yar/.yara rule files to load. A missing directory
+        /// is not an error: it just means zero rules load, zero matches.
+        #[arg(long, env = "NSIC_YARA_RULES_DIR", default_value = "yara-rules")]
+        rules_dir: PathBuf,
+    },
     /// Register this host with a console, printing the assigned host_id
     /// and the per-agent credential to use for subsequent requests.
     Enroll {
@@ -73,6 +85,22 @@ async fn main() -> Result<()> {
                     "path": path,
                     "sha256": result.sha256,
                     "md5": result.md5,
+                }))?
+            );
+        }
+        Command::Scan { path, rules_dir } => {
+            let engine = YaraEngine::load(&rules_dir)
+                .with_context(|| format!("loading YARA rules from {}", rules_dir.display()))?;
+            let matches = engine
+                .scan(&path)
+                .with_context(|| format!("scanning {}", path.display()))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "path": path,
+                    "rules_dir": rules_dir,
+                    "rule_count": engine.rule_count,
+                    "matches": matches.iter().map(|m| &m.rule_name).collect::<Vec<_>>(),
                 }))?
             );
         }

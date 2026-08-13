@@ -1,9 +1,10 @@
 # Phase 1 design: agent plus console
 
-Status: enrollment and heartbeat are authenticated end to end; most of the
-phase is still not built. This document tracks what Phase 1 actually is,
-what's landed so far, and what's deliberately deferred, in the same spirit
-as the README's Phase 0 "what works today / what's stubbed" split.
+Status: enrollment and heartbeat are authenticated end to end, and the
+agent can run local YARA scans; most of the phase is still not built. This
+document tracks what Phase 1 actually is, what's landed so far, and what's
+deliberately deferred, in the same spirit as the README's Phase 0 "what
+works today / what's stubbed" split.
 
 Per the README's build order, Phase 1 is: agent plus console, file-to-IOC
 across a fleet, sample retrieval. That's a lot; this document exists so
@@ -16,10 +17,9 @@ sequence, and why it's ordered this way:
 2. **PR #4 — agent identity.** Establish who is on that wire, before
    anything the wire carries is trusted. Bootstrap enrollment
    authorization, per-agent credentials, `/api/v1` versioning.
-3. **PR #5 (not started) — local YARA on the agent.** Give the agent
-   something meaningful to observe. Depends on #4 existing so what it
-   observes can eventually be attributed to a specific, authenticated
-   host.
+3. **PR #5 — local YARA on the agent.** Give the agent something
+   meaningful to observe. Depends on #4 existing so what it observes can
+   eventually be attributed to a specific, authenticated host.
 4. **PR #6 (not started) — sighting protocol.** Securely report those
    observations: "host X observed indicator Y," as an authenticated
    `/api/v1/.../sightings` endpoint and a new graph edge. Depends on both
@@ -111,11 +111,37 @@ token must not answer both):
 Everything here is still single-machine-testable: run the console, enroll
 one agent against it locally, heartbeat it. There is no fleet yet.
 
+### PR #5: local YARA scanning on the agent
+
+`src-tauri/src/yara_scan.rs` (`YaraEngine`, `YaraMatch`) moved into
+`nsic-core` verbatim — it was already DB-free — behind a new `yara-scan`
+feature, kept separate from the `db` feature so `crates/console` (which
+needs neither Postgres-free scanning nor YARA) doesn't pick up a
+`libyara-dev` build dependency it has no use for. `src-tauri` enables
+`yara-scan` alongside `db`, same re-export pattern as `hashing`/`models`;
+existing `crate::yara_scan::X` call sites are unaffected.
+
+- **`nsic-agent scan <path> [--rules-dir <dir>]`**: loads local `.yar`/
+  `.yara` rules (default `yara-rules/`, or `NSIC_YARA_RULES_DIR`, matching
+  `src-tauri`'s existing convention) and scans one file, printing matches
+  as JSON. Local-only — nothing is sent to the console yet; that's PR #6.
+- Real test coverage, not just "it compiles": `crates/nsic-core/src/
+  yara_scan.rs` has a test that loads the repo's bundled
+  `yara-rules/example_eicar.yar` and confirms it actually flags an EICAR
+  test string, plus a test that a missing rules directory degrades to
+  zero rules rather than erroring. Both are plain `#[test]`s (no DB, no
+  network), so unlike most of this crate's other tests they run on every
+  `cargo test`, not just `--ignored`.
+- CI's `workspace-crates` job now installs `libyara-dev` (only that,
+  still no GTK/WebKitGTK — `crates/console` still doesn't need it, only
+  `nsic-core`/`crates/agent` do once `yara-scan` is enabled).
+
+This is still local-only, same caveat as PR #4's per-agent credential
+persistence: nothing here sends a YARA hit anywhere. PR #6 is what turns
+"the agent noticed something" into "the console knows about it."
+
 ## What's deliberately not here yet
 
-- **Local YARA scanning on the agent** (PR #5). `src-tauri/src/
-  yara_scan.rs` is already DB-free and the candidate to move into
-  `nsic-core` next to `hashing`.
 - **Verdict / sighting submission** (PR #6). The agent doesn't send
   anything about what it finds yet, only that it exists and is alive
   (and, as of PR #4, that it can prove which host it is). The next real
@@ -186,6 +212,9 @@ cargo run -p agent --bin nsic-agent -- enroll \
 cargo run -p agent --bin nsic-agent -- heartbeat \
   --console-url http://localhost:8787 --host-id <uuid> --credential <token>
 # -> heartbeat ok: received_at=...
+
+cargo run -p agent --bin nsic-agent -- scan path/to/file --rules-dir yara-rules
+# -> {"path": "...", "rules_dir": "yara-rules", "rule_count": 1, "matches": [...]}
 ```
 
 `--enrollment-secret` and `--credential` both fall back to
@@ -194,5 +223,8 @@ cargo run -p agent --bin nsic-agent -- heartbeat \
 `crates/agent` and `crates/console` do not need the WebKitGTK/GTK system
 libraries `src-tauri` requires on Linux (`libwebkit2gtk-4.1-dev` etc.);
 they're plain Rust binaries. `crates/nsic-core` needs nothing beyond a
-Rust toolchain unless built with the `db` feature, which needs the same
-Postgres driver `src-tauri` already needs.
+Rust toolchain by default; the `db` feature needs the same Postgres
+driver `src-tauri` already needs, and the `yara-scan` feature needs
+`libyara-dev` (also already required by `src-tauri`). `crates/agent`
+enables `yara-scan` (for `scan`) but not `db`; `crates/console` enables
+`db` but not `yara-scan` — neither links what it doesn't use.

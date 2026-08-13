@@ -87,6 +87,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install system dependencies
+        # Only libyara-dev, unlike the backend job: crates/agent now links
+        # YARA (nsic-core's yara-scan feature) but none of these three
+        # crates need src-tauri's GTK/WebKitGTK stack.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libyara-dev
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
