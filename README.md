@@ -146,6 +146,27 @@ YARA engine, persists the hit to Postgres, and asserts it comes back out of
 the verdict engine as a `YaraHit` entry with provenance, exercising the
 same path a real file-manager click does.
 
+### Live abuse.ch ingestion check
+
+`ingest/mod.rs` has a second ignored test, `live_abusech_sync_works`, that
+calls the real MalwareBazaar and ThreatFox APIs (not a mock) and asserts the
+sync actually touches indicators/reports. It requires a real
+`ABUSECH_API_KEY` and is excluded from every normal test run:
+
+```bash
+cd src-tauri
+export ABUSECH_API_KEY=...
+cargo test live_abusech_sync_works -- --ignored --nocapture
+```
+
+This also runs in CI on a weekly schedule (`.github/workflows/live-ingest-check.yml`)
+and via manual dispatch, separately from the PR merge gate, so API drift or
+outages get caught without ever blocking a routine merge. It requires an
+`ABUSECH_API_KEY` repository secret (Settings -> Secrets and variables ->
+Actions -> New repository secret; get a free key at
+[auth.abuse.ch](https://auth.abuse.ch/)). Without that secret the workflow
+reports it plainly and exits rather than failing confusingly.
+
 ### Working with sqlx offline mode
 
 Queries are checked at compile time against the live schema in

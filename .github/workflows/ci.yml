@@ -57,7 +57,9 @@ jobs:
 
       - name: cargo test (including DB-backed integration tests)
         working-directory: src-tauri
-        run: cargo test -- --include-ignored
+        # live_abusech_sync_works needs a real ABUSECH_API_KEY and is
+        # deliberately not run here; see live-ingest-check.yml.
+        run: cargo test -- --include-ignored --skip live_abusech_sync_works
 
   frontend:
     runs-on: ubuntu-latest
