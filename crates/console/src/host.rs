@@ -5,7 +5,10 @@ use chrono::Utc;
 use nsic_core::proto::{EnrollRequest, EnrollResponse, HeartbeatRequest, HeartbeatResponse};
 use uuid::Uuid;
 
-use crate::auth::{bearer_token, generate_credential, hash_credential, secrets_match};
+use crate::auth::{
+    authenticate_host, bearer_token, generate_credential, hash_credential, internal_error,
+    secrets_match,
+};
 use crate::AppState;
 
 /// Enrolls a new host, provided the caller presents the console's
@@ -59,29 +62,7 @@ pub async fn heartbeat(
     headers: HeaderMap,
     Json(req): Json<HeartbeatRequest>,
 ) -> Result<Json<HeartbeatResponse>, (StatusCode, String)> {
-    let presented = bearer_token(&headers).ok_or((
-        StatusCode::UNAUTHORIZED,
-        "missing agent credential".to_string(),
-    ))?;
-
-    let unauthorized = || {
-        (
-            StatusCode::UNAUTHORIZED,
-            "invalid agent credential".to_string(),
-        )
-    };
-
-    let stored_hash: Option<String> =
-        sqlx::query_scalar("SELECT credential_hash FROM host WHERE id = $1")
-            .bind(host_id)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(internal_error)?;
-    let stored_hash = stored_hash.ok_or_else(unauthorized)?;
-
-    if !secrets_match(&hash_credential(presented), &stored_hash) {
-        return Err(unauthorized());
-    }
+    authenticate_host(&state.pool, host_id, &headers).await?;
 
     let now = Utc::now();
     sqlx::query("UPDATE host SET last_heartbeat_at = $1, agent_version = $2 WHERE id = $3")
@@ -93,14 +74,6 @@ pub async fn heartbeat(
         .map_err(internal_error)?;
 
     Ok(Json(HeartbeatResponse { received_at: now }))
-}
-
-fn internal_error(e: sqlx::Error) -> (StatusCode, String) {
-    tracing::error!("db error: {e:#}");
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "internal error".to_string(),
-    )
 }
 
 #[cfg(test)]

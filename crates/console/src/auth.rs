@@ -1,8 +1,10 @@
 use axum::http::header::AUTHORIZATION;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
+use sqlx::PgPool;
 use subtle::ConstantTimeEq;
+use uuid::Uuid;
 
 /// Generates a fresh per-agent credential: 32 random bytes, hex-encoded.
 /// Returned to the agent exactly once at enroll time; only its hash is
@@ -35,4 +37,51 @@ pub fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 /// exploit.
 pub fn secrets_match(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
+}
+
+/// Maps a database error to the 500 response every handler in this crate
+/// returns for one, logging the real cause server-side without leaking it
+/// to the caller.
+pub fn internal_error(e: sqlx::Error) -> (StatusCode, String) {
+    tracing::error!("db error: {e:#}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal error".to_string(),
+    )
+}
+
+/// Verifies the bearer token in `headers` is the correct per-agent
+/// credential for `host_id`. Shared by every authenticated agent-facing
+/// endpoint (heartbeat, sightings) so the check can't drift between them.
+/// Unknown host id and wrong credential return the same 401, so callers
+/// can't use this to enumerate valid host ids.
+pub async fn authenticate_host(
+    pool: &PgPool,
+    host_id: Uuid,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, String)> {
+    let presented = bearer_token(headers).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "missing agent credential".to_string(),
+    ))?;
+
+    let unauthorized = || {
+        (
+            StatusCode::UNAUTHORIZED,
+            "invalid agent credential".to_string(),
+        )
+    };
+
+    let stored_hash: Option<String> =
+        sqlx::query_scalar("SELECT credential_hash FROM host WHERE id = $1")
+            .bind(host_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(internal_error)?;
+    let stored_hash = stored_hash.ok_or_else(unauthorized)?;
+
+    if !secrets_match(&hash_credential(presented), &stored_hash) {
+        return Err(unauthorized());
+    }
+    Ok(())
 }

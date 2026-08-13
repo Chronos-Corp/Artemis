@@ -3,14 +3,19 @@
 //! not enable), and never sends file contents, only hashes and metadata
 //! (see the repo README's "Locked architecture decisions").
 //!
-//! Local YARA scanning (via `nsic-core`'s `yara-scan` feature) is now
-//! real; sending what it finds to the console (sighting submission) is
-//! not yet -- see docs/phase1-design.md for what's next.
+//! Local YARA scanning (via `nsic-core`'s `yara-scan` feature) is real,
+//! and `scan` can optionally report what it finds to a console as
+//! sightings -- see docs/phase1-design.md for what's still not here
+//! (batching many files/hosts in one request, credential persistence).
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 use nsic_core::hashing::compute_hashes;
-use nsic_core::proto::{EnrollRequest, EnrollResponse, HeartbeatRequest, HeartbeatResponse};
+use nsic_core::proto::{
+    EnrollRequest, EnrollResponse, HeartbeatRequest, HeartbeatResponse, SightingRequest,
+    SightingResponse,
+};
 use nsic_core::yara_scan::YaraEngine;
 use reqwest::Response;
 use std::path::PathBuf;
@@ -31,14 +36,24 @@ enum Command {
     /// but enroll/heartbeat to talk to yet.
     Hash { path: PathBuf },
     /// Load local YARA rules and scan a single file, printing any matches
-    /// as JSON. Local-only, no console involved -- reporting a match like
-    /// this back to the console is sighting submission, not designed yet.
+    /// as JSON. If --console-url, --host-id, and --credential are all
+    /// given, also reports each match to the console as a sighting;
+    /// otherwise this stays entirely local, same as before.
     Scan {
         path: PathBuf,
         /// Directory of .yar/.yara rule files to load. A missing directory
         /// is not an error: it just means zero rules load, zero matches.
         #[arg(long, env = "NSIC_YARA_RULES_DIR", default_value = "yara-rules")]
         rules_dir: PathBuf,
+        /// Base URL of a console to report any matches to, e.g.
+        /// http://localhost:8787. Requires --host-id and --credential too.
+        #[arg(long, env = "NSIC_CONSOLE_URL")]
+        console_url: Option<String>,
+        #[arg(long, env = "NSIC_HOST_ID")]
+        host_id: Option<Uuid>,
+        /// This host's per-agent credential, issued at enroll time.
+        #[arg(long, env = "NSIC_AGENT_CREDENTIAL")]
+        credential: Option<String>,
     },
     /// Register this host with a console, printing the assigned host_id
     /// and the per-agent credential to use for subsequent requests.
@@ -88,7 +103,13 @@ async fn main() -> Result<()> {
                 }))?
             );
         }
-        Command::Scan { path, rules_dir } => {
+        Command::Scan {
+            path,
+            rules_dir,
+            console_url,
+            host_id,
+            credential,
+        } => {
             let engine = YaraEngine::load(&rules_dir)
                 .with_context(|| format!("loading YARA rules from {}", rules_dir.display()))?;
             let matches = engine
@@ -103,6 +124,17 @@ async fn main() -> Result<()> {
                     "matches": matches.iter().map(|m| &m.rule_name).collect::<Vec<_>>(),
                 }))?
             );
+
+            match (console_url, host_id, credential) {
+                (Some(console_url), Some(host_id), Some(credential)) => {
+                    report_sightings(&console_url, host_id, &credential, &path, &matches).await?;
+                }
+                (None, None, None) => {}
+                _ => eprintln!(
+                    "warning: --console-url, --host-id, and --credential must all be given \
+                     together to report sightings; skipping report"
+                ),
+            }
         }
         Command::Enroll {
             console_url,
@@ -160,6 +192,50 @@ async fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Hashes the scanned file once and reports one sighting per YARA match
+/// found in it, in sequence (this PR does not batch multiple sightings
+/// into one request -- see docs/phase1-design.md for why that's deferred
+/// until scanning stops being one file per CLI invocation). A no-op if
+/// `matches` is empty, so callers don't need to check that themselves.
+async fn report_sightings(
+    console_url: &str,
+    host_id: Uuid,
+    credential: &str,
+    path: &std::path::Path,
+    matches: &[nsic_core::yara_scan::YaraMatch],
+) -> Result<()> {
+    if matches.is_empty() {
+        return Ok(());
+    }
+
+    let hash = compute_hashes(path)
+        .with_context(|| format!("hashing {} to report sighting", path.display()))?;
+    let observed_at = Utc::now();
+    let client = reqwest::Client::new();
+
+    for m in matches {
+        let req = SightingRequest {
+            sha256: hash.sha256.clone(),
+            detection_name: m.rule_name.clone(),
+            path: Some(path.to_string_lossy().to_string()),
+            observed_at,
+        };
+        let response = client
+            .post(format!("{console_url}/api/v1/agents/{host_id}/sightings"))
+            .bearer_auth(credential)
+            .json(&req)
+            .send()
+            .await
+            .with_context(|| format!("reporting sighting for rule {}", m.rule_name))?;
+        let resp: SightingResponse = parse_or_report(response, "sighting").await?;
+        println!(
+            "reported sighting: indicator_id={} rule={}",
+            resp.indicator_id, m.rule_name
+        );
+    }
     Ok(())
 }
 

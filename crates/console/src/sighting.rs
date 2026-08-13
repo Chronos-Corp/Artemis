@@ -1,0 +1,421 @@
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::Json;
+use chrono::{DateTime, Utc};
+use nsic_core::models::{DetectionKind, IndicatorKind};
+use nsic_core::proto::{SightingRequest, SightingResponse};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+use crate::auth::{authenticate_host, internal_error};
+use crate::AppState;
+
+/// Source/confidence for every sighting this endpoint records. Not
+/// client-supplied -- see `nsic_core::proto::SightingRequest`'s doc
+/// comment for why an agent doesn't get to assert its own trust level.
+/// Matches `src-tauri`'s existing convention for local YARA hits
+/// (`"local:yara_scan"`, confidence 65; see `verdict.rs`), prefixed
+/// `agent:` instead of `local:` so fleet- and desktop-sourced hits stay
+/// distinguishable in the graph.
+const YARA_SIGHTING_SOURCE: &str = "agent:yara_scan";
+const YARA_SIGHTING_CONFIDENCE: i16 = 65;
+
+/// Records that `host_id` observed a YARA rule match, provided the caller
+/// presents that host's own per-agent credential. Upserts the indicator
+/// (the file's hash) and the detection (the rule) if either is new, then
+/// both a `detection_detects_indicator` edge (so this hit joins the same
+/// graph a local desktop scan would populate) and a `host_sighted_indicator`
+/// edge (which host, specifically, saw it, and from where).
+pub async fn report_sighting(
+    State(state): State<AppState>,
+    Path(host_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(req): Json<SightingRequest>,
+) -> Result<Json<SightingResponse>, (StatusCode, String)> {
+    authenticate_host(&state.pool, host_id, &headers).await?;
+
+    let indicator_id = upsert_indicator(&state.pool, IndicatorKind::Sha256, &req.sha256)
+        .await
+        .map_err(internal_error)?;
+    let detection_id = upsert_detection(&state.pool, DetectionKind::Yara, &req.detection_name)
+        .await
+        .map_err(internal_error)?;
+
+    upsert_detection_detects_indicator(
+        &state.pool,
+        detection_id,
+        indicator_id,
+        YARA_SIGHTING_SOURCE,
+        YARA_SIGHTING_CONFIDENCE,
+        req.observed_at,
+        req.observed_at,
+    )
+    .await
+    .map_err(internal_error)?;
+
+    upsert_host_sighted_indicator(
+        &state.pool,
+        host_id,
+        indicator_id,
+        YARA_SIGHTING_SOURCE,
+        YARA_SIGHTING_CONFIDENCE,
+        req.path.as_deref(),
+        req.observed_at,
+        req.observed_at,
+    )
+    .await
+    .map_err(internal_error)?;
+
+    Ok(Json(SightingResponse {
+        indicator_id,
+        recorded_at: Utc::now(),
+    }))
+}
+
+/// Reimplements `src-tauri`'s `db::indicators::upsert_indicator` with a
+/// runtime-checked query (no `sqlx::query!` macro) rather than sharing it
+/// via `nsic-core`, so this crate keeps compiling without an
+/// `SQLX_OFFLINE` cache prepared against a live database -- the same
+/// tradeoff PR #4's `host.rs` queries already made. Both write the exact
+/// same table with the exact same conflict handling; see
+/// docs/phase1-design.md for the tradeoff this accepts.
+async fn upsert_indicator(pool: &PgPool, kind: IndicatorKind, value: &str) -> sqlx::Result<Uuid> {
+    sqlx::query_scalar(
+        "INSERT INTO indicator (kind, value) VALUES ($1, $2) \
+         ON CONFLICT (kind, value) DO UPDATE SET value = EXCLUDED.value \
+         RETURNING id",
+    )
+    .bind(kind)
+    .bind(value)
+    .fetch_one(pool)
+    .await
+}
+
+/// See `upsert_indicator`'s doc comment -- same reasoning, mirrors
+/// `src-tauri`'s `upsert_detection` but without the `rule_source`/
+/// `rule_body`/`author` columns, which a sighting doesn't carry (an
+/// existing detection's own metadata from a fuller ingestion path is left
+/// untouched by the `ON CONFLICT` clause below, not overwritten with
+/// NULLs).
+async fn upsert_detection(pool: &PgPool, kind: DetectionKind, name: &str) -> sqlx::Result<Uuid> {
+    sqlx::query_scalar(
+        "INSERT INTO detection (kind, name) VALUES ($1, $2) \
+         ON CONFLICT (kind, name) DO UPDATE SET name = EXCLUDED.name \
+         RETURNING id",
+    )
+    .bind(kind)
+    .bind(name)
+    .fetch_one(pool)
+    .await
+}
+
+/// Mirrors `src-tauri`'s `upsert_detection_detects_indicator` verbatim
+/// (see `upsert_indicator`'s doc comment for why this isn't shared code).
+#[allow(clippy::too_many_arguments)]
+async fn upsert_detection_detects_indicator(
+    pool: &PgPool,
+    detection_id: Uuid,
+    indicator_id: Uuid,
+    source: &str,
+    confidence: i16,
+    first_seen: DateTime<Utc>,
+    last_seen: DateTime<Utc>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO detection_detects_indicator \
+            (detection_id, indicator_id, source, confidence, first_seen, last_seen) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         ON CONFLICT (detection_id, indicator_id, source) DO UPDATE SET \
+            confidence = EXCLUDED.confidence, \
+            first_seen = LEAST(detection_detects_indicator.first_seen, EXCLUDED.first_seen), \
+            last_seen = GREATEST(detection_detects_indicator.last_seen, EXCLUDED.last_seen)",
+    )
+    .bind(detection_id)
+    .bind(indicator_id)
+    .bind(source)
+    .bind(confidence)
+    .bind(first_seen)
+    .bind(last_seen)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// New edge this PR introduces (`src-tauri/migrations/
+/// 0005_host_sighted_indicator.sql`). `path` is always overwritten with
+/// the latest reported value, not preserved via `LEAST`/`GREATEST` like
+/// the timestamps: "where it was last seen" is the useful semantic here.
+#[allow(clippy::too_many_arguments)]
+async fn upsert_host_sighted_indicator(
+    pool: &PgPool,
+    host_id: Uuid,
+    indicator_id: Uuid,
+    source: &str,
+    confidence: i16,
+    path: Option<&str>,
+    first_seen: DateTime<Utc>,
+    last_seen: DateTime<Utc>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO host_sighted_indicator \
+            (host_id, indicator_id, source, confidence, path, first_seen, last_seen) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         ON CONFLICT (host_id, indicator_id, source) DO UPDATE SET \
+            confidence = EXCLUDED.confidence, \
+            path = EXCLUDED.path, \
+            first_seen = LEAST(host_sighted_indicator.first_seen, EXCLUDED.first_seen), \
+            last_seen = GREATEST(host_sighted_indicator.last_seen, EXCLUDED.last_seen)",
+    )
+    .bind(host_id)
+    .bind(indicator_id)
+    .bind(source)
+    .bind(confidence)
+    .bind(path)
+    .bind(first_seen)
+    .bind(last_seen)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::YARA_SIGHTING_SOURCE;
+    use crate::AppState;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use chrono::{DateTime, Duration, Utc};
+    use http_body_util::BodyExt;
+    use sqlx::Row;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    const BOOTSTRAP_SECRET: &str = "test-bootstrap-secret";
+
+    async fn test_state() -> AppState {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://nsic:nsic@localhost:5432/nsic".to_string());
+        let pool = nsic_core::db::connect_and_migrate(&database_url)
+            .await
+            .expect("connect to test database");
+        AppState {
+            pool,
+            bootstrap_secret: BOOTSTRAP_SECRET.to_string(),
+        }
+    }
+
+    async fn enroll(app: &axum::Router) -> nsic_core::proto::EnrollResponse {
+        let body = serde_json::json!({
+            "hostname": "test-host",
+            "os": "linux",
+            "agent_version": "0.1.0-test",
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/agents/enroll")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {BOOTSTRAP_SECRET}"))
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn sighting_request(
+        host_id: Uuid,
+        bearer: Option<&str>,
+        sha256: &str,
+        observed_at: DateTime<Utc>,
+    ) -> Request<Body> {
+        let body = serde_json::json!({
+            "sha256": sha256,
+            "detection_name": "Example_EICAR_Test_File",
+            "path": "/tmp/eicar.txt",
+            "observed_at": observed_at.to_rfc3339(),
+        });
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/agents/{host_id}/sightings"))
+            .header("content-type", "application/json");
+        if let Some(token) = bearer {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        builder.body(Body::from(body.to_string())).unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn report_sighting_rejects_missing_credential() {
+        let state = test_state().await;
+        let app = crate::build_router(state);
+        let enrolled = enroll(&app).await;
+
+        let response = app
+            .oneshot(sighting_request(
+                enrolled.host_id,
+                None,
+                "a".repeat(64).as_str(),
+                Utc::now(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn report_sighting_rejects_forged_credential() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+
+        let response = app
+            .oneshot(sighting_request(
+                enrolled.host_id,
+                Some("forged-credential"),
+                "a".repeat(64).as_str(),
+                Utc::now(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn report_sighting_rejects_unknown_host_id() {
+        let app = crate::build_router(test_state().await);
+
+        let response = app
+            .oneshot(sighting_request(
+                Uuid::new_v4(),
+                Some("anything"),
+                "a".repeat(64).as_str(),
+                Utc::now(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The full happy path plus the idempotency/timestamp semantics this
+    /// endpoint promises: submitting the same (host, indicator, source)
+    /// sighting twice does not create a second edge row, extends
+    /// last_seen to the later observation, and leaves first_seen at the
+    /// earlier one -- exactly the LEAST/GREATEST upsert pattern every
+    /// other edge in the graph already uses.
+    #[tokio::test]
+    #[ignore]
+    async fn report_sighting_creates_graph_and_is_idempotent() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let app = crate::build_router(state);
+        let enrolled = enroll(&app).await;
+
+        let sha256 = format!("{:0<64}", "sightingtest");
+        let first_seen = Utc::now() - Duration::hours(1);
+        let response = app
+            .clone()
+            .oneshot(sighting_request(
+                enrolled.host_id,
+                Some(&enrolled.credential),
+                &sha256,
+                first_seen,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let first: nsic_core::proto::SightingResponse = serde_json::from_slice(&bytes).unwrap();
+
+        let row = sqlx::query(
+            "SELECT confidence, first_seen, last_seen, path FROM host_sighted_indicator \
+             WHERE host_id = $1 AND indicator_id = $2 AND source = $3",
+        )
+        .bind(enrolled.host_id)
+        .bind(first.indicator_id)
+        .bind(YARA_SIGHTING_SOURCE)
+        .fetch_one(&pool)
+        .await
+        .expect("sighting edge exists after first submission");
+        let confidence: i16 = row.get("confidence");
+        let stored_first_seen: DateTime<Utc> = row.get("first_seen");
+        let stored_last_seen: DateTime<Utc> = row.get("last_seen");
+        let stored_path: Option<String> = row.get("path");
+        assert_eq!(confidence, 65);
+        assert_eq!(stored_first_seen, first_seen);
+        assert_eq!(stored_last_seen, first_seen);
+        assert_eq!(stored_path.as_deref(), Some("/tmp/eicar.txt"));
+
+        let detection_edge_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM detection_detects_indicator WHERE indicator_id = $1 AND source = $2",
+        )
+        .bind(first.indicator_id)
+        .bind(YARA_SIGHTING_SOURCE)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            detection_edge_count, 1,
+            "sighting submission should also populate detection_detects_indicator"
+        );
+
+        // Resubmit the same sighting, observed an hour later.
+        let last_seen = first_seen + Duration::hours(2);
+        let response = app
+            .oneshot(sighting_request(
+                enrolled.host_id,
+                Some(&enrolled.credential),
+                &sha256,
+                last_seen,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let second: nsic_core::proto::SightingResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            second.indicator_id, first.indicator_id,
+            "the same sha256 should resolve to the same indicator, not a duplicate"
+        );
+
+        let edge_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM host_sighted_indicator WHERE host_id = $1 AND indicator_id = $2",
+        )
+        .bind(enrolled.host_id)
+        .bind(first.indicator_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            edge_count, 1,
+            "resubmission must not create a second edge row"
+        );
+
+        let row = sqlx::query(
+            "SELECT first_seen, last_seen FROM host_sighted_indicator \
+             WHERE host_id = $1 AND indicator_id = $2 AND source = $3",
+        )
+        .bind(enrolled.host_id)
+        .bind(first.indicator_id)
+        .bind(YARA_SIGHTING_SOURCE)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let stored_first_seen: DateTime<Utc> = row.get("first_seen");
+        let stored_last_seen: DateTime<Utc> = row.get("last_seen");
+        assert_eq!(
+            stored_first_seen, first_seen,
+            "first_seen should stay at the earlier observation"
+        );
+        assert_eq!(
+            stored_last_seen, last_seen,
+            "last_seen should advance to the later observation"
+        );
+    }
+}

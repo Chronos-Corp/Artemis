@@ -1,16 +1,17 @@
-//! Phase 1 fleet console. Accepts agent enrollment and heartbeats and
-//! records them in the shared Postgres intel graph (the same schema
-//! `src-tauri` uses). See docs/phase1-design.md for what's deliberately
-//! not here yet (TLS, sighting ingestion, sample retrieval, a fleet UI).
+//! Phase 1 fleet console. Accepts agent enrollment, heartbeats, and YARA
+//! sighting reports, and records them in the shared Postgres intel graph
+//! (the same schema `src-tauri` uses). See docs/phase1-design.md for
+//! what's deliberately not here yet (TLS, sample retrieval, a fleet UI).
 //!
 //! Two credentials gate this API (see `nsic_core::proto` for the full
 //! rationale): a bootstrap enrollment secret the operator configures via
 //! `NSIC_ENROLLMENT_SECRET`, required on every `POST /api/v1/agents/enroll`
 //! call, and a per-agent credential minted at enroll time, required on
-//! every subsequent authenticated request.
+//! every subsequent authenticated request (heartbeat, sightings).
 
 mod auth;
 mod host;
+mod sighting;
 
 use anyhow::Context;
 use axum::routing::post;
@@ -62,5 +63,9 @@ fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/agents/enroll", post(host::enroll))
         .route("/api/v1/agents/{host_id}/heartbeat", post(host::heartbeat))
+        .route(
+            "/api/v1/agents/{host_id}/sightings",
+            post(sighting::report_sighting),
+        )
         .with_state(state)
 }

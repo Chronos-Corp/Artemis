@@ -13,6 +13,7 @@ nsic-core = { path = "../nsic-core", features = ["yara-scan"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+chrono = { version = "0.4", features = ["serde"] }
 serde = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

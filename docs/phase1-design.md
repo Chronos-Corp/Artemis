@@ -1,10 +1,10 @@
 # Phase 1 design: agent plus console
 
-Status: enrollment and heartbeat are authenticated end to end, and the
-agent can run local YARA scans; most of the phase is still not built. This
-document tracks what Phase 1 actually is, what's landed so far, and what's
-deliberately deferred, in the same spirit as the README's Phase 0 "what
-works today / what's stubbed" split.
+Status: enrollment, heartbeat, and sighting submission are authenticated
+end to end; most of the phase is still not built. This document tracks
+what Phase 1 actually is, what's landed so far, and what's deliberately
+deferred, in the same spirit as the README's Phase 0 "what works today /
+what's stubbed" split.
 
 Per the README's build order, Phase 1 is: agent plus console, file-to-IOC
 across a fleet, sample retrieval. That's a lot; this document exists so
@@ -20,10 +20,11 @@ sequence, and why it's ordered this way:
 3. **PR #5 — local YARA on the agent.** Give the agent something
    meaningful to observe. Depends on #4 existing so what it observes can
    eventually be attributed to a specific, authenticated host.
-4. **PR #6 (not started) — sighting protocol.** Securely report those
-   observations: "host X observed indicator Y," as an authenticated
-   `/api/v1/.../sightings` endpoint and a new graph edge. Depends on both
-   #4 (who's reporting) and #5 (what there is to report).
+4. **PR #6 — sighting protocol.** Securely report those observations:
+   "host X observed indicator Y," as an authenticated
+   `/api/v1/agents/{host_id}/sightings` endpoint and a new graph edge.
+   Depended on both #4 (who's reporting) and #5 (what there is to
+   report).
 5. **Later, not started:** sample retrieval, fleet UI, TLS/deployment
    hardening.
 
@@ -136,24 +137,86 @@ existing `crate::yara_scan::X` call sites are unaffected.
   still no GTK/WebKitGTK — `crates/console` still doesn't need it, only
   `nsic-core`/`crates/agent` do once `yara-scan` is enabled).
 
-This is still local-only, same caveat as PR #4's per-agent credential
-persistence: nothing here sends a YARA hit anywhere. PR #6 is what turns
+PR #5 shipped local-only, same caveat as PR #4's per-agent credential
+persistence: nothing there sent a YARA hit anywhere. PR #6 is what turns
 "the agent noticed something" into "the console knows about it."
+
+### PR #6: sighting protocol
+
+`POST /api/v1/agents/{host_id}/sightings` (`crates/console/src/
+sighting.rs`), authenticated the same way heartbeat is — the per-agent
+credential check was pulled out of `host.rs`'s `heartbeat` into a shared
+`authenticate_host` helper (`crates/console/src/auth.rs`) so both
+endpoints use the exact same check rather than two copies drifting.
+
+- **Deliberately narrow request shape.** `SightingRequest` (`nsic_core::
+  proto`) is `{ sha256, detection_name, path: Option<String>,
+  observed_at }` — exactly what `nsic-agent scan` produces today, not a
+  generic multi-indicator-kind sighting. Generalizing (a `kind` field,
+  non-YARA detection types) is deferred until something other than local
+  YARA scanning produces a sighting — Phase 0's still-unpopulated tier 2
+  (fuzzy hashing) would be the next candidate.
+- **Source and confidence are not client-supplied.** The endpoint always
+  writes `source = "agent:yara_scan"`, `confidence = 65` — matching
+  `src-tauri`'s existing convention for local YARA hits
+  (`"local:yara_scan"`, also 65; see `verdict.rs`), `agent:` instead of
+  `local:` so fleet- and desktop-sourced hits stay distinguishable in the
+  graph. An agent asserting its own trust level would be circular; the
+  console decides confidence based on the evidence mechanism, the same
+  way `src-tauri` already does for its own local scans.
+- **What a sighting actually writes.** Reusing the intel graph's existing
+  shape rather than inventing a side channel: `upsert_indicator` (the
+  file's sha256, creating it if the console has never seen this hash),
+  `upsert_detection` (the YARA rule, by name), a
+  `detection_detects_indicator` edge (so a fleet hit joins the exact same
+  graph a local desktop scan populates), and the new
+  `host_sighted_indicator` edge (which host, specifically, saw it, and
+  from where — see Data model below).
+- **These four upserts are reimplemented in `crates/console/src/
+  sighting.rs`** with runtime-checked queries (no `sqlx::query!` macro),
+  not shared from `src-tauri/src/db/indicators.rs` where three of the
+  four already exist. `src-tauri`'s versions use compile-time-checked
+  macros backed by a checked-in `.sqlx` offline cache; moving them into
+  `nsic-core` would mean either preparing that cache for a second crate
+  location (needs a live, migrated database to generate) or losing local
+  compilability without one. Given PR #4 already made this same call for
+  `host.rs`'s queries, staying consistent won. Both write the identical
+  SQL shape (same tables, same `ON CONFLICT` targets) as `src-tauri`'s
+  macro versions; drift between them is the accepted cost, flagged in
+  code comments at each reimplemented function.
+- **Idempotency.** `PRIMARY KEY (host_id, indicator_id, source)` on
+  `host_sighted_indicator` — resubmitting the same sighting is an upsert,
+  not a duplicate row. `first_seen` takes `LEAST`, `last_seen` takes
+  `GREATEST` (the exact pattern every other edge in `0001_init.sql`
+  already uses); `path` is always overwritten with the latest reported
+  value ("last seen at" is the useful semantic, not "first seen at").
+- **Batching is out of scope.** One HTTP request per (indicator,
+  detection) pair; the agent loops client-side if a single scan matches
+  multiple rules. `nsic-agent scan` still only scans one file per
+  invocation, so there's nothing to batch yet — revisit once the agent
+  does bulk or continuous scanning.
+- **`nsic-agent scan`** gained `--console-url` / `--host-id` /
+  `--credential` (env fallbacks `NSIC_CONSOLE_URL` / `NSIC_HOST_ID` /
+  `NSIC_AGENT_CREDENTIAL`); if all three are given and the scan found any
+  matches, each is reported as a sighting after the local JSON is
+  printed. Given none of them, `scan` behaves exactly as it did in PR #5.
+  Given some but not all, the agent prints a warning and skips
+  reporting rather than silently doing nothing or guessing.
+- Tests (`crates/console/src/sighting.rs`, DB-backed, `--ignored`):
+  missing/forged credential, unknown `host_id`, and a combined happy-path
+  test that submits the same sighting twice with different
+  `observed_at` values and asserts against the database directly that
+  `first_seen`/`last_seen` follow `LEAST`/`GREATEST`, exactly one edge
+  row exists (not two), and `detection_detects_indicator` was populated
+  too.
 
 ## What's deliberately not here yet
 
-- **Verdict / sighting submission** (PR #6). The agent doesn't send
-  anything about what it finds yet, only that it exists and is alive
-  (and, as of PR #4, that it can prove which host it is). The next real
-  payload is "host X saw indicator Y," which needs a `sighting` edge in
-  the intel graph (host <-> indicator, with source/confidence/
-  first-last-seen, same pattern as every other edge in `0001_init.sql`),
-  plus deduplication/idempotency and batching semantics — none of that is
-  designed yet.
-- **Transport security.** Still HTTP, not HTTPS. Both the bootstrap
-  secret and per-agent credential cross the wire in plaintext today. Real
-  TLS (or at minimum a documented "put this behind a VPN/reverse proxy
-  for now") is required before this talks to a real fleet.
+- **Transport security.** Still HTTP, not HTTPS. The bootstrap secret,
+  per-agent credentials, and now sighting data all cross the wire in
+  plaintext today. Real TLS (or at minimum a documented "put this behind
+  a VPN/reverse proxy for now") is required before this talks to a real
+  fleet.
 - **Credential rotation and revocation.** A compromised or decommissioned
   host's credential can't currently be invalidated short of deleting its
   `host` row outright. No rotation flow exists either.
@@ -163,12 +226,18 @@ persistence: nothing here sends a YARA hit anywhere. PR #6 is what turns
   taken as-is; the console doesn't reject a short or weak value. Fine for
   local testing, not before a real deployment.
 - **Protected agent-side credential persistence.** The CLI prints the
-  per-agent credential and leaves storing it to the caller; there's no
-  agent-managed credential file (with correct permissions, per OS) yet.
-  That needs a design once the agent stops being a one-shot CLI and
-  becomes a persistent process sending authenticated telemetry (PR #6 and
-  after) — storing a long-lived credential insecurely at that point is a
-  real vulnerability, not just a rough edge.
+  per-agent credential and leaves storing it to the caller (`scan
+  --credential` still has to be passed explicitly, or via
+  `NSIC_AGENT_CREDENTIAL`); there's no agent-managed credential file
+  (with correct permissions, per OS) yet. That needs a design once the
+  agent stops being a one-shot CLI and becomes a persistent process --
+  storing a long-lived credential insecurely at that point is a real
+  vulnerability, not just a rough edge.
+- **Reading sightings back out.** PR #6 only writes; there's no endpoint
+  or query to list what's been reported for a host, a hash, or a rule.
+  The data is in the same Postgres graph `src-tauri`'s verdict engine
+  already queries, so it's reachable by hand, just not through any
+  Phase 1-specific API yet.
 - **Sample retrieval.** Locked architecture decision #3: file contents
   leave the host only on explicit analyst request, logged and attributed.
   No part of that request/audit flow exists yet.
@@ -190,9 +259,15 @@ persistence: nothing here sends a YARA hit anywhere. PR #6 is what turns
 `0004_host_credential.sql`): id, hostname, os, agent_version,
 `credential_hash` (SHA-256 hex of the per-agent credential, `NOT NULL`),
 enrolled_at, last_heartbeat_at. Additive to the Phase 0 schema in
-`0001_init.sql` / `0002_verdict_indexes.sql`, not a redesign of it. The
-next data-model addition, once PR #6 designs sighting submission, is an
-edge table between `host` and `indicator`.
+`0001_init.sql` / `0002_verdict_indexes.sql`, not a redesign of it.
+
+`host_sighted_indicator` (`src-tauri/migrations/
+0005_host_sighted_indicator.sql`): the host<->indicator edge PR #6 adds.
+`host_id`, `indicator_id`, `source`, `confidence`, `path` (nullable,
+always overwritten with the latest value), `first_seen`, `last_seen`,
+primary keyed on `(host_id, indicator_id, source)` -- same edge shape as
+every other edge in `0001_init.sql`, just between a host and an
+indicator instead of, say, a report and an indicator.
 
 ## Running it locally
 
@@ -215,6 +290,11 @@ cargo run -p agent --bin nsic-agent -- heartbeat \
 
 cargo run -p agent --bin nsic-agent -- scan path/to/file --rules-dir yara-rules
 # -> {"path": "...", "rules_dir": "yara-rules", "rule_count": 1, "matches": [...]}
+
+cargo run -p agent --bin nsic-agent -- scan path/to/file --rules-dir yara-rules \
+  --console-url http://localhost:8787 --host-id <uuid> --credential <token>
+# -> (same JSON as above, then, for each match:)
+# -> reported sighting: indicator_id=<uuid> rule=<rule name>
 ```
 
 `--enrollment-secret` and `--credential` both fall back to
