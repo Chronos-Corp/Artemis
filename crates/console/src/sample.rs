@@ -1,6 +1,7 @@
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::IntoResponse;
 use axum::Json;
 use chrono::Utc;
 use nsic_core::proto::{
@@ -109,6 +110,102 @@ pub async fn list_sample_requests(
         requests: rows.into_iter().map(sample_request_view_from_row).collect(),
         truncated,
     }))
+}
+
+/// Downloads a specific sample request's retrieved content, if it has
+/// any. Operator-credential only, same as every other read of this data.
+/// The `JOIN` against `sample_blob` (rather than a separate status check)
+/// is what actually determines availability: `sample_request.sha256` is
+/// only ever non-`NULL` once a request has resolved to `fulfilled` or
+/// `mismatched` (see the migration), so a `pending` or `failed` request
+/// has no matching row and this returns the same `404` as a request that
+/// doesn't exist at all -- an operator already has full visibility into
+/// *why* via `list_sample_requests`, so there's nothing this endpoint
+/// needs to explain that the list view hasn't already shown.
+pub async fn download_sample_by_request(
+    State(state): State<AppState>,
+    Path((host_id, request_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    authenticate_operator(&state.operator_secret, &headers)?;
+
+    let row = sqlx::query(
+        "SELECT sb.sha256, sb.content FROM sample_request sr \
+         JOIN sample_blob sb ON sb.sha256 = sr.sha256 \
+         WHERE sr.id = $1 AND sr.host_id = $2",
+    )
+    .bind(request_id)
+    .bind(host_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(internal_error)?;
+
+    let Some(row) = row else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "no content available for this sample request".to_string(),
+        ));
+    };
+
+    let sha256: String = row.get("sha256");
+    let content: Vec<u8> = row.get("content");
+    Ok(sample_content_response(&sha256, content))
+}
+
+/// Downloads sample content directly by hash, independent of any
+/// specific request -- the natural access pattern once content is
+/// content-addressed and deduplicated: an operator pivoting from a
+/// sighting or from another host's already-fulfilled request already has
+/// the sha256 in hand and shouldn't need to know (or care) which
+/// specific request first pulled it in. Serving by hash doesn't weaken
+/// locked architecture decision #3's "explicit analyst request" gate --
+/// that gate is enforced once, at upload time (only a pending, per-
+/// agent-credentialed request can add to `sample_blob` in the first
+/// place); once content is legitimately stored, which authenticated
+/// operator query later reads it back out isn't a second gate the design
+/// depends on.
+pub async fn download_sample_by_sha256(
+    State(state): State<AppState>,
+    Path(sha256): Path<String>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    authenticate_operator(&state.operator_secret, &headers)?;
+    validate_lowercase_sha256(&sha256, "sha256")?;
+
+    let row = sqlx::query("SELECT content FROM sample_blob WHERE sha256 = $1")
+        .bind(&sha256)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(internal_error)?;
+
+    let Some(row) = row else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "no sample stored for this sha256".to_string(),
+        ));
+    };
+
+    let content: Vec<u8> = row.get("content");
+    Ok(sample_content_response(&sha256, content))
+}
+
+/// Shared response builder for both download endpoints: raw bytes,
+/// `application/octet-stream`, named by hash rather than the path the
+/// agent originally reported -- an arbitrary analyst-supplied path could
+/// contain characters that don't belong in a header value, while a
+/// hex-encoded sha256 always does.
+fn sample_content_response(sha256: &str, content: Vec<u8>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{sha256}\""),
+            ),
+        ],
+        content,
+    )
 }
 
 /// Lists only this host's own *pending* requests -- what the agent polls
@@ -489,6 +586,30 @@ mod tests {
             builder = builder.header("authorization", format!("Bearer {token}"));
         }
         builder.body(Body::from(content)).unwrap()
+    }
+
+    fn download_by_request_request(
+        host_id: Uuid,
+        request_id: Uuid,
+        bearer: Option<&str>,
+    ) -> Request<Body> {
+        let mut builder = Request::builder().method("GET").uri(format!(
+            "/api/v1/hosts/{host_id}/sample-requests/{request_id}/content"
+        ));
+        if let Some(token) = bearer {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    fn download_by_sha256_request(sha256: &str, bearer: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/samples/{sha256}/content"));
+        if let Some(token) = bearer {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        builder.body(Body::empty()).unwrap()
     }
 
     fn fail_request(
@@ -1271,5 +1392,266 @@ mod tests {
             }
             other => panic!("expected the row to end Fulfilled or Failed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn download_sample_by_request_rejects_missing_operator_credential() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+        let response = app
+            .oneshot(download_by_request_request(
+                enrolled.host_id,
+                Uuid::new_v4(),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A host's own per-agent credential -- valid for uploading its own
+    /// sample content -- must not also authorize downloading it back out.
+    /// Same mutual-exclusion property already verified for every other
+    /// operator/agent endpoint pair in this file.
+    #[tokio::test]
+    #[ignore]
+    async fn download_sample_by_request_rejects_per_agent_credential() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+        let request_id = create_pending(&app, enrolled.host_id, "/tmp/x", None).await;
+        let response = app
+            .oneshot(download_by_request_request(
+                enrolled.host_id,
+                request_id,
+                Some(&enrolled.credential),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn download_sample_by_request_rejects_unknown_request_id() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+        let response = app
+            .oneshot(download_by_request_request(
+                enrolled.host_id,
+                Uuid::new_v4(),
+                Some(OPERATOR_SECRET),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A request that's still pending has no content to download yet --
+    /// this is the "no status leak beyond what list_sample_requests
+    /// already shows" case documented on the handler.
+    #[tokio::test]
+    #[ignore]
+    async fn download_sample_by_request_returns_404_for_pending_request() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+        let request_id = create_pending(&app, enrolled.host_id, "/tmp/x", None).await;
+        let response = app
+            .oneshot(download_by_request_request(
+                enrolled.host_id,
+                request_id,
+                Some(OPERATOR_SECRET),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A failed request never had bytes to store in the first place.
+    #[tokio::test]
+    #[ignore]
+    async fn download_sample_by_request_returns_404_for_failed_request() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+        let request_id = create_pending(&app, enrolled.host_id, "/tmp/x", None).await;
+        let response = app
+            .clone()
+            .oneshot(fail_request(
+                enrolled.host_id,
+                request_id,
+                Some(&enrolled.credential),
+                "gone",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(download_by_request_request(
+                enrolled.host_id,
+                request_id,
+                Some(OPERATOR_SECRET),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The full round trip: what the agent uploaded is exactly what the
+    /// operator downloads back out, byte for byte, with the headers this
+    /// handler promises.
+    #[tokio::test]
+    #[ignore]
+    async fn download_sample_by_request_returns_content_for_fulfilled_request() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+        let request_id = create_pending(&app, enrolled.host_id, "/tmp/x", None).await;
+        let content = b"the actual malware bytes".to_vec();
+        let expected_sha256 = hex::encode(Sha256::digest(&content));
+
+        let response = app
+            .clone()
+            .oneshot(fulfill_content_request(
+                enrolled.host_id,
+                request_id,
+                Some(&enrolled.credential),
+                content.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(download_by_request_request(
+                enrolled.host_id,
+                request_id,
+                Some(OPERATOR_SECRET),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_DISPOSITION)
+                .unwrap(),
+            &format!("attachment; filename=\"{expected_sha256}\"")
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.as_ref(), content.as_slice());
+    }
+
+    /// A mismatched request still has real, successfully-uploaded content
+    /// -- the mismatch is between what was expected and what arrived, not
+    /// a failure to store anything -- so it must still be downloadable.
+    #[tokio::test]
+    #[ignore]
+    async fn download_sample_by_request_returns_content_for_mismatched_request() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+        let request_id =
+            create_pending(&app, enrolled.host_id, "/tmp/x", Some(&valid_sha256("a"))).await;
+        let content = b"not what was expected".to_vec();
+
+        let response = app
+            .clone()
+            .oneshot(fulfill_content_request(
+                enrolled.host_id,
+                request_id,
+                Some(&enrolled.credential),
+                content.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(download_by_request_request(
+                enrolled.host_id,
+                request_id,
+                Some(OPERATOR_SECRET),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.as_ref(), content.as_slice());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn download_sample_by_sha256_rejects_missing_operator_credential() {
+        let app = crate::build_router(test_state().await);
+        let response = app
+            .oneshot(download_by_sha256_request(&valid_sha256("a"), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn download_sample_by_sha256_rejects_malformed_sha256() {
+        let app = crate::build_router(test_state().await);
+        let response = app
+            .oneshot(download_by_sha256_request("banana", Some(OPERATOR_SECRET)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn download_sample_by_sha256_returns_404_for_unknown_hash() {
+        let app = crate::build_router(test_state().await);
+        let response = app
+            .oneshot(download_by_sha256_request(
+                &valid_sha256("dead"),
+                Some(OPERATOR_SECRET),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The content-addressed access pattern this endpoint exists for:
+    /// content uploaded while fulfilling one host's request is
+    /// downloadable by hash alone, with no need to know which request or
+    /// which host originally supplied it.
+    #[tokio::test]
+    #[ignore]
+    async fn download_sample_by_sha256_returns_content_regardless_of_which_host_uploaded_it() {
+        let app = crate::build_router(test_state().await);
+        let host_a = enroll(&app).await;
+        let request_id = create_pending(&app, host_a.host_id, "/tmp/x", None).await;
+        let content = b"content-addressed bytes".to_vec();
+        let sha256 = hex::encode(Sha256::digest(&content));
+
+        let response = app
+            .clone()
+            .oneshot(fulfill_content_request(
+                host_a.host_id,
+                request_id,
+                Some(&host_a.credential),
+                content.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(download_by_sha256_request(&sha256, Some(OPERATOR_SECRET)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.as_ref(), content.as_slice());
     }
 }

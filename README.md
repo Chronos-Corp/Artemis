@@ -234,16 +234,16 @@ Do not jump ahead; each phase de-risks the next.
   sightings, and fulfill an operator's sample-retrieval requests),
   `crates/console` (an HTTP service, `/api/v1`, recording
   enrollment/heartbeats/sightings/sample requests in the same Postgres
-  intel graph, and reading sightings and sample-request status back out
-  by host or by hash). Enrollment requires a console-operator bootstrap
-  secret; each enrolled host gets its own credential for authenticated
-  heartbeats, sighting submission, and sample-request polling/
-  fulfillment; a third, separate console-operator credential gates
-  reading sightings back out and creating/listing sample requests.
-  Sample retrieval currently covers request + fulfillment only -- there's
-  no way to download a retrieved sample's actual content yet, and no
-  fleet UI -- see [`docs/phase1-design.md`](docs/phase1-design.md) for
-  exactly what's covered and what's deliberately deferred.
+  intel graph, reading sightings and sample-request status back out by
+  host or by hash, and downloading a retrieved sample's actual content
+  either by request or by hash). Enrollment requires a console-operator
+  bootstrap secret; each enrolled host gets its own credential for
+  authenticated heartbeats, sighting submission, and sample-request
+  polling/fulfillment; a third, separate console-operator credential
+  gates reading sightings and sample data back out and creating sample
+  requests. No fleet UI yet -- see
+  [`docs/phase1-design.md`](docs/phase1-design.md) for exactly what's
+  covered and what's deliberately deferred.
 - **Phase 2:** CVE hunt packs, KEV first.
 - **Phase 3:** Folder correlation scoring. Must come after Phase 1 because
   the scoring model cannot be tuned without real telemetry; building it

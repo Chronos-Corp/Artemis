@@ -145,6 +145,14 @@ fn build_router(state: AppState) -> Router {
             post(sample::create_sample_request).get(sample::list_sample_requests),
         )
         .route(
+            "/api/v1/hosts/{host_id}/sample-requests/{request_id}/content",
+            get(sample::download_sample_by_request),
+        )
+        .route(
+            "/api/v1/samples/{sha256}/content",
+            get(sample::download_sample_by_sha256),
+        )
+        .route(
             "/api/v1/agents/{host_id}/sample-requests",
             get(sample::list_pending_sample_requests),
         )
