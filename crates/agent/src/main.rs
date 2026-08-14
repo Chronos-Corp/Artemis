@@ -1,7 +1,12 @@
 //! Phase 1 fleet agent. Talks to a console over HTTP; never touches
 //! Postgres directly (see `nsic-core`'s `db` feature, which this crate does
-//! not enable), and never sends file contents, only hashes and metadata
-//! (see the repo README's "Locked architecture decisions").
+//! not enable). `hash`, `scan`, `enroll`, and `heartbeat` never send file
+//! contents, only hashes and metadata (see the repo README's "Locked
+//! architecture decisions"). `fulfill-samples` is the one exception, and
+//! only because that decision's own carve-out requires it: "file contents
+//! leave the host only on explicit analyst request, logged and
+//! attributed" -- a sample request is exactly that explicit request,
+//! already logged by the console the moment an operator created it.
 //!
 //! Local YARA scanning (via `nsic-core`'s `yara-scan` feature) is real,
 //! and `scan` can optionally report what it finds to a console as
@@ -13,8 +18,8 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use nsic_core::hashing::{compute_hashes, hash_bytes};
 use nsic_core::proto::{
-    EnrollRequest, EnrollResponse, HeartbeatRequest, HeartbeatResponse, SightingRequest,
-    SightingResponse,
+    EnrollRequest, EnrollResponse, HeartbeatRequest, HeartbeatResponse, SampleRequestFailure,
+    SampleRequestFulfilled, SampleRequestListResponse, SightingRequest, SightingResponse,
 };
 use nsic_core::yara_scan::YaraEngine;
 use reqwest::Response;
@@ -74,6 +79,21 @@ enum Command {
     },
     /// Send a single heartbeat for an already-enrolled host.
     Heartbeat {
+        #[arg(long)]
+        console_url: String,
+        #[arg(long)]
+        host_id: Uuid,
+        /// This host's per-agent credential, issued at enroll time. Falls
+        /// back to NSIC_AGENT_CREDENTIAL if not given.
+        #[arg(long)]
+        credential: Option<String>,
+    },
+    /// Poll the console for this host's pending sample-retrieval requests
+    /// and resolve each one: read the requested path locally and upload
+    /// its bytes, or -- if that read fails -- report back why instead of
+    /// leaving the request stuck at pending forever. A no-op if there's
+    /// nothing pending.
+    FulfillSamples {
         #[arg(long)]
         console_url: String,
         #[arg(long)]
@@ -210,6 +230,18 @@ async fn main() -> Result<()> {
             let resp: HeartbeatResponse = parse_or_report(response, "heartbeat").await?;
             println!("heartbeat ok: received_at={}", resp.received_at);
         }
+        Command::FulfillSamples {
+            console_url,
+            host_id,
+            credential,
+        } => {
+            let credential = credential
+                .or_else(|| std::env::var("NSIC_AGENT_CREDENTIAL").ok())
+                .context(
+                    "agent credential required: pass --credential or set NSIC_AGENT_CREDENTIAL",
+                )?;
+            fulfill_sample_requests(&console_url, host_id, &credential).await?;
+        }
     }
 
     Ok(())
@@ -261,6 +293,88 @@ async fn report_sightings(
             "reported sighting: indicator_id={} rule={}",
             resp.indicator_id, m.rule_name
         );
+    }
+    Ok(())
+}
+
+/// Fetches this host's pending sample requests and resolves each one:
+/// reads the requested path locally exactly once, then either uploads
+/// those exact bytes as the fulfillment or, if the read itself fails,
+/// reports the failure with its reason rather than silently skipping the
+/// request and leaving it stuck at `pending`. A no-op if nothing is
+/// pending.
+async fn fulfill_sample_requests(console_url: &str, host_id: Uuid, credential: &str) -> Result<()> {
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!(
+            "{console_url}/api/v1/agents/{host_id}/sample-requests"
+        ))
+        .bearer_auth(credential)
+        .send()
+        .await
+        .context("listing pending sample requests")?;
+    let pending: SampleRequestListResponse =
+        parse_or_report(response, "sample-request list").await?;
+
+    if pending.requests.is_empty() {
+        println!("no pending sample requests");
+        return Ok(());
+    }
+    if pending.truncated {
+        eprintln!(
+            "warning: more pending sample requests exist than this call returned; re-run \
+             after these are resolved to pick up the rest"
+        );
+    }
+
+    for req in &pending.requests {
+        match std::fs::read(&req.path) {
+            Ok(data) => {
+                let response = client
+                    .post(format!(
+                        "{console_url}/api/v1/agents/{host_id}/sample-requests/{}/content",
+                        req.id
+                    ))
+                    .bearer_auth(credential)
+                    .header("content-type", "application/octet-stream")
+                    .body(data)
+                    .send()
+                    .await
+                    .with_context(|| format!("uploading sample for request {}", req.id))?;
+                let resp: SampleRequestFulfilled =
+                    parse_or_report(response, "sample-request fulfillment").await?;
+                println!(
+                    "fulfilled sample request {}: path={} status={:?} sha256={} size_bytes={}",
+                    req.id, req.path, resp.status, resp.sha256, resp.size_bytes
+                );
+            }
+            Err(e) => {
+                let failure = SampleRequestFailure {
+                    reason: format!("reading {}: {e}", req.path),
+                };
+                let response = client
+                    .post(format!(
+                        "{console_url}/api/v1/agents/{host_id}/sample-requests/{}/failure",
+                        req.id
+                    ))
+                    .bearer_auth(credential)
+                    .json(&failure)
+                    .send()
+                    .await
+                    .with_context(|| format!("reporting failure for request {}", req.id))?;
+                let status = response.status();
+                if !status.is_success() {
+                    let body = response.text().await.unwrap_or_default();
+                    anyhow::bail!(
+                        "console rejected sample-request failure report: {status} {body}"
+                    );
+                }
+                println!(
+                    "reported failure for sample request {}: path={} reason={}",
+                    req.id, req.path, failure.reason
+                );
+            }
+        }
     }
     Ok(())
 }

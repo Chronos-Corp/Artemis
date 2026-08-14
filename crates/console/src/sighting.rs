@@ -8,6 +8,8 @@ use sqlx::{PgExecutor, Row};
 use uuid::Uuid;
 
 use crate::auth::{authenticate_host, authenticate_operator, internal_error};
+use crate::pagination::truncate_to_limit;
+use crate::validate::{bad_request, validate_lowercase_sha256};
 use crate::AppState;
 
 /// Hard cap on rows returned by the list endpoints below. Not real
@@ -199,21 +201,6 @@ pub async fn list_indicator_sightings(
     }))
 }
 
-/// Both list endpoints fetch one row past `SIGHTING_LIST_LIMIT` so this
-/// can tell "exactly at the cap" apart from "past the cap" by whether the
-/// extra row showed up, then trims it back off before the response is
-/// built -- the cap itself must never leak an extra row to the caller.
-/// Generic over the row type (rather than `sqlx::postgres::PgRow`
-/// directly) purely so the off-by-one logic can be unit-tested on a plain
-/// `Vec` without a database; the real call sites always pass `PgRow`.
-fn truncate_to_limit<T>(rows: &mut Vec<T>, limit: usize) -> bool {
-    let truncated = rows.len() > limit;
-    if truncated {
-        rows.truncate(limit);
-    }
-    truncated
-}
-
 fn sighting_view_from_row(row: sqlx::postgres::PgRow) -> SightingView {
     SightingView {
         host_id: row.get("host_id"),
@@ -274,23 +261,6 @@ fn earliest_plausible_observed_at() -> DateTime<Utc> {
     DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
         .expect("valid constant")
         .with_timezone(&Utc)
-}
-
-fn validate_lowercase_sha256(value: &str, field: &str) -> Result<(), (StatusCode, String)> {
-    let is_valid = value.len() == 64
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-    if !is_valid {
-        return Err(bad_request(&format!(
-            "{field} must be exactly 64 lowercase hexadecimal characters"
-        )));
-    }
-    Ok(())
-}
-
-fn bad_request(message: &str) -> (StatusCode, String) {
-    (StatusCode::BAD_REQUEST, message.to_string())
 }
 
 /// Reimplements `src-tauri`'s `db::indicators::upsert_indicator` with a
@@ -437,7 +407,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{truncate_to_limit, YARA_SIGHTING_SOURCE};
+    use super::YARA_SIGHTING_SOURCE;
     use crate::AppState;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -450,31 +420,8 @@ mod tests {
     const BOOTSTRAP_SECRET: &str = "test-bootstrap-secret";
     const OPERATOR_SECRET: &str = "test-operator-secret";
 
-    // No DB, no #[ignore]: this is the exact off-by-one logic the two list
-    // endpoints depend on to tell "the fleet has exactly the cap's worth
-    // of sightings" apart from "there are more past the cap" -- worth
-    // verifying directly rather than only indirectly, since reproducing it
-    // through the real endpoints would mean seeding 1000+ database rows.
-    #[test]
-    fn truncate_to_limit_trims_and_reports_truncation_past_the_cap() {
-        let mut rows = vec![1, 2, 3];
-        assert!(truncate_to_limit(&mut rows, 2));
-        assert_eq!(rows, vec![1, 2]);
-    }
-
-    #[test]
-    fn truncate_to_limit_reports_no_truncation_exactly_at_the_cap() {
-        let mut rows = vec![1, 2];
-        assert!(!truncate_to_limit(&mut rows, 2));
-        assert_eq!(rows, vec![1, 2]);
-    }
-
-    #[test]
-    fn truncate_to_limit_reports_no_truncation_under_the_cap() {
-        let mut rows = vec![1];
-        assert!(!truncate_to_limit(&mut rows, 2));
-        assert_eq!(rows, vec![1]);
-    }
+    // truncate_to_limit itself is unit-tested in pagination.rs, shared by
+    // this file and sample.rs.
 
     fn valid_sha256(seed: &str) -> String {
         format!("{seed:0<64}")

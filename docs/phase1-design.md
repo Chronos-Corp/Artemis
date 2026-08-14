@@ -1,8 +1,9 @@
 # Phase 1 design: agent plus console
 
-Status: enrollment, heartbeat, sighting submission, and reading sightings
-back out are all authenticated end to end; most of the phase is still not
-built. This document tracks
+Status: enrollment, heartbeat, sighting submission, reading sightings back
+out, and sample retrieval's write path (request + agent fulfillment) are
+all authenticated end to end; most of the phase is still not built. This
+document tracks
 what Phase 1 actually is, what's landed so far, and what's deliberately
 deferred, in the same spirit as the README's Phase 0 "what works today /
 what's stubbed" split.
@@ -31,8 +32,15 @@ sequence, and why it's ordered this way:
    introduced, gates two read endpoints: sightings for a given host, and
    every host that's sighted a given indicator. Depended on #6 existing so
    there's a graph to query.
-6. **Later, not started:** sample retrieval, fleet UI, TLS/deployment
-   hardening.
+6. **PR #8 — sample retrieval, write path.** The third Phase 1 pillar per
+   the README. An operator requests a specific file from a specific host
+   (the console-operator credential again -- this is an analyst action,
+   not something an agent initiates); the agent polls for its own pending
+   requests and uploads the bytes, or reports why it couldn't. Reading
+   retrieved sample content back out is deferred to a follow-up PR, the
+   same split #6/#7 already established for sightings.
+7. **Later, not started:** reading sample content back out, fleet UI,
+   TLS/deployment hardening.
 
 Auth before telemetry, deliberately: once YARA and sighting submission
 exist, the agent starts producing intelligence the console has to trust.
@@ -432,6 +440,126 @@ behavior, and confirmed live: starting the binary with
 `NSIC_ENROLLMENT_SECRET=same NSIC_OPERATOR_SECRET=same` fails fast with a
 clear error before touching Postgres.
 
+### PR #8: sample retrieval, write path
+
+Locked architecture decision #3 (README): file contents leave a host only
+on explicit analyst request, logged and attributed. Nothing before this
+PR let an analyst actually get bytes off a host -- sightings only ever
+carry a hash, never content. This PR is that request/fulfillment flow;
+reading the retrieved content back out is deferred to a follow-up PR, the
+same split #6/#7 already established for sightings (write first, read
+once there's something to read).
+
+**Push isn't possible, so this is poll.** The agent only ever makes
+outbound requests to the console -- it doesn't listen for anything, and
+there's no persistent daemon (`nsic-agent` is still a one-shot CLI, same
+as every other subcommand). So an operator's request can't be delivered
+to a specific agent directly; instead the agent polls
+`GET /api/v1/agents/{host_id}/sample-requests` for its own pending work
+and acts on whatever it finds. `nsic-agent fulfill-samples` does this in
+one invocation: list pending, then for each one, read the requested path
+and upload it (or report why that read failed), matching `scan`'s
+"one CLI call does the whole job" shape.
+
+**A new, third database table, not a repurposed sightings edge.**
+`sample_request` (`src-tauri/migrations/0006_sample_request.sql`) is its
+own row per analyst request -- host, path, optional asserted hash,
+status, and how it was resolved -- because a sample request has a
+lifecycle (`pending` → `fulfilled`/`mismatched`/`failed`) that a sighting
+never had. `sample_blob` stores the actual bytes, content-addressed by
+sha256 the same way `indicator` already is, so the same file retrieved
+from two hosts (or the same host twice) is stored once. Raw `BYTEA` in
+Postgres, not a separate object store -- the simplest thing that works
+for Phase 1 (see below for what that doesn't cover).
+
+**Operator-authenticated to create and list; per-agent-authenticated to
+poll and resolve.** `POST`/`GET /api/v1/hosts/{host_id}/sample-requests`
+(create a request; list every request for a host, any status) require the
+operator credential -- requesting a file off a host is an analyst
+action, not something a host does to itself, exactly the same reasoning
+that already gates reading sightings. `GET /api/v1/agents/{host_id}/
+sample-requests` (poll pending only) and the two resolution endpoints
+(`POST .../content`, `POST .../failure`) require that specific host's
+per-agent credential. Verified both directions: a host's own credential
+does not authorize creating or listing requests
+(`create_sample_request_rejects_per_agent_credential`), and the operator
+credential does not authorize polling
+(`list_pending_sample_requests_rejects_operator_credential`) -- neither
+credential works in the other's place, the same mutual check PR #7
+established for sightings.
+
+**Raw bytes, not JSON.** Every other request/response in this API is
+JSON; `POST .../content`'s body is the sample's raw bytes
+(`axum::body::Bytes`), `Content-Type: application/octet-stream`. Base64-
+encoding a multi-megabyte sample into a JSON field would inflate it by
+roughly a third for no benefit once nothing else in the payload needs to
+be structured.
+
+**A size cap, enforced twice.** `sample::MAX_SAMPLE_SIZE_BYTES` (100 MiB)
+is applied as an `axum::extract::DefaultBodyLimit` on the upload route
+specifically -- not globally, so a misbehaving JSON client on some other
+endpoint can't force the server to buffer up to 100 MiB before rejecting
+it -- and checked again explicitly inside the handler, belt-and-
+suspenders in case that layer is ever misconfigured or dropped in a
+future refactor. Not exercised with an actual 100 MiB+ transfer in
+either the automated tests or the live smoke test below (the cost of
+generating and uploading that much data on every run/verification isn't
+worth it for a straightforward length comparison); verified by code
+review that the layer is present and the check is correct, not by
+observing the rejection happen.
+
+**A pending request can't be silently overwritten.** Fulfilling or
+failing a request first confirms it's still `pending`
+(`claim_pending_request`, shared by both resolution paths) and returns
+`409 Conflict` otherwise. Without this, a stale or replayed upload could
+quietly rewrite an already-resolved request's outcome -- exactly the
+kind of already-recorded-evidence tampering this project has been
+careful to close off elsewhere (e.g. `host_sighted_indicator`'s
+stale-observation-can't-regress-`path` rule in PR #6). Verified with
+`fulfill_sample_request_rejects_already_resolved_request` and
+`fail_sample_request_rejects_already_resolved_request`.
+
+**A wrong or unknown request id looks the same from an agent's
+perspective.** `claim_pending_request` looks a request up by `(id,
+host_id)` together, so a request belonging to a different host returns
+the same `404` as a request id that doesn't exist at all -- a request id
+can't be used to probe whether it belongs to some other host, the same
+"don't leak existence" property `authenticate_host` already has for
+credential checks.
+
+**Mismatches are a distinct, visible outcome, not silently upgraded to
+success.** `SampleRequestCreate::expected_sha256` lets an analyst pivoting
+from a known hash assert what they expect to receive. If the agent
+uploads something that hashes to something else -- wrong file, changed
+since the hash was recorded, or worse -- the request resolves to
+`mismatched`, not `fulfilled`, and that status is what the operator's
+list view shows. Verified with
+`fulfill_sample_request_mismatched_expected_sha256_marks_mismatched`,
+which confirms the mismatch is visible through the real list endpoint,
+not just in the immediate response.
+
+**Row cap and deterministic ordering applied from the start, not added in
+a second review round.** Both list endpoints use the same
+`truncate_to_limit`/`truncated`-flag pattern PR #7 added after review
+(now shared via `crates/console/src/pagination.rs` rather than
+duplicated), and order by `requested_at` with `id` as an explicit
+tie-break. `validate_lowercase_sha256`/`bad_request` similarly moved to a
+new `crates/console/src/validate.rs`, shared between `sighting.rs` and
+the new `sample.rs`, once there were two real consumers instead of one.
+
+**Verified against a live Postgres and the real binaries again.** The
+full DB-backed suite (22 new tests in `sample.rs`, 57 total across
+`console`) ran for real, twice, to confirm rerun-safety. The complete
+write-then-poll-then-fulfill flow was also exercised against the actual
+`nsic-console`/`nsic-agent` binaries: created a real sample request via
+`curl` with the operator credential, ran `nsic-agent fulfill-samples`
+against a real file, confirmed the uploaded content's sha256 matches
+`sha256sum` run directly against the same file, confirmed a second
+`fulfill-samples` run correctly reports nothing pending, and confirmed
+the failure path (a request for a path that doesn't exist on the host)
+resolves to `failed` with a clear reason instead of hanging or silently
+dropping the request.
+
 ## What's deliberately not here yet
 
 - **Sensor health / scan coverage.** PR #6 only sends positive sightings
@@ -523,9 +651,34 @@ clear error before touching Postgres.
   single-analyst click-to-verdict flow has different risk
   characteristics than an authenticated, durably-persisted fleet
   sighting. Worth the same fix eventually, but out of scope for this PR.
-- **Sample retrieval.** Locked architecture decision #3: file contents
-  leave the host only on explicit analyst request, logged and attributed.
-  No part of that request/audit flow exists yet.
+- **Reading retrieved sample content back out.** PR #8 covers requesting
+  and fulfilling; there's no endpoint that returns a retrieved sample's
+  actual bytes to an operator yet -- `SampleRequestView` deliberately
+  never carries `sample_blob.content`. The same write-then-read split #6
+  and #7 went through for sightings; the operator-facing "list requests
+  and their status" endpoint already exists (PR #8), only "download the
+  bytes" is missing.
+- **No encryption at rest for stored sample content.** `sample_blob.
+  content` sits in Postgres as plain `BYTEA` -- raw malware bytes,
+  unencrypted, readable by anyone with database access. Consistent with
+  everything else in Phase 1 not being hardened yet (no TLS in transit
+  either), but a real gap once this holds actual malicious samples
+  rather than test fixtures.
+- **No retention or TTL policy for sample content.** Nothing ever deletes
+  a `sample_blob` row; storage grows unbounded as samples accumulate.
+  Fine for early testing, not for a long-running console.
+- **`MAX_SAMPLE_SIZE_BYTES` (100 MiB) is arbitrary and untested at the
+  boundary.** Chosen as a documented, sane-sounding ceiling for storing
+  raw bytes directly in Postgres, not derived from any real workload;
+  verified by code review that the `DefaultBodyLimit` layer and the
+  redundant in-handler check are both present and correct, not by
+  actually uploading something at or past the limit (see PR #8 above).
+- **Sample-request read/write share the same operator-RBAC gap sightings
+  already have.** Every holder of `NSIC_OPERATOR_SECRET` can request a
+  file from any host and see every request's status and outcome; there's
+  no per-user identity or audit trail beyond "the operator, as a whole"
+  did this. Same deferred item PR #7 logged for sighting reads, now also
+  true of sample requests.
 - **Fleet console UI.** No frontend for any of this; `crates/console` is
   API-only.
 - **Windows-specific agent internals.** USN journal, Amcache, etc. are
@@ -571,6 +724,23 @@ joined against `host` (for `hostname`), `indicator` (for the sha256
 `value`), and `detection` (for the rule `name`), via
 `SightingView` (`nsic_core::proto`).
 
+`sample_blob` (`src-tauri/migrations/0006_sample_request.sql`): `sha256`
+(primary key -- content-addressed, the same convention `indicator`
+already uses, so identical content retrieved from two hosts is stored
+once), `content` (`BYTEA`, the raw bytes), `size_bytes`, `stored_at`.
+
+`sample_request` (same migration): one row per analyst request to pull a
+specific file off a specific host -- the audit trail locked architecture
+decision #3 requires. `id`, `host_id`, `path` (as requested, not
+verified against anything until an agent responds), `expected_sha256`
+(nullable -- set when the analyst already knows the hash they're
+expecting), `status` (`pending` / `fulfilled` / `mismatched` / `failed`),
+`failure_reason` (set only on `failed`), `sha256` (nullable until
+resolved, references `sample_blob` once it is), `requested_at`,
+`resolved_at` (nullable until resolved). Not an edge in the intel graph
+like `host_sighted_indicator` -- a sample request isn't a fact about an
+indicator, it's a workflow record with its own lifecycle.
+
 ## Running it locally
 
 ```bash
@@ -607,12 +777,34 @@ curl -H "Authorization: Bearer $NSIC_OPERATOR_SECRET" \
 #     "detection_name": "...", "source": "agent:yara_scan", "confidence": 65,
 #     "path": "...", "ruleset_fingerprint": "...", "first_seen": "...",
 #     "last_seen": "...", "received_at": "..."}], "truncated": false}
+
+curl -X POST -H "Authorization: Bearer $NSIC_OPERATOR_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"path": "/path/on/the/host", "expected_sha256": null}' \
+  http://localhost:8787/api/v1/hosts/<uuid>/sample-requests
+# -> {"request_id": "<uuid>"}
+
+cargo run -p agent --bin nsic-agent -- fulfill-samples \
+  --console-url http://localhost:8787 --host-id <uuid> --credential <token>
+# -> fulfilled sample request <uuid>: path=... status=Fulfilled sha256=... size_bytes=...
+# -> (or, if the path doesn't exist on this host:)
+# -> reported failure for sample request <uuid>: path=... reason=...
+
+curl -H "Authorization: Bearer $NSIC_OPERATOR_SECRET" \
+  http://localhost:8787/api/v1/hosts/<uuid>/sample-requests
+# -> {"requests": [{"id": "...", "host_id": "...", "path": "...",
+#     "expected_sha256": null, "status": "fulfilled", "failure_reason": null,
+#     "sha256": "...", "size_bytes": ..., "requested_at": "...",
+#     "resolved_at": "..."}], "truncated": false}
 ```
 
 `--enrollment-secret` and `--credential` both fall back to
-`NSIC_ENROLLMENT_SECRET` / `NSIC_AGENT_CREDENTIAL` if omitted. The two
-read endpoints have no dedicated CLI command yet -- `curl` (or any HTTP
-client) with the operator credential as a bearer token, as above.
+`NSIC_ENROLLMENT_SECRET` / `NSIC_AGENT_CREDENTIAL` if omitted. The
+sighting- and sample-request-list endpoints have no dedicated CLI command
+yet -- `curl` (or any HTTP client) with the operator credential as a
+bearer token, as above. There is no command to download a retrieved
+sample's actual content yet either (see "What's deliberately not here
+yet").
 
 `crates/agent` and `crates/console` do not need the WebKitGTK/GTK system
 libraries `src-tauri` requires on Linux (`libwebkit2gtk-4.1-dev` etc.);
