@@ -1,9 +1,9 @@
 # Phase 1 design: agent plus console
 
 Status: enrollment, heartbeat, sighting submission, reading sightings back
-out, and sample retrieval's write path (request + agent fulfillment) are
-all authenticated end to end; most of the phase is still not built. This
-document tracks
+out, and both halves of sample retrieval (request + agent fulfillment,
+and reading the retrieved content back out) are all authenticated end to
+end; most of the phase is still not built. This document tracks
 what Phase 1 actually is, what's landed so far, and what's deliberately
 deferred, in the same spirit as the README's Phase 0 "what works today /
 what's stubbed" split.
@@ -48,8 +48,14 @@ sequence, and why it's ordered this way:
    Both fixed before starting the read half, deliberately: this is
    exactly the kind of evidence-integrity bug that gets harder to unwind
    the more gets built on top of it.
-8. **Later, not started:** reading sample content back out, fleet UI,
-   TLS/deployment hardening.
+8. **PR #10 — reading sample content back out.** The read half #8
+   deferred. Two operator-credential download endpoints: by a specific
+   sample request (for an operator already looking at
+   `list_sample_requests`), and directly by sha256 (content-addressed,
+   independent of which request or host originally supplied it -- the
+   same "pivot from a hash you already have" pattern #7 established for
+   sightings). Raw bytes, not JSON, same reasoning as the upload side.
+9. **Later, not started:** fleet UI, TLS/deployment hardening.
 
 Auth before telemetry, deliberately: once YARA and sighting submission
 exist, the agent starts producing intelligence the console has to trust.
@@ -673,6 +679,77 @@ separate open, and on Unix, nonblocking open flags are worth
 considering against hostile special files. Not worth the added
 complexity for Phase 1's one-shot invocation model yet.
 
+### PR #10: reading sample content back out
+
+The read half of sample retrieval PR #8 deferred, following the same
+write-then-read split #6/#7 already used for sightings. No schema
+changes -- both endpoints read `sample_blob`, which #8 already wrote.
+
+**Two access patterns, both operator-credential only.**
+`GET /api/v1/hosts/{host_id}/sample-requests/{request_id}/content`
+downloads via a specific request -- the natural next step after
+`list_sample_requests`, which already hands back a request's `id`.
+`GET /api/v1/samples/{sha256}/content` downloads directly by hash,
+independent of which request or host originally supplied the content --
+the same "pivot from a hash you already have" pattern
+`list_indicator_sightings` established for sightings, and the more
+useful pattern once content is deduplicated: an operator who already has
+a sha256 (from a sighting, or from another host's already-fulfilled
+request) shouldn't need to know or care which specific request first
+retrieved it.
+
+**Serving by hash doesn't reopen locked architecture decision #3's
+gate.** "File contents leave a host only on explicit analyst request" is
+enforced once, at upload time -- only a `pending`, per-agent-
+credentialed request can add anything to `sample_blob` in the first
+place (see PR #8/#9). Once content is legitimately stored there, which
+authenticated operator query later reads it back out isn't a second
+gate the design ever depended on.
+
+**Availability is a `JOIN`, not a separate status check.** The
+per-request endpoint joins `sample_request` to `sample_blob` on
+`sr.sha256 = sb.sha256`; since that column is only ever non-`NULL` once
+a request has resolved to `fulfilled` or `mismatched` (see the
+migration), a `pending` or `failed` request simply has no matching row.
+Same `404` as a request that doesn't exist at all -- an operator already
+has full visibility into *why* via `list_sample_requests`'s `status`
+field, so there's nothing this endpoint needs to explain that the list
+view hasn't already shown. Verified with tests covering both non-
+available statuses (`pending`, `failed`) returning `404`, and both
+content-bearing statuses (`fulfilled`, `mismatched`) returning the
+actual bytes -- a mismatched request still has real, successfully-
+uploaded content; the mismatch is between what was expected and what
+arrived, not a failure to store anything.
+
+**Raw bytes, not JSON, named by hash.** Same reasoning as the upload
+side: base64-encoding a multi-megabyte sample for no benefit is wasted
+overhead. Responses set `Content-Type: application/octet-stream` and
+`Content-Disposition: attachment; filename="<sha256>"` -- named by the
+hash rather than the path the agent originally reported, since an
+arbitrary analyst-supplied path could contain characters that don't
+belong in a header value while a hex-encoded sha256 always does.
+
+**Verified against a live Postgres and the real binaries.** 13 new
+tests in `sample.rs` (85 total across the workspace), covering both
+endpoints' credential checks (including the same mutual-exclusion
+property verified everywhere else: a per-agent credential doesn't
+authorize operator-facing reads, and vice versa), malformed-sha256
+rejection, unknown-id/unknown-hash `404`s, both non-available statuses
+returning `404`, both content-bearing statuses returning bytes, and
+content-addressing working across hosts (content uploaded fulfilling
+one host's request downloads correctly by hash with no reference to
+that host or request at all). The full write-then-download round trip
+was also exercised against the actual `nsic-console`/`nsic-agent`
+binaries: created a request, fulfilled it via `nsic-agent
+fulfill-samples`, downloaded the content both ways (`curl` by request
+id and by sha256), and confirmed both downloads are byte-identical to
+the original file via `diff` and to each other, with the response
+headers matching exactly what's documented above. Also confirmed live:
+missing credential (`401`), unknown hash (`404`), and unknown request id
+(`404`).
+
+## What's deliberately not here yet
+
 - **Sensor health / scan coverage.** PR #6 only sends positive sightings
   -- a match. Zero active YARA rules and zero YARA detections currently
   look identical from the console's side: both are just an absence of
@@ -771,13 +848,6 @@ complexity for Phase 1's one-shot invocation model yet.
   single-analyst click-to-verdict flow has different risk
   characteristics than an authenticated, durably-persisted fleet
   sighting. Worth the same fix eventually, but out of scope for this PR.
-- **Reading retrieved sample content back out.** PR #8 covers requesting
-  and fulfilling; there's no endpoint that returns a retrieved sample's
-  actual bytes to an operator yet -- `SampleRequestView` deliberately
-  never carries `sample_blob.content`. The same write-then-read split #6
-  and #7 went through for sightings; the operator-facing "list requests
-  and their status" endpoint already exists (PR #8), only "download the
-  bytes" is missing.
 - **No encryption at rest for stored sample content.** `sample_blob.
   content` sits in Postgres as plain `BYTEA` -- raw malware bytes,
   unencrypted, readable by anyone with database access. Consistent with
@@ -916,15 +986,21 @@ curl -H "Authorization: Bearer $NSIC_OPERATOR_SECRET" \
 #     "expected_sha256": null, "status": "fulfilled", "failure_reason": null,
 #     "sha256": "...", "size_bytes": ..., "requested_at": "...",
 #     "resolved_at": "..."}], "truncated": false}
+
+curl -o retrieved-sample.bin -H "Authorization: Bearer $NSIC_OPERATOR_SECRET" \
+  http://localhost:8787/api/v1/hosts/<uuid>/sample-requests/<request-uuid>/content
+# -> (raw bytes, Content-Type: application/octet-stream)
+
+curl -o retrieved-sample.bin -H "Authorization: Bearer $NSIC_OPERATOR_SECRET" \
+  http://localhost:8787/api/v1/samples/<sha256>/content
+# -> same content, looked up by hash instead of by request
 ```
 
 `--enrollment-secret` and `--credential` both fall back to
 `NSIC_ENROLLMENT_SECRET` / `NSIC_AGENT_CREDENTIAL` if omitted. The
-sighting- and sample-request-list endpoints have no dedicated CLI command
-yet -- `curl` (or any HTTP client) with the operator credential as a
-bearer token, as above. There is no command to download a retrieved
-sample's actual content yet either (see "What's deliberately not here
-yet").
+sighting- and sample-request-list endpoints, and both download
+endpoints, have no dedicated CLI command yet -- `curl` (or any HTTP
+client) with the operator credential as a bearer token, as above.
 
 `crates/agent` and `crates/console` do not need the WebKitGTK/GTK system
 libraries `src-tauri` requires on Linux (`libwebkit2gtk-4.1-dev` etc.);
