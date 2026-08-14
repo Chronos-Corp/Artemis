@@ -12,6 +12,8 @@ path = "src/main.rs"
 nsic-core = { path = "../nsic-core", features = ["db"] }
 anyhow = "1"
 axum = "0.8"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "chrono", "uuid"] }
 chrono = { version = "0.4", features = ["serde"] }

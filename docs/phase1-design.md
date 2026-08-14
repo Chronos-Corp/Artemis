@@ -55,7 +55,14 @@ sequence, and why it's ordered this way:
    independent of which request or host originally supplied it -- the
    same "pivot from a hash you already have" pattern #7 established for
    sightings). Raw bytes, not JSON, same reasoning as the upload side.
-9. **Later, not started:** fleet UI, TLS/deployment hardening.
+9. **PR #11 — TLS/deployment hardening.** Everything through PR #10 talks
+   plain HTTP -- credentials and retrieved sample content (including
+   actual malware bytes) crossed the wire in plaintext. Opt-in TLS
+   termination in the console, and a matching way for the agent to trust
+   a self-signed or internal-CA console certificate, so a real deployment
+   isn't forced to sit behind a separate TLS-terminating proxy just to
+   stop shipping secrets in the clear.
+10. **Later, not started:** fleet UI, credential rotation.
 
 Auth before telemetry, deliberately: once YARA and sighting submission
 exist, the agent starts producing intelligence the console has to trust.
@@ -748,6 +755,111 @@ headers matching exactly what's documented above. Also confirmed live:
 missing credential (`401`), unknown hash (`404`), and unknown request id
 (`404`).
 
+### PR #11: TLS/deployment hardening
+
+Every PR through #10 ran the console over plain HTTP. That meant the
+bootstrap secret, per-agent credentials, the operator secret, sighting
+data, and now retrieved sample content -- actual malware bytes -- all
+crossed the wire unencrypted. This PR makes TLS available end to end,
+opt-in on the console side and matched by a corresponding trust option on
+the agent side, without breaking any existing plain-HTTP deployment.
+
+**Opt-in, both-or-neither, same shape as the existing secret
+validation.** TLS activates only when both `NSIC_TLS_CERT_PATH` and
+`NSIC_TLS_KEY_PATH` are set (`validate_tls_configuration` in
+`crates/console/src/main.rs`); setting exactly one fails fast at startup
+with a clear error, the same "half-configured is refused, not silently
+downgraded" pattern `validate_secret_configuration` already established
+for the bootstrap/operator secrets. Setting neither serves plain HTTP,
+now with an explicit `tracing::warn!` naming exactly what's exposed
+(credentials, sample content) and pointing at the two env vars that turn
+it off. Existing local setups keep working unchanged; enabling TLS is a
+deliberate operator choice.
+
+**`axum-server` + `rustls`, not a bolt-on reverse proxy.** The console
+serves HTTPS directly (`axum_server::bind_rustls`, config loaded via
+`RustlsConfig::from_pem_file`) rather than requiring every deployment to
+stand up its own TLS-terminating proxy in front of a plaintext console.
+A proxy is still a reasonable choice for a real production deployment
+(cert rotation, ACME, etc. -- see below); this just means it's no longer
+the *only* way to get encryption in transit.
+
+**A genuine bug, found only by actually starting the console with TLS
+configured.** rustls needs exactly one process-level crypto provider
+selected before anything builds a `ServerConfig`. `sqlx`'s
+`runtime-tokio-rustls` feature pulls in rustls's `ring` provider;
+`axum-server`'s `tls-rustls` feature pulls in rustls's `aws-lc-rs`
+provider by default. Cargo's workspace-wide feature unification means
+*both* ended up compiled into the same `console` binary
+(`cargo tree -p console -e features -i aws-lc-rs` confirmed both paths),
+and rustls refuses to guess between them -- the console panicked at the
+first TLS handshake attempt with "Could not automatically determine the
+process-level CryptoProvider." `cargo check`/`clippy`/the full test suite
+never exercised this at all; nothing short of actually starting the
+binary with TLS configured surfaced it. Fixed by adding a direct
+`rustls` dependency to `console/Cargo.toml` with only the `ring` feature
+enabled, and calling
+`rustls::crypto::ring::default_provider().install_default()` as the
+first statement in `main()`, before any secret or TLS-path validation --
+cheap and harmless even on a run where TLS ends up disabled. Verified by
+rebuilding and starting the console with TLS configured: it now logs
+"console listening on `<addr>` (HTTPS)" and serves real HTTPS instead of
+panicking.
+
+**The agent trusts an additional root, it doesn't skip verification.**
+A console operator running TLS with a self-signed or internal-CA
+certificate needs some way for the agent to trust it, since that
+certificate won't chain to a public root. Every console-talking
+subcommand (`enroll`, `heartbeat`, `scan`, `fulfill-samples`) gained a
+`--tls-ca-cert` / `NSIC_TLS_CA_CERT` option
+(`crates/agent/src/main.rs`). `build_http_client` reads that PEM file and
+adds it via `reqwest::Client::builder().add_root_certificate(cert)` --
+*in addition to* the platform's normal CA store, never a flag that
+disables certificate validation entirely. There is deliberately no
+`--insecure`/skip-verification escape hatch: an operator without a real
+or internal CA still gets a hard failure rather than a silent downgrade
+to an unauthenticated channel. Verified live: an `enroll` attempt against
+the TLS-enabled console *without* `--tls-ca-cert` fails with
+`invalid peer certificate: UnknownIssuer` (the handshake genuinely
+rejects an untrusted cert), and the same call *with* `--tls-ca-cert`
+pointing at the console's certificate succeeds.
+
+**`reqwest::Certificate::from_pem` doesn't validate content at parse
+time -- confirmed directly, not assumed.** An initial test asserted that
+`build_http_client` given a garbage (non-PEM) CA cert file should return
+an `Err`. It didn't -- `from_pem` returned `Ok`. Checked directly via a
+standalone throwaway Cargo project: plain garbage text, empty input, PEM
+markers wrapping garbage, and PEM markers wrapping syntactically-invalid-
+but-plausible-looking DER all parsed as `Ok`. Real validation only
+happens later, during an actual TLS handshake against a server presenting
+a certificate. `build_http_client`'s doc comment says this explicitly now,
+and the test was renamed from an incorrect `_fails` expectation to
+`build_http_client_with_malformed_ca_cert_still_succeeds_at_this_stage`,
+asserting `.is_ok()` and documenting real `reqwest` behavior instead of
+an assumption about it.
+
+**Verified against a live Postgres and the real binaries, over real
+HTTPS.** A self-signed certificate was generated locally (`openssl req
+-x509 -newkey rsa:2048 ...`) and used to run the console with TLS
+enabled. The complete flow was exercised end to end over
+`https://localhost:8787`: `enroll --tls-ca-cert`, `heartbeat`, creating a
+sample request via `curl --cacert`, `fulfill-samples`, `scan` plus
+sighting report, and downloading the retrieved sample -- all succeeding,
+with the downloaded content byte-identical to the original file via
+`diff`. Also verified: plain-HTTP backward compatibility (console started
+with neither TLS env var set serves HTTP exactly as before, `enroll`
+over `http://` unaffected), and both halves of the half-configured
+fail-fast case (`NSIC_TLS_CERT_PATH` set without `NSIC_TLS_KEY_PATH`, and
+the reverse), each producing the expected startup error rather than
+starting in some ambiguous state. The full 91-test suite (`nsic-core`,
+`console`, `agent`) was run twice for rerun-safety.
+
+**Not addressed here, worth flagging:** the `axum-server`
+`tls-rustls` feature transitively pulls in `aws-lc-sys`, which needs
+`cmake` to build -- present in this sandbox and expected to be present on
+GitHub Actions' standard `ubuntu-latest` runner image, but not yet
+confirmed against a real CI run at the time this was written.
+
 ## What's deliberately not here yet
 
 - **Sensor health / scan coverage.** PR #6 only sends positive sightings
@@ -775,11 +887,20 @@ missing credential (`401`), unknown hash (`404`), and unknown request id
   policy (skip or chunk-hash above a threshold) or a stable-handle
   strategy (e.g. hold an open handle and read from it for both hashing
   and scanning) instead of `std::fs::read`'s single full-file buffer.
-- **Transport security.** Still HTTP, not HTTPS. The bootstrap secret,
-  per-agent credentials, and now sighting data all cross the wire in
-  plaintext today. Real TLS (or at minimum a documented "put this behind
-  a VPN/reverse proxy for now") is required before this talks to a real
-  fleet.
+- **TLS is opt-in and mutually exclusive with plain HTTP, not dual-mode.**
+  PR #11 added HTTPS support, but a single console process serves either
+  plain HTTP or HTTPS on one port, never both at once -- there's no
+  automatic HTTP-to-HTTPS redirect or dual-listener setup. An operator
+  who wants both would need two console processes on two ports (or a
+  proxy in front), not something this PR set out to build.
+- **No automatic certificate renewal, no mTLS.** The console loads
+  whatever cert/key `NSIC_TLS_CERT_PATH`/`NSIC_TLS_KEY_PATH` point to once
+  at startup; rotating a certificate means restarting the process with
+  new paths, no ACME/Let's Encrypt integration. TLS as added here also
+  only authenticates the *console* to callers -- there's no client
+  certificate requirement, so it doesn't replace or strengthen the
+  existing bearer-credential model, just stops those credentials
+  travelling in plaintext.
 - **Credential rotation and revocation.** A compromised or decommissioned
   host's credential can't currently be invalidated short of deleting its
   `host` row outright. No rotation flow exists either.
@@ -1001,6 +1122,39 @@ curl -o retrieved-sample.bin -H "Authorization: Bearer $NSIC_OPERATOR_SECRET" \
 sighting- and sample-request-list endpoints, and both download
 endpoints, have no dedicated CLI command yet -- `curl` (or any HTTP
 client) with the operator credential as a bearer token, as above.
+
+### Running it locally, with TLS
+
+```bash
+# Generate a self-signed cert for local testing -- a real deployment
+# should use a certificate from a real or internal CA instead.
+openssl req -x509 -newkey rsa:2048 -nodes \
+  -keyout console-key.pem -out console-cert.pem \
+  -days 365 -subj "/CN=localhost"
+
+export NSIC_TLS_CERT_PATH="$PWD/console-cert.pem"
+export NSIC_TLS_KEY_PATH="$PWD/console-key.pem"
+cargo run -p console --bin nsic-console &
+# -> console listening on 127.0.0.1:8787 (HTTPS)
+
+# The agent needs to be told to trust this cert, since it isn't signed
+# by a public CA -- every subcommand below accepts --tls-ca-cert
+# (or NSIC_TLS_CA_CERT), added *alongside* the normal system CA store,
+# never a flag that skips verification.
+cargo run -p agent --bin nsic-agent -- enroll \
+  --console-url https://localhost:8787 --hostname "$(hostname)" \
+  --enrollment-secret "$NSIC_ENROLLMENT_SECRET" \
+  --tls-ca-cert "$PWD/console-cert.pem"
+
+curl --cacert console-cert.pem \
+  -H "Authorization: Bearer $NSIC_OPERATOR_SECRET" \
+  https://localhost:8787/api/v1/hosts/<uuid>/sightings
+```
+
+Omitting both `NSIC_TLS_CERT_PATH` and `NSIC_TLS_KEY_PATH` (the default)
+runs the console over plain HTTP exactly as shown above; setting only one
+of the two fails the console at startup rather than silently running
+without TLS.
 
 `crates/agent` and `crates/console` do not need the WebKitGTK/GTK system
 libraries `src-tauri` requires on Linux (`libwebkit2gtk-4.1-dev` etc.);
