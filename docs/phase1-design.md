@@ -655,6 +655,24 @@ the audit trail locked architecture decision #3 requires, that's a real
 tension, but there's no host deletion/decommissioning workflow yet for
 it to bite in practice. See below.
 
+**Also not fixed here, also logged as deferred: a smaller TOCTOU in
+`read_bounded_sample` itself.** It checks `std::fs::metadata(path)
+.is_file()`, then separately calls `std::fs::File::open(path)` -- a
+local process could in theory swap what that path resolves to (a FIFO,
+a device node, a different symlink target) in the gap between those two
+calls. `Read::take(max_bytes + 1)` still bounds memory use regardless,
+so the actual problem this PR set out to fix (unbounded reads) stays
+fixed either way; the residual risk is narrower -- mainly that a swap to
+something blocking (a FIFO with no writer) could hang the one-shot
+agent process while opening or reading it, not a memory-safety issue.
+Worth tightening once the agent is more than a one-shot CLI: handle-
+based identity/type validation (open first, then check the open file
+descriptor's metadata, rather than checking a path and trusting a
+second open of "the same" path) rather than a path check followed by a
+separate open, and on Unix, nonblocking open flags are worth
+considering against hostile special files. Not worth the added
+complexity for Phase 1's one-shot invocation model yet.
+
 - **Sensor health / scan coverage.** PR #6 only sends positive sightings
   -- a match. Zero active YARA rules and zero YARA detections currently
   look identical from the console's side: both are just an absence of
