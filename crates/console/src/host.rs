@@ -85,6 +85,7 @@ mod tests {
     use tower::ServiceExt;
 
     const BOOTSTRAP_SECRET: &str = "test-bootstrap-secret";
+    const OPERATOR_SECRET: &str = "test-operator-secret";
 
     async fn test_state() -> AppState {
         let database_url = std::env::var("DATABASE_URL")
@@ -95,6 +96,7 @@ mod tests {
         AppState {
             pool,
             bootstrap_secret: BOOTSTRAP_SECRET.to_string(),
+            operator_secret: OPERATOR_SECRET.to_string(),
         }
     }
 

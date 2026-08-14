@@ -1,7 +1,8 @@
 # Phase 1 design: agent plus console
 
-Status: enrollment, heartbeat, and sighting submission are authenticated
-end to end; most of the phase is still not built. This document tracks
+Status: enrollment, heartbeat, sighting submission, and reading sightings
+back out are all authenticated end to end; most of the phase is still not
+built. This document tracks
 what Phase 1 actually is, what's landed so far, and what's deliberately
 deferred, in the same spirit as the README's Phase 0 "what works today /
 what's stubbed" split.
@@ -25,7 +26,12 @@ sequence, and why it's ordered this way:
    `/api/v1/agents/{host_id}/sightings` endpoint and a new graph edge.
    Depended on both #4 (who's reporting) and #5 (what there is to
    report).
-5. **Later, not started:** sample retrieval, fleet UI, TLS/deployment
+5. **PR #7 — reading sightings back out.** #6 could only write. A new
+   console-operator credential, distinct from both credentials #4
+   introduced, gates two read endpoints: sightings for a given host, and
+   every host that's sighted a given indicator. Depended on #6 existing so
+   there's a graph to query.
+6. **Later, not started:** sample retrieval, fleet UI, TLS/deployment
    hardening.
 
 Auth before telemetry, deliberately: once YARA and sighting submission
@@ -317,6 +323,115 @@ endpoints use the exact same check rather than two copies drifting.
   covers `load()`'s new single-read-then-compile-via-add_rules_str path,
   since that's what it exercises today.
 
+### PR #7: reading sightings back out
+
+PR #6 only wrote. `crates/console/src/sighting.rs` gains two read
+endpoints, both returning `nsic_core::proto::SightingListResponse` (a list
+of `SightingView`, each row denormalized with a hostname, sha256, and rule
+name resolved so a caller doesn't have to look up `indicator_id`/
+`detection_id` itself):
+
+- `GET /api/v1/hosts/{host_id}/sightings` — every sighting recorded for a
+  given host.
+- `GET /api/v1/indicators/{sha256}/sightings` — every host that's sighted
+  a given hash, the cross-fleet "who else has seen this" pivot the
+  product's core idea (see the README) depends on.
+
+**A third credential, not a reuse of either existing one.** Neither
+credential PR #4 introduced fits: the bootstrap enrollment secret only
+ever authorizes a machine to join, and a per-agent credential proves "I am
+this one host, reporting my own observations" -- not "I may read what any
+host in the fleet has reported." Reusing either would conflate concerns
+the same way PR #4 was built specifically to avoid. A new
+`NSIC_OPERATOR_SECRET`, required at console startup (the console refuses
+to start without it, matching the bootstrap secret's fail-fast behavior),
+gates both endpoints via a new `authenticate_operator` in
+`crates/console/src/auth.rs` -- a direct constant-time comparison against
+the configured value, no database lookup, since (unlike a per-agent
+credential) there's nothing per-row to check against. Verified a
+compromised agent's own per-agent credential does *not* authenticate
+these endpoints (`list_host_sightings_rejects_per_agent_credential`) --
+the failure mode a shared or reused credential would silently allow.
+
+**Route prefix split reflects the trust boundary, not just REST taste.**
+Agent-facing routes stay under `/api/v1/agents/...` (bootstrap or
+per-agent credential); the new operator-facing read routes live under
+`/api/v1/hosts/...` and `/api/v1/indicators/...` (operator credential
+only) -- the URL shape itself signals which credential a given endpoint
+expects.
+
+**An unknown `host_id` returns `200` with an empty list, not `404`.**
+There's no "list all hosts" endpoint yet (see below) for an operator to
+have confirmed an id exists in the first place, so treating "no
+sightings" and "no such host" identically doesn't leak anything an
+operator couldn't already tell another way once one exists.
+
+**A fixed row cap, not real pagination -- and callers can tell when
+they've hit it.** Both endpoints fetch `SIGHTING_LIST_LIMIT + 1` (1001)
+rows, and if that extra row shows up, trim it back off and set
+`SightingListResponse::truncated = true`. Without the extra-row probe, a
+response capped at exactly 1000 rows is indistinguishable from a host or
+hash that genuinely has exactly 1000 sightings -- `truncated` is what lets
+a caller tell "this is everything" from "there's more, and this endpoint
+can't hand it to you yet." Still not a cursor -- there's no way to reach
+the rows past the cap, only a signal that they exist. The off-by-one trim
+logic (`truncate_to_limit`) is a small generic helper specifically so it
+can be unit-tested directly on a plain `Vec` without a database, rather
+than only indirectly by seeding 1000+ rows through the real endpoint.
+Real pagination is deferred until a fleet actually produces enough
+sightings per host or per hash to make the cap a real problem (see
+below).
+
+**`ORDER BY last_seen DESC` alone doesn't guarantee a stable order for
+ties.** Two sightings for the same host observed at the exact same
+instant used to sort however Postgres felt like breaking the tie, which
+is fine for a one-off read but means two separate calls to the same
+endpoint over unchanged data weren't guaranteed to return rows in the
+same order -- silently inconsistent with the row that happened to land
+at the cap potentially differing between two truncated responses of the
+same query. Both queries now tie-break on the rest of the relevant
+primary-key columns (whichever ones the `WHERE` clause doesn't already
+fix), so the full sort key is unique per row and the order is
+deterministic. Verified with a test that submits two sightings with
+identical `last_seen`, calls the endpoint twice, and asserts the two
+responses return rows in the same order.
+
+**This is the first PR in this sequence with DB-backed tests actually
+executed, not just reviewed.** A local Postgres 16 instance was available
+in this sandbox (unlike prior PRs, where none was), so the full DB-backed
+suite (`cargo test -- --include-ignored`) ran for real, including tests
+for missing/wrong operator credential, a per-agent credential rejected,
+an unknown host returning an empty list, malformed sha256 rejected, the
+full round trip confirming every denormalized field on the response
+actually matches what was reported, and the tie-break/ordering-stability
+test above. The write-then-read path was also exercised end to end
+against the real binaries (`nsic-console` + `nsic-agent`), not just the
+in-process test harness: enroll, scan-and-report a real EICAR match, then
+`curl` both new endpoints with the operator credential and confirm the
+JSON (including `truncated: false`) matches, and confirm the console
+still refuses to start without `NSIC_OPERATOR_SECRET` set, or with
+`NSIC_ENROLLMENT_SECRET`/`NSIC_OPERATOR_SECRET` empty or equal to each
+other (`validate_secret_configuration` in `main.rs` -- see below).
+
+**Bootstrap and operator secrets can't silently collapse into the same
+value.** The console now refuses to start if either
+`NSIC_ENROLLMENT_SECRET` or `NSIC_OPERATOR_SECRET` is empty, or if the
+two are equal. Nothing upstream of this PR would have caught an operator
+setting both to the same value in their environment -- every check this
+design relies on (`authenticate_host`'s per-agent lookup aside)
+ultimately reduces to "does the presented token equal the configured
+one," so if the two configured values are equal, a valid *bootstrap*
+secret would also pass the *operator* check, quietly reopening exactly
+the read-access-via-enrollment-secret conflation this PR's whole
+credential design exists to avoid. Plain `==`, not `auth::secrets_match`'s
+constant-time comparison: this runs once at process startup on two local
+config values, not a request path an attacker can measure timing on.
+Unit-tested directly (`validate_secret_configuration` in
+`crates/console/src/main.rs`) rather than only via the console's startup
+behavior, and confirmed live: starting the binary with
+`NSIC_ENROLLMENT_SECRET=same NSIC_OPERATOR_SECRET=same` fails fast with a
+clear error before touching Postgres.
+
 ## What's deliberately not here yet
 
 - **Sensor health / scan coverage.** PR #6 only sends positive sightings
@@ -365,11 +480,39 @@ endpoints use the exact same check rather than two copies drifting.
   agent stops being a one-shot CLI and becomes a persistent process --
   storing a long-lived credential insecurely at that point is a real
   vulnerability, not just a rough edge.
-- **Reading sightings back out.** PR #6 only writes; there's no endpoint
-  or query to list what's been reported for a host, a hash, or a rule.
-  The data is in the same Postgres graph `src-tauri`'s verdict engine
-  already queries, so it's reachable by hand, just not through any
-  Phase 1-specific API yet.
+- **Reading sightings back out by rule/detection name.** PR #7 covers
+  querying by host and by indicator; there's no
+  `GET /api/v1/detections/{name}/sightings` yet. Straightforward to add
+  the same way once there's a real need for it.
+- **No "list all hosts" endpoint.** An operator currently has no way to
+  discover valid `host_id`s through the API at all -- only from an
+  enroll response at enrollment time, or by querying Postgres directly.
+  PR #7's read endpoints assume the caller already has a `host_id` or a
+  sha256 in hand from somewhere; a host directory is its own PR. (An
+  unknown `host_id` returning `200` with an empty list rather than `404`
+  was reconsidered during review and kept deliberately, for exactly this
+  reason -- see PR #7 above.)
+- **Real pagination on the PR #7 list endpoints.** Both currently
+  `LIMIT 1000`, with a `truncated` flag signaling when a response was cut
+  short (see PR #7 above) but still no cursor to actually reach the rows
+  past the cap. Fine while no fleet has produced that many sightings for
+  one host or hash; not fine indefinitely.
+- **Operator-credential rotation.** Same gap as per-agent credentials
+  below, for the new `NSIC_OPERATOR_SECRET`: it's a single static value
+  with no rotation flow, and (unlike per-agent credentials) isn't even
+  hashed before comparison -- there's nothing per-row to hash it against.
+- **Operator identity is a single shared secret, not per-user.** Every
+  holder of `NSIC_OPERATOR_SECRET` looks identical to the console --
+  there's no way to tell which analyst issued a given read, let alone
+  restrict what any individual analyst can see. Fine for one operator
+  running this locally; a real multi-user fleet UI needs per-user
+  identity and RBAC before this credential model is adequate for it.
+- **`SightingView.sha256` assumes every indicator is a sha256.** True
+  today (`SightingRequest` only ever carries a sha256, per PR #6), so the
+  read side mirrors that narrowness rather than generalizing ahead of
+  need. Once a non-sha256 indicator kind can produce a sighting, this
+  field needs to become something like a `(kind, value)` pair instead of
+  assuming the one kind that exists right now.
 - **The same hash/scan TOCTOU exists in `src-tauri`'s desktop verdict
   engine, unfixed.** `verdict.rs`'s `resolve()` still hashes a file
   (`hash_file_cached`) and separately opens it again to YARA-scan it
@@ -423,12 +566,18 @@ indicator_id, source, ruleset_fingerprint)` -- the same edge shape every
 other edge in `0001_init.sql` uses, extended by two columns for the
 reasons above.
 
+No schema changes in PR #7 -- it only reads `host_sighted_indicator`,
+joined against `host` (for `hostname`), `indicator` (for the sha256
+`value`), and `detection` (for the rule `name`), via
+`SightingView` (`nsic_core::proto`).
+
 ## Running it locally
 
 ```bash
 docker compose up -d                       # Postgres, same as Phase 0
 export DATABASE_URL=postgres://nsic:nsic@localhost:5432/nsic
 export NSIC_ENROLLMENT_SECRET=dev-secret   # pick anything for local testing
+export NSIC_OPERATOR_SECRET=dev-operator-secret  # ditto -- gates the read endpoints below
 
 cargo run -p console --bin nsic-console &  # listens on 127.0.0.1:8787
 
@@ -449,10 +598,21 @@ cargo run -p agent --bin nsic-agent -- scan path/to/file --rules-dir yara-rules 
   --console-url http://localhost:8787 --host-id <uuid> --credential <token>
 # -> (same JSON as above, then, for each match:)
 # -> reported sighting: indicator_id=<uuid> rule=<rule name>
+
+curl -H "Authorization: Bearer $NSIC_OPERATOR_SECRET" \
+  http://localhost:8787/api/v1/hosts/<uuid>/sightings
+curl -H "Authorization: Bearer $NSIC_OPERATOR_SECRET" \
+  http://localhost:8787/api/v1/indicators/<sha256>/sightings
+# -> {"sightings": [{"host_id": "...", "hostname": "...", "sha256": "...",
+#     "detection_name": "...", "source": "agent:yara_scan", "confidence": 65,
+#     "path": "...", "ruleset_fingerprint": "...", "first_seen": "...",
+#     "last_seen": "...", "received_at": "..."}], "truncated": false}
 ```
 
 `--enrollment-secret` and `--credential` both fall back to
-`NSIC_ENROLLMENT_SECRET` / `NSIC_AGENT_CREDENTIAL` if omitted.
+`NSIC_ENROLLMENT_SECRET` / `NSIC_AGENT_CREDENTIAL` if omitted. The two
+read endpoints have no dedicated CLI command yet -- `curl` (or any HTTP
+client) with the operator credential as a bearer token, as above.
 
 `crates/agent` and `crates/console` do not need the WebKitGTK/GTK system
 libraries `src-tauri` requires on Linux (`libwebkit2gtk-4.1-dev` etc.);

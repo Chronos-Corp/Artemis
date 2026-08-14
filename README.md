@@ -232,10 +232,12 @@ Do not jump ahead; each phase de-risks the next.
   `src-tauri`), `crates/agent` (a CLI that can hash a file, run a local
   YARA scan, enroll/heartbeat against a console, and report scan matches
   as sightings), `crates/console` (an HTTP service, `/api/v1`, recording
-  enrollment/heartbeats/sightings in the same Postgres intel graph).
-  Enrollment requires a console-operator bootstrap secret; each enrolled
-  host gets its own credential for authenticated heartbeats and sighting
-  submission. No sample retrieval or fleet UI yet -- see
+  enrollment/heartbeats/sightings in the same Postgres intel graph, and
+  reading them back out by host or by hash). Enrollment requires a
+  console-operator bootstrap secret; each enrolled host gets its own
+  credential for authenticated heartbeats and sighting submission; a
+  third, separate console-operator credential gates the read endpoints.
+  No sample retrieval or fleet UI yet -- see
   [`docs/phase1-design.md`](docs/phase1-design.md) for exactly what's
   covered and what's deliberately deferred.
 - **Phase 2:** CVE hunt packs, KEV first.

@@ -85,3 +85,31 @@ pub async fn authenticate_host(
     }
     Ok(())
 }
+
+/// Verifies the bearer token in `headers` is the console-operator
+/// credential (`NSIC_OPERATOR_SECRET`), gating read access to fleet-wide
+/// sighting data. Deliberately a separate check from `authenticate_host`:
+/// a per-agent credential proves "I am this one host, reporting my own
+/// observations," not "I may read what any host in the fleet has
+/// reported." Collapsing the two would let a compromised or malicious
+/// agent read the entire fleet's sighting history using nothing but its
+/// own per-agent credential -- the same class of conflation PR #4 already
+/// rejected once for the bootstrap-vs-per-agent split. No database lookup
+/// here, unlike `authenticate_host`: the operator secret is a single
+/// operator-configured value compared directly, not a per-row hash.
+pub fn authenticate_operator(
+    operator_secret: &str,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, String)> {
+    let presented = bearer_token(headers).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "missing operator credential".to_string(),
+    ))?;
+    if !secrets_match(presented, operator_secret) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "invalid operator credential".to_string(),
+        ));
+    }
+    Ok(())
+}
