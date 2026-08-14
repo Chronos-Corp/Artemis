@@ -39,7 +39,16 @@ sequence, and why it's ordered this way:
    requests and uploads the bytes, or reports why it couldn't. Reading
    retrieved sample content back out is deferred to a follow-up PR, the
    same split #6/#7 already established for sightings.
-7. **Later, not started:** reading sample content back out, fleet UI,
+7. **PR #9 — sample-retrieval concurrency and safety fixes.** A
+   post-merge review of #8 found a real race in how a pending request
+   gets resolved (two concurrent fulfillments, or a fulfillment racing a
+   failure report, could both pass the "is it still pending" check and
+   both write, silently corrupting the outcome), plus an unbounded
+   client-side file read with no local size cap to match the console's.
+   Both fixed before starting the read half, deliberately: this is
+   exactly the kind of evidence-integrity bug that gets harder to unwind
+   the more gets built on top of it.
+8. **Later, not started:** reading sample content back out, fleet UI,
    TLS/deployment hardening.
 
 Auth before telemetry, deliberately: once YARA and sighting submission
@@ -560,7 +569,109 @@ the failure path (a request for a path that doesn't exist on the host)
 resolves to `failed` with a clear reason instead of hanging or silently
 dropping the request.
 
-## What's deliberately not here yet
+### PR #9: sample-retrieval concurrency and safety fixes
+
+A post-merge review of PR #8 found a real, high-priority race condition
+plus a strong follow-up worth fixing before building the read half on
+top of either. Fixed here, before any download endpoint exists.
+
+**The race: two concurrent resolutions of the same request could both
+write.** `claim_pending_request` originally ran a plain `SELECT` to check
+a request was still `pending`, outside any transaction, before a
+*separate* transaction did the actual `INSERT`/`UPDATE` -- and that final
+`UPDATE` had no `WHERE status = 'pending'` condition of its own. Two
+concurrent fulfillments could both pass the initial check before either
+had written anything, then both write, with whichever committed second
+silently overwriting the first's forensic result. Racing a fulfillment
+against a failure report was worse: the two updates touch different
+columns (`sha256` vs. `failure_reason`), so depending on ordering the row
+could end up `failed` while `sha256` still pointed at successfully
+uploaded bytes, or `fulfilled` with a stale `failure_reason` left
+attached -- a self-contradictory row, directly contradicting the code
+comment that promised an already-resolved request couldn't be
+overwritten.
+
+Fixed with `SELECT ... FOR UPDATE`: `claim_pending_request` now locks the
+row for the remainder of the caller's transaction. A second transaction
+trying to claim the same row *blocks* at the database level until the
+first commits or rolls back, then observes the post-resolution status
+and correctly gets `409`. The final `UPDATE` (factored into a shared
+`resolve_claimed_request`) still carries `AND status = 'pending'` as
+defense-in-depth, but the lock is the actual guarantee -- if that
+`UPDATE` ever affected zero rows, that would mean the locking invariant
+itself broke, and it's logged and surfaced as a `500` rather than
+silently ignored.
+
+Verified two ways. First, negatively: temporarily swapped in the
+original unlocked code with the new tests still attached and ran them
+repeatedly -- they failed a real fraction of runs (assertions like
+"exactly one of these two concurrent attempts should succeed" failing
+because both succeeded, or the row ending up in a self-contradictory
+state), confirming the tests actually catch the bug rather than passing
+vacuously. Then, positively: the fixed code passed the same tests
+consistently across repeated runs. The two new tests
+(`fulfill_sample_request_concurrent_attempts_exactly_one_succeeds`,
+`fulfill_and_fail_concurrent_attempts_leave_a_self_consistent_row`) fire
+real concurrent requests from separate `tokio::spawn`ed tasks sharing the
+same connection pool via `tokio::join!`, not a sequential
+double-resolution check -- the previous tests with "resolved" in their
+name predate this fix and only ever exercised the sequential case, which
+was never the part that was actually broken.
+
+**The follow-up: the agent had no size cap of its own.** The console's
+100 MiB cap (`nsic_core::proto::MAX_SAMPLE_SIZE_BYTES`, moved there from
+`console::sample` so both sides reference the same constant instead of
+each hardcoding a copy that can drift) only protects the console -- it
+rejects an oversized upload, but by the time that rejection happens the
+agent has already read the whole file into memory via an unbounded
+`std::fs::read`. A multi-gigabyte file named by a request's `path` would
+exhaust agent memory before the console ever got a chance to say no; an
+endless special file (a device node, a FIFO) named by that path could be
+far worse than merely large. Fixed with `read_bounded_sample`
+(`crates/agent/src/main.rs`): checks `std::fs::metadata(path).is_file()`
+first (rejecting directories and special files, but still following
+symlinks to an ordinary file's final target, since a legitimate request
+path being a symlink shouldn't be penalized), then reads at most
+`MAX_SAMPLE_SIZE_BYTES + 1` bytes via `Read::take` and rejects anything
+that hits that ceiling -- never buffers meaningfully more than the limit
+regardless of how large or strange the target actually is. Six new,
+DB-free unit tests in `crates/agent/src/main.rs` cover within-limit,
+exactly-at-limit, over-limit, a directory, and (on Unix) a symlink to an
+ordinary file being correctly accepted.
+
+**Documentation correction: attribution was overstated.**
+`SampleRequestCreate`'s doc comment used to say a `sample_request` row
+records "host, path, requester, and eventual outcome," listing
+"requester" as something the row tracks. It doesn't -- there is no
+per-user operator identity (see the deferred RBAC note below), only the
+shared operator credential as an undifferentiated whole. The migration's
+own comment already said this correctly; the Rust doc comment didn't
+match it. Fixed to describe only what's actually stored.
+
+**Not fixed here, logged as deferred instead: `ON DELETE CASCADE` on
+`sample_request.host_id`.** Deleting a host currently deletes its entire
+retrieval-request history along with it -- for a table that's explicitly
+the audit trail locked architecture decision #3 requires, that's a real
+tension, but there's no host deletion/decommissioning workflow yet for
+it to bite in practice. See below.
+
+**Also not fixed here, also logged as deferred: a smaller TOCTOU in
+`read_bounded_sample` itself.** It checks `std::fs::metadata(path)
+.is_file()`, then separately calls `std::fs::File::open(path)` -- a
+local process could in theory swap what that path resolves to (a FIFO,
+a device node, a different symlink target) in the gap between those two
+calls. `Read::take(max_bytes + 1)` still bounds memory use regardless,
+so the actual problem this PR set out to fix (unbounded reads) stays
+fixed either way; the residual risk is narrower -- mainly that a swap to
+something blocking (a FIFO with no writer) could hang the one-shot
+agent process while opening or reading it, not a memory-safety issue.
+Worth tightening once the agent is more than a one-shot CLI: handle-
+based identity/type validation (open first, then check the open file
+descriptor's metadata, rather than checking a path and trusting a
+second open of "the same" path) rather than a path check followed by a
+separate open, and on Unix, nonblocking open flags are worth
+considering against hostile special files. Not worth the added
+complexity for Phase 1's one-shot invocation model yet.
 
 - **Sensor health / scan coverage.** PR #6 only sends positive sightings
   -- a match. Zero active YARA rules and zero YARA detections currently
@@ -635,6 +746,15 @@ dropping the request.
   restrict what any individual analyst can see. Fine for one operator
   running this locally; a real multi-user fleet UI needs per-user
   identity and RBAC before this credential model is adequate for it.
+- **`sample_request.host_id` is `ON DELETE CASCADE`, which deletes the
+  audit trail along with the host.** For a table that's explicitly the
+  audit log locked architecture decision #3 requires (see PR #8/#9),
+  losing that history the moment a host row is deleted is a real
+  tension -- but there's no host deletion/decommissioning workflow yet
+  for it to matter in practice. Needs a retention-safe strategy (soft-
+  deleting hosts, or changing the FK behavior so retrieval history
+  outlives the host record) before deletion becomes a supported
+  operation, not before.
 - **`SightingView.sha256` assumes every indicator is a sha256.** True
   today (`SightingRequest` only ever carries a sha256, per PR #6), so the
   read side mirrors that narrowness rather than generalizing ahead of

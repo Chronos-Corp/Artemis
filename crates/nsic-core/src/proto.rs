@@ -24,6 +24,19 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Hard cap on a single sample's size, shared by both sides of the wire
+/// so they agree on it rather than each hardcoding their own copy that
+/// can drift: the console enforces it as an upper bound on what it will
+/// accept (`axum::extract::DefaultBodyLimit` on the upload route, plus a
+/// redundant in-handler check), and the agent enforces it as an upper
+/// bound on what it will even attempt to read off disk before making the
+/// request -- reading an unbounded file into memory first and only then
+/// discovering the console will reject it defeats the point of a cap.
+/// 100 MiB is an arbitrary but documented ceiling for storing raw sample
+/// bytes directly in Postgres -- see docs/phase1-design.md for why that
+/// storage choice itself is not the final answer.
+pub const MAX_SAMPLE_SIZE_BYTES: usize = 100 * 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnrollRequest {
     pub hostname: String,
@@ -131,8 +144,12 @@ pub struct SightingListResponse {
 /// See the repo README's locked architecture decision #3: file contents
 /// leave a host only on explicit, logged, attributed analyst request --
 /// this struct, once inserted as a `sample_request` row, *is* that log
-/// entry (host, path, requester, and eventual outcome all live on one
-/// row).
+/// entry (host, path, and eventual outcome all live on one row).
+/// "Attributed" is currently only to the operator credential as a whole,
+/// not to an individual analyst -- there is no per-user operator identity
+/// yet (see the deferred RBAC note in docs/phase1-design.md), and this
+/// doc comment used to imply otherwise by listing a "requester" as
+/// something the row records, which it doesn't.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SampleRequestCreate {
     pub path: String,
