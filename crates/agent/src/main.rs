@@ -20,10 +20,12 @@ use nsic_core::hashing::{compute_hashes, hash_bytes};
 use nsic_core::proto::{
     EnrollRequest, EnrollResponse, HeartbeatRequest, HeartbeatResponse, SampleRequestFailure,
     SampleRequestFulfilled, SampleRequestListResponse, SightingRequest, SightingResponse,
+    MAX_SAMPLE_SIZE_BYTES,
 };
 use nsic_core::yara_scan::YaraEngine;
 use reqwest::Response;
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -297,6 +299,46 @@ async fn report_sightings(
     Ok(())
 }
 
+/// Reads `path` into memory, refusing to read more than `max_bytes` and
+/// refusing anything that isn't a regular file. The console enforces
+/// `MAX_SAMPLE_SIZE_BYTES` on the way in (`DefaultBodyLimit` plus an
+/// in-handler check), but that's too late to matter here: a multi-
+/// gigabyte file, or an endless special file (a device node, a FIFO, a
+/// symlink loop's eventual target) named by an operator's request path
+/// would otherwise get read via an unbounded `std::fs::read` before the
+/// agent ever makes the HTTP request the console could reject. Uses
+/// `std::fs::metadata` (follows symlinks) rather than `symlink_metadata`,
+/// so a path that's a symlink to an ordinary file is still accepted --
+/// only the final target's type has to be a regular file, not the path
+/// itself. Reads at most `max_bytes + 1` via `Read::take` so a file
+/// exactly at the limit is distinguishable from one a single byte over
+/// it, without ever buffering more than one byte past what's allowed.
+fn read_bounded_sample(path: &Path, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+
+    let file = std::fs::File::open(path)?;
+    let mut limited = file.take(max_bytes as u64 + 1);
+    let mut buf = Vec::new();
+    limited.read_to_end(&mut buf)?;
+
+    if buf.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} exceeds the {max_bytes}-byte sample size limit",
+                path.display()
+            ),
+        ));
+    }
+    Ok(buf)
+}
+
 /// Fetches this host's pending sample requests and resolves each one:
 /// reads the requested path locally exactly once, then either uploads
 /// those exact bytes as the fulfillment or, if the read itself fails,
@@ -328,7 +370,7 @@ async fn fulfill_sample_requests(console_url: &str, host_id: Uuid, credential: &
     }
 
     for req in &pending.requests {
-        match std::fs::read(&req.path) {
+        match read_bounded_sample(Path::new(&req.path), MAX_SAMPLE_SIZE_BYTES) {
             Ok(data) => {
                 let response = client
                     .post(format!(
@@ -397,4 +439,76 @@ async fn parse_or_report<T: serde::de::DeserializeOwned>(
         .json()
         .await
         .with_context(|| format!("parsing {what} response"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_bounded_sample;
+    use std::io::Write;
+
+    #[test]
+    fn reads_a_file_within_the_limit() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(b"hello").unwrap();
+        let data = read_bounded_sample(tmp.path(), 100).expect("should read within limit");
+        assert_eq!(data, b"hello");
+    }
+
+    #[test]
+    fn accepts_a_file_exactly_at_the_limit() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&[0u8; 10]).unwrap();
+        let data =
+            read_bounded_sample(tmp.path(), 10).expect("a file exactly at the limit should pass");
+        assert_eq!(data.len(), 10);
+    }
+
+    #[test]
+    fn rejects_a_file_over_the_limit() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&[0u8; 11]).unwrap();
+        let err =
+            read_bounded_sample(tmp.path(), 10).expect_err("an over-limit file must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// The actual motivating case: an unbounded read of a huge or
+    /// endless file must never get far enough to matter. A 10-byte limit
+    /// against an 11-byte file already proves the cutoff is exact; this
+    /// just confirms the same holds well past that boundary too, so the
+    /// `take(max_bytes + 1)` isn't accidentally doing something that only
+    /// happens to work for tiny limits.
+    #[test]
+    fn does_not_buffer_more_than_one_byte_past_the_limit() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&[0u8; 4096]).unwrap();
+        let err = read_bounded_sample(tmp.path(), 1024)
+            .expect_err("a file well over the limit must still be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn rejects_a_directory() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let err = read_bounded_sample(tmp_dir.path(), 100)
+            .expect_err("a directory is not a regular file");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// `read_bounded_sample` deliberately uses `std::fs::metadata`
+    /// (follows symlinks), not `symlink_metadata` -- a path that's a
+    /// symlink to an ordinary file must still be accepted; only the
+    /// final target's type has to be a regular file.
+    #[cfg(unix)]
+    #[test]
+    fn follows_a_symlink_to_an_ordinary_file() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(b"symlinked content").unwrap();
+        let link_dir = tempfile::tempdir().unwrap();
+        let link_path = link_dir.path().join("link");
+        std::os::unix::fs::symlink(tmp.path(), &link_path).unwrap();
+        let data = read_bounded_sample(&link_path, 100)
+            .expect("a symlink to a regular file should be accepted");
+        assert_eq!(data, b"symlinked content");
+    }
 }

@@ -113,14 +113,16 @@ fn build_router(state: AppState) -> Router {
     // The sample-content upload route gets its own sub-router so only it
     // carries a raised body-size limit -- every other route (all JSON)
     // keeps axum's default, so a misbehaving JSON client can't force the
-    // server to buffer up to sample::MAX_SAMPLE_SIZE_BYTES on an endpoint
-    // that was never meant to receive anything that large.
+    // server to buffer up to MAX_SAMPLE_SIZE_BYTES on an endpoint that
+    // was never meant to receive anything that large.
     let sample_content_route = Router::new()
         .route(
             "/api/v1/agents/{host_id}/sample-requests/{request_id}/content",
             post(sample::fulfill_sample_request),
         )
-        .layer(DefaultBodyLimit::max(sample::MAX_SAMPLE_SIZE_BYTES))
+        .layer(DefaultBodyLimit::max(
+            nsic_core::proto::MAX_SAMPLE_SIZE_BYTES,
+        ))
         .with_state(state.clone());
 
     Router::new()

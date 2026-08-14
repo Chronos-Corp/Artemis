@@ -5,26 +5,16 @@ use axum::Json;
 use chrono::Utc;
 use nsic_core::proto::{
     SampleRequestCreate, SampleRequestCreated, SampleRequestFailure, SampleRequestFulfilled,
-    SampleRequestListResponse, SampleRequestStatus, SampleRequestView,
+    SampleRequestListResponse, SampleRequestStatus, SampleRequestView, MAX_SAMPLE_SIZE_BYTES,
 };
 use sha2::{Digest, Sha256};
-use sqlx::Row;
+use sqlx::{PgExecutor, Row};
 use uuid::Uuid;
 
 use crate::auth::{authenticate_host, authenticate_operator, internal_error};
 use crate::pagination::truncate_to_limit;
 use crate::validate::{bad_request, validate_lowercase_sha256};
 use crate::AppState;
-
-/// Hard cap on a single sample's size, enforced two ways: as an
-/// `axum::extract::DefaultBodyLimit` on the upload route in `main.rs` (so
-/// an oversized body is rejected before it's fully buffered into memory)
-/// and again here as a belt-and-suspenders check, in case that layer is
-/// ever misconfigured or removed in a future refactor. 100 MiB is an
-/// arbitrary but documented ceiling for storing raw sample bytes directly
-/// in Postgres -- see docs/phase1-design.md for why that storage choice
-/// itself is not the final answer.
-pub const MAX_SAMPLE_SIZE_BYTES: usize = 100 * 1024 * 1024;
 
 /// Row cap for both list endpoints below, same reasoning and same
 /// truncated-flag pattern as `sighting.rs`'s `SIGHTING_LIST_LIMIT`.
@@ -168,6 +158,13 @@ pub async fn list_pending_sample_requests(
 /// stored in `sample_blob` keyed by that hash (deduplicating identical
 /// content), and compared against `expected_sha256` if the request set
 /// one.
+///
+/// The claim-then-resolve sequence runs entirely inside one transaction,
+/// with `claim_pending_request` taking a row lock (`SELECT ... FOR
+/// UPDATE`) that's held until this transaction commits or rolls back --
+/// see that function's doc comment for why a separate claim query
+/// followed by an unconditional `UPDATE` (the first version of this
+/// function) was a real race, not just a theoretical one.
 pub async fn fulfill_sample_request(
     State(state): State<AppState>,
     Path((host_id, request_id)): Path<(Uuid, Uuid)>,
@@ -182,13 +179,11 @@ pub async fn fulfill_sample_request(
         )));
     }
 
-    let expected_sha256: Option<String> =
-        claim_pending_request(&state, host_id, request_id).await?;
-
     let sha256 = hex::encode(Sha256::digest(&body));
     let size_bytes = body.len() as i64;
 
     let mut tx = state.pool.begin().await.map_err(internal_error)?;
+    let expected_sha256 = claim_pending_request(&mut *tx, host_id, request_id).await?;
 
     sqlx::query(
         "INSERT INTO sample_blob (sha256, content, size_bytes) VALUES ($1, $2, $3) \
@@ -206,16 +201,14 @@ pub async fn fulfill_sample_request(
         _ => SampleRequestStatus::Fulfilled,
     };
 
-    sqlx::query(
-        "UPDATE sample_request SET status = $1, sha256 = $2, resolved_at = $3 WHERE id = $4",
+    resolve_claimed_request(
+        &mut tx,
+        request_id,
+        status_to_str(status),
+        Some(&sha256),
+        None,
     )
-    .bind(status_to_str(status))
-    .bind(&sha256)
-    .bind(Utc::now())
-    .bind(request_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(internal_error)?;
+    .await?;
 
     tx.commit().await.map_err(internal_error)?;
 
@@ -228,7 +221,8 @@ pub async fn fulfill_sample_request(
 
 /// Records that the agent tried and could not fulfill a request, so it
 /// doesn't sit at `pending` forever with no way for an operator to tell
-/// "still in flight" from "never going to happen."
+/// "still in flight" from "never going to happen." Same claim-inside-a-
+/// transaction pattern as `fulfill_sample_request`, for the same reason.
 pub async fn fail_sample_request(
     State(state): State<AppState>,
     Path((host_id, request_id)): Path<(Uuid, Uuid)>,
@@ -236,43 +230,56 @@ pub async fn fail_sample_request(
     Json(req): Json<SampleRequestFailure>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     authenticate_host(&state.pool, host_id, &headers).await?;
-    claim_pending_request(&state, host_id, request_id).await?;
 
     if req.reason.trim().is_empty() {
         return Err(bad_request("reason must not be empty"));
     }
 
-    sqlx::query(
-        "UPDATE sample_request SET status = 'failed', failure_reason = $1, resolved_at = $2 \
-         WHERE id = $3",
-    )
-    .bind(&req.reason)
-    .bind(Utc::now())
-    .bind(request_id)
-    .execute(&state.pool)
-    .await
-    .map_err(internal_error)?;
+    let mut tx = state.pool.begin().await.map_err(internal_error)?;
+    claim_pending_request(&mut *tx, host_id, request_id).await?;
+    resolve_claimed_request(&mut tx, request_id, "failed", None, Some(&req.reason)).await?;
+    tx.commit().await.map_err(internal_error)?;
 
     Ok(StatusCode::OK)
 }
 
-/// Looks up a request by `(id, host_id)` together and confirms it's still
-/// `pending`, returning its `expected_sha256`. Shared by both resolution
-/// paths (`fulfill_sample_request`, `fail_sample_request`) so "wrong
-/// host", "unknown id", and "already resolved" are checked identically
-/// by both. Wrong host and unknown id return the same `404` -- a request
-/// id can't be used to probe whether it belongs to some other host.
-async fn claim_pending_request(
-    state: &AppState,
+/// Looks up a request by `(id, host_id)` together and, in the same
+/// motion, locks the row (`FOR UPDATE`) for the rest of the caller's
+/// transaction. That lock is the actual fix for a real race the first
+/// version of this code had: a plain `SELECT` here (no lock) followed by
+/// an unconditional `UPDATE ... WHERE id = $1` later let two concurrent
+/// resolutions of the same request both pass the "is it still pending"
+/// check before either had written anything, so the second `UPDATE` to
+/// commit would silently clobber the first's result -- fulfillment vs.
+/// fulfillment (last upload wins, first is lost), or worse, fulfillment
+/// vs. failure racing to leave the row in a self-contradictory state
+/// (`status = 'failed'` with a live `sha256` still pointing at
+/// successfully uploaded bytes, or vice versa). `FOR UPDATE` makes a
+/// second transaction's `claim_pending_request` on the same row block
+/// until the first transaction commits or rolls back, so by the time the
+/// second one proceeds, it observes the *post-resolution* status and
+/// correctly rejects with `409` -- exactly one caller ever succeeds.
+/// Confirmed with a test that fires two concurrent fulfillments at the
+/// same request and asserts exactly one `200` and one `409`.
+///
+/// Returns the request's `expected_sha256`. Wrong host and unknown id
+/// return the same `404` -- a request id can't be used to probe whether
+/// it belongs to some other host.
+async fn claim_pending_request<'e, E>(
+    executor: E,
     host_id: Uuid,
     request_id: Uuid,
-) -> Result<Option<String>, (StatusCode, String)> {
+) -> Result<Option<String>, (StatusCode, String)>
+where
+    E: PgExecutor<'e>,
+{
     let row = sqlx::query(
-        "SELECT status, expected_sha256 FROM sample_request WHERE id = $1 AND host_id = $2",
+        "SELECT status, expected_sha256 FROM sample_request \
+         WHERE id = $1 AND host_id = $2 FOR UPDATE",
     )
     .bind(request_id)
     .bind(host_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(executor)
     .await
     .map_err(internal_error)?;
 
@@ -289,6 +296,53 @@ async fn claim_pending_request(
     }
 
     Ok(row.get("expected_sha256"))
+}
+
+/// Writes a request's final resolution. Always paired with a preceding
+/// `claim_pending_request` call inside the same transaction, so the
+/// `AND status = 'pending'` here is defense-in-depth (the row lock
+/// already prevents a concurrent resolution from reaching this point)
+/// rather than the actual correctness guarantee -- if it ever affected
+/// zero rows, that would mean the locking invariant above broke, not
+/// that this is a legitimate no-op.
+async fn resolve_claimed_request(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request_id: Uuid,
+    status: &str,
+    sha256: Option<&str>,
+    failure_reason: Option<&str>,
+) -> Result<(), (StatusCode, String)> {
+    let affected = sqlx::query(
+        "UPDATE sample_request SET status = $1, sha256 = $2, failure_reason = $3, \
+                resolved_at = $4 \
+         WHERE id = $5 AND status = 'pending'",
+    )
+    .bind(status)
+    .bind(sha256)
+    .bind(failure_reason)
+    .bind(Utc::now())
+    .bind(request_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(internal_error)?
+    .rows_affected();
+
+    if affected != 1 {
+        // The FOR UPDATE lock in claim_pending_request should make this
+        // unreachable: nothing else can have changed this row's status
+        // between the claim and this UPDATE within the same transaction.
+        // Logged and surfaced as a 500 rather than silently ignored, in
+        // case that invariant is ever wrong.
+        tracing::error!(
+            "resolve_claimed_request affected {affected} rows for sample_request {request_id}, \
+             expected exactly 1"
+        );
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn status_to_str(status: SampleRequestStatus) -> &'static str {
@@ -1063,5 +1117,159 @@ mod tests {
         let ids: Vec<Uuid> = listed.requests.iter().map(|r| r.id).collect();
         assert!(ids.contains(&pending_id));
         assert!(ids.contains(&failed_id));
+    }
+
+    /// A genuine concurrency test, not just a sequential double-fulfill
+    /// test: fires two fulfillments at the same pending request from two
+    /// independent tasks sharing the same connection pool, as close to
+    /// simultaneously as `tokio::join!` gets, and asserts exactly one
+    /// succeeds. Before `claim_pending_request` took a `FOR UPDATE` lock,
+    /// both tasks could observe `pending` before either had written
+    /// anything, and both would then write -- the second silently
+    /// clobbering the first's forensic result instead of being rejected.
+    /// This is the test that would have caught that.
+    #[tokio::test]
+    #[ignore]
+    async fn fulfill_sample_request_concurrent_attempts_exactly_one_succeeds() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+        let request_id = create_pending(&app, enrolled.host_id, "/tmp/race.exe", None).await;
+        let host_id = enrolled.host_id;
+
+        let app_a = app.clone();
+        let credential_a = enrolled.credential.clone();
+        let task_a = tokio::spawn(async move {
+            app_a
+                .oneshot(fulfill_content_request(
+                    host_id,
+                    request_id,
+                    Some(&credential_a),
+                    b"content from racer A".to_vec(),
+                ))
+                .await
+                .unwrap()
+                .status()
+        });
+
+        let app_b = app.clone();
+        let credential_b = enrolled.credential.clone();
+        let task_b = tokio::spawn(async move {
+            app_b
+                .oneshot(fulfill_content_request(
+                    host_id,
+                    request_id,
+                    Some(&credential_b),
+                    b"content from racer B".to_vec(),
+                ))
+                .await
+                .unwrap()
+                .status()
+        });
+
+        let (status_a, status_b) = tokio::join!(task_a, task_b);
+        let statuses = [status_a.unwrap(), status_b.unwrap()];
+        assert_eq!(
+            statuses.iter().filter(|s| **s == StatusCode::OK).count(),
+            1,
+            "exactly one of the two concurrent fulfillments should succeed, got {statuses:?}"
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|s| **s == StatusCode::CONFLICT)
+                .count(),
+            1,
+            "the other concurrent fulfillment should be rejected as already-resolved, got \
+             {statuses:?}"
+        );
+    }
+
+    /// The "even nastier race" from review: fulfillment racing failure on
+    /// the same request. Whichever wins, the row must end up internally
+    /// consistent -- never `failed` while still pointing at successfully
+    /// uploaded bytes via a live `sha256`, and never `fulfilled` with a
+    /// stale `failure_reason` left attached.
+    #[tokio::test]
+    #[ignore]
+    async fn fulfill_and_fail_concurrent_attempts_leave_a_self_consistent_row() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+        let request_id = create_pending(&app, enrolled.host_id, "/tmp/race2.exe", None).await;
+        let host_id = enrolled.host_id;
+
+        let app_fulfill = app.clone();
+        let credential_fulfill = enrolled.credential.clone();
+        let fulfill_task = tokio::spawn(async move {
+            app_fulfill
+                .oneshot(fulfill_content_request(
+                    host_id,
+                    request_id,
+                    Some(&credential_fulfill),
+                    b"racer content".to_vec(),
+                ))
+                .await
+                .unwrap()
+                .status()
+        });
+
+        let app_fail = app.clone();
+        let credential_fail = enrolled.credential.clone();
+        let fail_task = tokio::spawn(async move {
+            app_fail
+                .oneshot(fail_request(
+                    host_id,
+                    request_id,
+                    Some(&credential_fail),
+                    "racer failure reason",
+                ))
+                .await
+                .unwrap()
+                .status()
+        });
+
+        let (fulfill_status, fail_status) = tokio::join!(fulfill_task, fail_task);
+        let statuses = [fulfill_status.unwrap(), fail_status.unwrap()];
+        assert_eq!(
+            statuses.iter().filter(|s| **s == StatusCode::OK).count(),
+            1,
+            "exactly one of the concurrent fulfill/fail attempts should succeed, got {statuses:?}"
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|s| **s == StatusCode::CONFLICT)
+                .count(),
+            1,
+            "the other concurrent attempt should be rejected as already-resolved, got \
+             {statuses:?}"
+        );
+
+        let response = app
+            .oneshot(list_operator_view_request(host_id, Some(OPERATOR_SECRET)))
+            .await
+            .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let listed: SampleRequestListResponse = serde_json::from_slice(&bytes).unwrap();
+        let view = listed.requests.iter().find(|r| r.id == request_id).unwrap();
+        match view.status {
+            SampleRequestStatus::Fulfilled => {
+                assert!(view.sha256.is_some(), "fulfilled row must have a sha256");
+                assert!(
+                    view.failure_reason.is_none(),
+                    "fulfilled row must not carry a stale failure_reason"
+                );
+            }
+            SampleRequestStatus::Failed => {
+                assert!(
+                    view.sha256.is_none(),
+                    "failed row must not point at uploaded bytes via a live sha256"
+                );
+                assert!(
+                    view.failure_reason.is_some(),
+                    "failed row must have a failure_reason"
+                );
+            }
+            other => panic!("expected the row to end Fulfilled or Failed, got {other:?}"),
+        }
     }
 }
