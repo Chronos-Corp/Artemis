@@ -12,6 +12,13 @@
 //! and `scan` can optionally report what it finds to a console as
 //! sightings -- see docs/phase1-design.md for what's still not here
 //! (batching many files/hosts in one request, credential persistence).
+//!
+//! `--tls-ca-cert` (every subcommand that talks to a console) trusts an
+//! additional PEM-encoded root CA when the console is reached over
+//! `https://`, on top of the standard public CA trust store `reqwest`
+//! already ships with. Needed for a self-signed or internal-CA console
+//! certificate; has no effect against a plain-`http://` console or one
+//! whose certificate already chains to a public CA.
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -61,6 +68,10 @@ enum Command {
         /// This host's per-agent credential, issued at enroll time.
         #[arg(long, env = "NSIC_AGENT_CREDENTIAL")]
         credential: Option<String>,
+        /// Trust this additional PEM-encoded root CA when the console is
+        /// reached over https://. See the crate-level doc comment.
+        #[arg(long, env = "NSIC_TLS_CA_CERT")]
+        tls_ca_cert: Option<PathBuf>,
     },
     /// Register this host with a console, printing the assigned host_id
     /// and the per-agent credential to use for subsequent requests.
@@ -78,6 +89,10 @@ enum Command {
         /// process listings.
         #[arg(long)]
         enrollment_secret: Option<String>,
+        /// Trust this additional PEM-encoded root CA when the console is
+        /// reached over https://. See the crate-level doc comment.
+        #[arg(long, env = "NSIC_TLS_CA_CERT")]
+        tls_ca_cert: Option<PathBuf>,
     },
     /// Send a single heartbeat for an already-enrolled host.
     Heartbeat {
@@ -89,6 +104,10 @@ enum Command {
         /// back to NSIC_AGENT_CREDENTIAL if not given.
         #[arg(long)]
         credential: Option<String>,
+        /// Trust this additional PEM-encoded root CA when the console is
+        /// reached over https://. See the crate-level doc comment.
+        #[arg(long, env = "NSIC_TLS_CA_CERT")]
+        tls_ca_cert: Option<PathBuf>,
     },
     /// Poll the console for this host's pending sample-retrieval requests
     /// and resolve each one: read the requested path locally and upload
@@ -104,6 +123,10 @@ enum Command {
         /// back to NSIC_AGENT_CREDENTIAL if not given.
         #[arg(long)]
         credential: Option<String>,
+        /// Trust this additional PEM-encoded root CA when the console is
+        /// reached over https://. See the crate-level doc comment.
+        #[arg(long, env = "NSIC_TLS_CA_CERT")]
+        tls_ca_cert: Option<PathBuf>,
     },
 }
 
@@ -131,6 +154,7 @@ async fn main() -> Result<()> {
             console_url,
             host_id,
             credential,
+            tls_ca_cert,
         } => {
             let engine = YaraEngine::load(&rules_dir)
                 .with_context(|| format!("loading YARA rules from {}", rules_dir.display()))?;
@@ -168,6 +192,7 @@ async fn main() -> Result<()> {
                         &hash.sha256,
                         &engine.ruleset_fingerprint,
                         &matches,
+                        tls_ca_cert.as_deref(),
                     )
                     .await?;
                 }
@@ -183,6 +208,7 @@ async fn main() -> Result<()> {
             hostname,
             os,
             enrollment_secret,
+            tls_ca_cert,
         } => {
             let secret = enrollment_secret
                 .or_else(|| std::env::var("NSIC_ENROLLMENT_SECRET").ok())
@@ -195,7 +221,7 @@ async fn main() -> Result<()> {
                 os,
                 agent_version: env!("CARGO_PKG_VERSION").to_string(),
             };
-            let response = reqwest::Client::new()
+            let response = build_http_client(tls_ca_cert.as_deref())?
                 .post(format!("{console_url}/api/v1/agents/enroll"))
                 .bearer_auth(secret)
                 .json(&req)
@@ -213,6 +239,7 @@ async fn main() -> Result<()> {
             console_url,
             host_id,
             credential,
+            tls_ca_cert,
         } => {
             let credential = credential
                 .or_else(|| std::env::var("NSIC_AGENT_CREDENTIAL").ok())
@@ -222,7 +249,7 @@ async fn main() -> Result<()> {
             let req = HeartbeatRequest {
                 agent_version: env!("CARGO_PKG_VERSION").to_string(),
             };
-            let response = reqwest::Client::new()
+            let response = build_http_client(tls_ca_cert.as_deref())?
                 .post(format!("{console_url}/api/v1/agents/{host_id}/heartbeat"))
                 .bearer_auth(credential)
                 .json(&req)
@@ -236,17 +263,54 @@ async fn main() -> Result<()> {
             console_url,
             host_id,
             credential,
+            tls_ca_cert,
         } => {
             let credential = credential
                 .or_else(|| std::env::var("NSIC_AGENT_CREDENTIAL").ok())
                 .context(
                     "agent credential required: pass --credential or set NSIC_AGENT_CREDENTIAL",
                 )?;
-            fulfill_sample_requests(&console_url, host_id, &credential).await?;
+            fulfill_sample_requests(&console_url, host_id, &credential, tls_ca_cert.as_deref())
+                .await?;
         }
     }
 
     Ok(())
+}
+
+/// Builds the `reqwest::Client` every console-talking command uses.
+/// Without `ca_cert_path`, this is just `reqwest::Client::new()` --
+/// standard public CA trust store, same as before this flag existed. With
+/// it, the given PEM file is trusted as an *additional* root CA, not a
+/// replacement for the public trust store, so a self-signed or internal-
+/// CA console certificate can be trusted without disabling certificate
+/// validation entirely (there is deliberately no "skip verification"
+/// escape hatch here).
+///
+/// `reqwest::Certificate::from_pem` does not actually validate the
+/// certificate's contents at this point -- confirmed directly: garbage
+/// text, an empty file, and structurally invalid DER all parse as `Ok`
+/// with this reqwest/rustls combination. Real content validation happens
+/// later, during an actual TLS handshake against the console, where a
+/// bad CA cert will surface as a connection failure rather than a
+/// startup error here. The `.with_context` below is kept anyway (in case
+/// a future reqwest version does validate eagerly, and because
+/// `std::fs::read` failing -- the file not existing or not being
+/// readable -- is a real, common error this does catch), but "this
+/// function returned `Ok`" should not be read as "the certificate is
+/// valid."
+fn build_http_client(ca_cert_path: Option<&Path>) -> Result<reqwest::Client> {
+    let Some(path) = ca_cert_path else {
+        return Ok(reqwest::Client::new());
+    };
+    let pem = std::fs::read(path)
+        .with_context(|| format!("reading TLS CA certificate from {}", path.display()))?;
+    let cert = reqwest::Certificate::from_pem(&pem)
+        .with_context(|| format!("parsing TLS CA certificate at {}", path.display()))?;
+    reqwest::Client::builder()
+        .add_root_certificate(cert)
+        .build()
+        .context("building HTTP client with custom TLS CA certificate")
 }
 
 /// Reports one sighting per YARA match found, in sequence (this PR does
@@ -267,13 +331,14 @@ async fn report_sightings(
     sha256: &str,
     ruleset_fingerprint: &str,
     matches: &[nsic_core::yara_scan::YaraMatch],
+    tls_ca_cert: Option<&Path>,
 ) -> Result<()> {
     if matches.is_empty() {
         return Ok(());
     }
 
     let observed_at = Utc::now();
-    let client = reqwest::Client::new();
+    let client = build_http_client(tls_ca_cert)?;
 
     for m in matches {
         let req = SightingRequest {
@@ -345,8 +410,13 @@ fn read_bounded_sample(path: &Path, max_bytes: usize) -> std::io::Result<Vec<u8>
 /// reports the failure with its reason rather than silently skipping the
 /// request and leaving it stuck at `pending`. A no-op if nothing is
 /// pending.
-async fn fulfill_sample_requests(console_url: &str, host_id: Uuid, credential: &str) -> Result<()> {
-    let client = reqwest::Client::new();
+async fn fulfill_sample_requests(
+    console_url: &str,
+    host_id: Uuid,
+    credential: &str,
+    tls_ca_cert: Option<&Path>,
+) -> Result<()> {
+    let client = build_http_client(tls_ca_cert)?;
     let response = client
         .get(format!(
             "{console_url}/api/v1/agents/{host_id}/sample-requests"
@@ -443,8 +513,9 @@ async fn parse_or_report<T: serde::de::DeserializeOwned>(
 
 #[cfg(test)]
 mod tests {
-    use super::read_bounded_sample;
+    use super::{build_http_client, read_bounded_sample};
     use std::io::Write;
+    use std::path::Path;
 
     #[test]
     fn reads_a_file_within_the_limit() {
@@ -510,5 +581,63 @@ mod tests {
         let data = read_bounded_sample(&link_path, 100)
             .expect("a symlink to a regular file should be accepted");
         assert_eq!(data, b"symlinked content");
+    }
+
+    // A real self-signed certificate, generated once with `openssl req
+    // -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=nsic-test-ca"`,
+    // embedded as a fixture rather than shelled out to `openssl` at test
+    // time. `reqwest::Certificate::from_pem` only parses the certificate
+    // structure -- it doesn't validate expiry or chain to anything -- so
+    // a long-dated but otherwise ordinary self-signed cert is a
+    // sufficient, stable fixture for exercising the parsing path.
+    const TEST_CA_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIDDzCCAfegAwIBAgIUe63a66MzsJUI8dfsPullfQDTTQgwDQYJKoZIhvcNAQEL\n\
+BQAwFzEVMBMGA1UEAwwMbnNpYy10ZXN0LWNhMB4XDTI2MDgxNDIzMDAwMVoXDTM2\n\
+MDgxMTIzMDAwMVowFzEVMBMGA1UEAwwMbnNpYy10ZXN0LWNhMIIBIjANBgkqhkiG\n\
+9w0BAQEFAAOCAQ8AMIIBCgKCAQEApMeLUlfxga2A0WOMHMtUjGiOTzJ/W1K315AI\n\
+1C/yNF1ivBr5KlkJgzxGuDFKO37H/oIA9RvopqOcqoaQIu0zGhRF+bwHsctNN+VD\n\
+vHuVBqesKQSNxq+9EI1sSnV4zU7iXPuE/HdvUk8GArCLCoSy3IrWaZ0QcGuo81jH\n\
+5qnfcgp5+yVJAoSIQeKKUs/PDXwi9UPCJ85ksyboP0TjUPhRQ9BWDPzKRpfJSXnA\n\
+kLl630w9gufq44RFhPODImiTQhDPTSD+gB628Td4X7yBxNsOe6jAE8JU7YNvG5r/\n\
+ngH21BirrYGKvw8mOhgouBXpBrEmpT5moYE0E0St2wadITbR1wIDAQABo1MwUTAd\n\
+BgNVHQ4EFgQUo5eWWiCJEGb4RWa9HtcAOWxkSfUwHwYDVR0jBBgwFoAUo5eWWiCJ\n\
+EGb4RWa9HtcAOWxkSfUwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOC\n\
+AQEAgR4+2yBfNQ391i1nR8W5UcGz6djLDCjHLuVrJzvs7yG33b7MeQy4giIAWP6R\n\
+3N2cFFeQHrmVw/offA6t9gcCu9FFZkmAPYXS1RrxVnTtgVC+YsSKxQYC8WcMVwvG\n\
+yGB80HC4yFstu7TXh4FiCMHZ5H8UsgHc4ChxyP6qHSF9QMQnGX/vzZNmoyHybhFz\n\
+dpA34jpi9PV3c7eC21nfTS93+RX+ZyGEc823ZXnuzpzJbZGwobjPDHxC9W4M3lkV\n\
+wpwPXandNWDezRLLas1qzW+wbZzJQldwo29Rdo2z21MkFW4ZW/AU4v84CrCs0CPJ\n\
+0Rq5Bpn3J2Y9WylT1VrWzHojzQ==\n\
+-----END CERTIFICATE-----\n";
+
+    #[test]
+    fn build_http_client_without_ca_cert_succeeds() {
+        assert!(build_http_client(None).is_ok());
+    }
+
+    #[test]
+    fn build_http_client_with_valid_ca_cert_succeeds() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(TEST_CA_CERT_PEM.as_bytes()).unwrap();
+        assert!(build_http_client(Some(tmp.path())).is_ok());
+    }
+
+    #[test]
+    fn build_http_client_with_missing_ca_cert_file_fails() {
+        let err = build_http_client(Some(Path::new("/nonexistent/does-not-exist-nsic-test.pem")))
+            .expect_err("a missing CA cert file should be a clear error, not a panic");
+        assert!(err.to_string().contains("reading TLS CA certificate"));
+    }
+
+    /// Documents real, verified behavior rather than assuming it: garbage
+    /// content in the CA cert file does *not* make `build_http_client`
+    /// fail -- see its doc comment. A test asserting the opposite would
+    /// itself be wrong, not just unhelpful; this exists so that fact
+    /// stays pinned and visible instead of being silently assumed.
+    #[test]
+    fn build_http_client_with_malformed_ca_cert_still_succeeds_at_this_stage() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(b"this is not a PEM certificate").unwrap();
+        assert!(build_http_client(Some(tmp.path())).is_ok());
     }
 }
