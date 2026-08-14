@@ -3,12 +3,19 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use nsic_core::models::{DetectionKind, IndicatorKind};
-use nsic_core::proto::{SightingRequest, SightingResponse};
-use sqlx::PgExecutor;
+use nsic_core::proto::{SightingListResponse, SightingRequest, SightingResponse, SightingView};
+use sqlx::{PgExecutor, Row};
 use uuid::Uuid;
 
-use crate::auth::{authenticate_host, internal_error};
+use crate::auth::{authenticate_host, authenticate_operator, internal_error};
 use crate::AppState;
+
+/// Hard cap on rows returned by the list endpoints below. Not real
+/// pagination (there's no cursor, no way to reach rows past the cap) --
+/// just a ceiling against an unbounded response once a host or a widely
+/// matched hash accumulates enough sightings, which real pagination should
+/// eventually replace. See docs/phase1-design.md.
+const SIGHTING_LIST_LIMIT: i64 = 1000;
 
 /// Source/confidence for every sighting this endpoint records. Not
 /// client-supplied -- see `nsic_core::proto::SightingRequest`'s doc
@@ -93,6 +100,106 @@ pub async fn report_sighting(
         indicator_id,
         recorded_at: Utc::now(),
     }))
+}
+
+/// Lists every sighting recorded for a given host, most recently observed
+/// first, joined against `indicator`/`detection` so callers get a sha256
+/// and rule name directly rather than resolving `indicator_id`/
+/// `detection_id` themselves. Requires the console-operator credential
+/// (`authenticate_operator`), not the per-agent credential `report_sighting`
+/// checks -- a host's own credential proves it may report its own
+/// observations, not that it may read any host's data, including its own.
+/// An unknown `host_id` returns `200` with an empty list rather than
+/// `404`: there is no "list all hosts" endpoint yet for an operator to
+/// have confirmed the id exists in the first place (see
+/// docs/phase1-design.md), so treating "no sightings" and "no such host"
+/// identically doesn't leak anything an operator couldn't already tell by
+/// other means once one exists.
+pub async fn list_host_sightings(
+    State(state): State<AppState>,
+    Path(host_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<SightingListResponse>, (StatusCode, String)> {
+    authenticate_operator(&state.operator_secret, &headers)?;
+
+    let rows = sqlx::query(
+        "SELECT ho.id AS host_id, ho.hostname, h.indicator_id, i.value AS sha256, \
+                h.detection_id, d.name AS detection_name, h.source, h.confidence, \
+                h.path, h.ruleset_fingerprint, h.first_seen, h.last_seen, h.received_at \
+         FROM host_sighted_indicator h \
+         JOIN host ho ON ho.id = h.host_id \
+         JOIN indicator i ON i.id = h.indicator_id \
+         JOIN detection d ON d.id = h.detection_id \
+         WHERE h.host_id = $1 \
+         ORDER BY h.last_seen DESC \
+         LIMIT $2",
+    )
+    .bind(host_id)
+    .bind(SIGHTING_LIST_LIMIT)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(internal_error)?;
+
+    Ok(Json(SightingListResponse {
+        sightings: rows.into_iter().map(sighting_view_from_row).collect(),
+    }))
+}
+
+/// Lists every host that has sighted a given indicator (by sha256), most
+/// recently observed first -- the cross-fleet "who else has seen this
+/// hash" pivot the product's core idea (see the README) depends on.
+/// Requires the console-operator credential, same as `list_host_sightings`.
+/// Scoped to sha256 lookups only, the same deliberate narrowness
+/// `SightingRequest` already has: sightings currently only ever carry a
+/// sha256 indicator, so there is nothing else to look up by yet.
+pub async fn list_indicator_sightings(
+    State(state): State<AppState>,
+    Path(sha256): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<SightingListResponse>, (StatusCode, String)> {
+    authenticate_operator(&state.operator_secret, &headers)?;
+    validate_lowercase_sha256(&sha256, "sha256")?;
+
+    let rows = sqlx::query(
+        "SELECT ho.id AS host_id, ho.hostname, h.indicator_id, i.value AS sha256, \
+                h.detection_id, d.name AS detection_name, h.source, h.confidence, \
+                h.path, h.ruleset_fingerprint, h.first_seen, h.last_seen, h.received_at \
+         FROM host_sighted_indicator h \
+         JOIN host ho ON ho.id = h.host_id \
+         JOIN indicator i ON i.id = h.indicator_id \
+         JOIN detection d ON d.id = h.detection_id \
+         WHERE i.kind = $1 AND i.value = $2 \
+         ORDER BY h.last_seen DESC \
+         LIMIT $3",
+    )
+    .bind(IndicatorKind::Sha256)
+    .bind(&sha256)
+    .bind(SIGHTING_LIST_LIMIT)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(internal_error)?;
+
+    Ok(Json(SightingListResponse {
+        sightings: rows.into_iter().map(sighting_view_from_row).collect(),
+    }))
+}
+
+fn sighting_view_from_row(row: sqlx::postgres::PgRow) -> SightingView {
+    SightingView {
+        host_id: row.get("host_id"),
+        hostname: row.get("hostname"),
+        indicator_id: row.get("indicator_id"),
+        sha256: row.get("sha256"),
+        detection_id: row.get("detection_id"),
+        detection_name: row.get("detection_name"),
+        source: row.get("source"),
+        confidence: row.get("confidence"),
+        path: row.get("path"),
+        ruleset_fingerprint: row.get("ruleset_fingerprint"),
+        first_seen: row.get("first_seen"),
+        last_seen: row.get("last_seen"),
+        received_at: row.get("received_at"),
+    }
 }
 
 /// Authentication proves which agent sent a request, not that the agent
@@ -311,6 +418,7 @@ mod tests {
     use uuid::Uuid;
 
     const BOOTSTRAP_SECRET: &str = "test-bootstrap-secret";
+    const OPERATOR_SECRET: &str = "test-operator-secret";
 
     fn valid_sha256(seed: &str) -> String {
         format!("{seed:0<64}")
@@ -329,6 +437,7 @@ mod tests {
         AppState {
             pool,
             bootstrap_secret: BOOTSTRAP_SECRET.to_string(),
+            operator_secret: OPERATOR_SECRET.to_string(),
         }
     }
 
@@ -890,5 +999,238 @@ mod tests {
             stored_last_seen, later,
             "last_seen still tracks the latest observation"
         );
+    }
+
+    fn list_host_sightings_request(host_id: Uuid, bearer: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/hosts/{host_id}/sightings"));
+        if let Some(token) = bearer {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    fn list_indicator_sightings_request(sha256: &str, bearer: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/indicators/{sha256}/sightings"));
+        if let Some(token) = bearer {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn list_host_sightings_rejects_missing_operator_credential() {
+        let app = crate::build_router(test_state().await);
+        let response = app
+            .oneshot(list_host_sightings_request(Uuid::new_v4(), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn list_host_sightings_rejects_wrong_operator_credential() {
+        let app = crate::build_router(test_state().await);
+        let response = app
+            .oneshot(list_host_sightings_request(
+                Uuid::new_v4(),
+                Some("not-the-operator-secret"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A per-agent credential -- valid for that host's own writes -- must
+    /// not also authenticate reading fleet-wide sighting data. Without
+    /// this, a single compromised agent could read every other host's
+    /// sighting history using only its own credential.
+    #[tokio::test]
+    #[ignore]
+    async fn list_host_sightings_rejects_per_agent_credential() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+
+        let response = app
+            .oneshot(list_host_sightings_request(
+                enrolled.host_id,
+                Some(&enrolled.credential),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn list_host_sightings_for_unknown_host_returns_empty_list() {
+        let app = crate::build_router(test_state().await);
+        let response = app
+            .oneshot(list_host_sightings_request(
+                Uuid::new_v4(),
+                Some(OPERATOR_SECRET),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let listed: nsic_core::proto::SightingListResponse =
+            serde_json::from_slice(&bytes).unwrap();
+        assert!(listed.sightings.is_empty());
+    }
+
+    /// The full read-path happy path: report a sighting, then list it back
+    /// out by host, and check every denormalized field on the response
+    /// (hostname, sha256, rule name) matches what was actually reported
+    /// rather than trusting the join compiled at all.
+    #[tokio::test]
+    #[ignore]
+    async fn list_host_sightings_returns_reported_sightings() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+        let sha256 = valid_sha256("11eaf00d1eaf00d");
+
+        let response = app
+            .clone()
+            .oneshot(sighting_request(
+                enrolled.host_id,
+                Some(&enrolled.credential),
+                &sha256,
+                Utc::now().trunc_subsecs(6),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(list_host_sightings_request(
+                enrolled.host_id,
+                Some(OPERATOR_SECRET),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let listed: nsic_core::proto::SightingListResponse =
+            serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(listed.sightings.len(), 1);
+        let view = &listed.sightings[0];
+        assert_eq!(view.host_id, enrolled.host_id);
+        assert_eq!(view.hostname, "test-host");
+        assert_eq!(view.sha256, sha256);
+        assert_eq!(view.detection_name, "Example_EICAR_Test_File");
+        assert_eq!(view.source, YARA_SIGHTING_SOURCE);
+        assert_eq!(view.confidence, 65);
+        assert_eq!(view.path.as_deref(), Some("/tmp/eicar.txt"));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn list_indicator_sightings_rejects_missing_operator_credential() {
+        let app = crate::build_router(test_state().await);
+        let response = app
+            .oneshot(list_indicator_sightings_request(&valid_sha256("a"), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn list_indicator_sightings_rejects_malformed_sha256() {
+        let app = crate::build_router(test_state().await);
+        let response = app
+            .oneshot(list_indicator_sightings_request(
+                "banana",
+                Some(OPERATOR_SECRET),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Two different hosts sighting the same hash through two different
+    /// rules must both show up when querying by that hash -- the
+    /// cross-fleet "who else has seen this" pivot this endpoint exists
+    /// for -- each still correctly attributed to the rule it actually
+    /// matched.
+    #[tokio::test]
+    #[ignore]
+    async fn list_indicator_sightings_returns_all_hosts_that_saw_it() {
+        let app = crate::build_router(test_state().await);
+        let host_a = enroll(&app).await;
+        let host_b = enroll(&app).await;
+        let sha256 = valid_sha256("fee1dead1eaf00d");
+        let now = Utc::now().trunc_subsecs(6);
+
+        let response = app
+            .clone()
+            .oneshot(sighting_request_full(
+                host_a.host_id,
+                Some(&host_a.credential),
+                &sha256,
+                "Alpha",
+                &valid_fingerprint("f"),
+                Some("/tmp/eicar.txt"),
+                now,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(sighting_request_full(
+                host_b.host_id,
+                Some(&host_b.credential),
+                &sha256,
+                "Beta",
+                &valid_fingerprint("f"),
+                Some("/tmp/eicar.txt"),
+                now,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(list_indicator_sightings_request(
+                &sha256,
+                Some(OPERATOR_SECRET),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let listed: nsic_core::proto::SightingListResponse =
+            serde_json::from_slice(&bytes).unwrap();
+
+        // Scoped to the two hosts this test actually created, not the
+        // response's total length: this sha256 is a fixed seed, and a
+        // long-lived console (or this same test suite run twice against a
+        // persistent local database, as opposed to a fresh one per CI run)
+        // can accumulate other hosts' sightings against it too. Asserting
+        // on a bare total count would make the test flaky against data it
+        // doesn't own; asserting exactly these two hosts are present and
+        // correctly attributed is the actual invariant this test is for.
+        let for_host_a: Vec<_> = listed
+            .sightings
+            .iter()
+            .filter(|v| v.host_id == host_a.host_id)
+            .collect();
+        let for_host_b: Vec<_> = listed
+            .sightings
+            .iter()
+            .filter(|v| v.host_id == host_b.host_id)
+            .collect();
+        assert_eq!(for_host_a.len(), 1, "expected exactly one row for host A");
+        assert_eq!(for_host_b.len(), 1, "expected exactly one row for host B");
+        assert_eq!(for_host_a[0].detection_name, "Alpha");
+        assert_eq!(for_host_b[0].detection_name, "Beta");
     }
 }

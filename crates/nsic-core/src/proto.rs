@@ -78,3 +78,39 @@ pub struct SightingResponse {
     pub indicator_id: Uuid,
     pub recorded_at: DateTime<Utc>,
 }
+
+/// One row of the intel graph's `host_sighted_indicator` edge, denormalized
+/// for read consumers so an operator querying by host or by indicator gets
+/// a sha256 and a rule name directly, rather than having to separately
+/// resolve `indicator_id`/`detection_id`. The read-side counterpart to
+/// [`SightingRequest`] -- see `list_host_sightings`/`list_indicator_
+/// sightings` in `crates/console/src/sighting.rs`, gated by a distinct
+/// console-operator credential, not the per-agent credential that governs
+/// writing sightings (an agent can report what it saw; it cannot read what
+/// the rest of the fleet reported).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SightingView {
+    pub host_id: Uuid,
+    pub hostname: String,
+    pub indicator_id: Uuid,
+    pub sha256: String,
+    pub detection_id: Uuid,
+    pub detection_name: String,
+    pub source: String,
+    pub confidence: i16,
+    pub path: Option<String>,
+    pub ruleset_fingerprint: String,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    pub received_at: DateTime<Utc>,
+}
+
+/// Response for both `GET /api/v1/hosts/{host_id}/sightings` and
+/// `GET /api/v1/indicators/{sha256}/sightings`. Wrapped in a struct rather
+/// than returning a bare JSON array so a future page cursor can be added
+/// without breaking existing clients -- see docs/phase1-design.md for why
+/// this PR ships a fixed row cap instead of real pagination.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SightingListResponse {
+    pub sightings: Vec<SightingView>,
+}

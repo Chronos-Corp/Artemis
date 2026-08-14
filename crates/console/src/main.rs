@@ -3,18 +3,24 @@
 //! (the same schema `src-tauri` uses). See docs/phase1-design.md for
 //! what's deliberately not here yet (TLS, sample retrieval, a fleet UI).
 //!
-//! Two credentials gate this API (see `nsic_core::proto` for the full
-//! rationale): a bootstrap enrollment secret the operator configures via
-//! `NSIC_ENROLLMENT_SECRET`, required on every `POST /api/v1/agents/enroll`
-//! call, and a per-agent credential minted at enroll time, required on
-//! every subsequent authenticated request (heartbeat, sightings).
+//! Three credentials gate this API (see `nsic_core::proto` and
+//! `crate::auth` for the full rationale, kept deliberately distinct rather
+//! than collapsed into one token): a bootstrap enrollment secret the
+//! operator configures via `NSIC_ENROLLMENT_SECRET`, required on every
+//! `POST /api/v1/agents/enroll` call; a per-agent credential minted at
+//! enroll time, required on every subsequent agent-authenticated request
+//! (heartbeat, sighting submission); and a console-operator credential
+//! (`NSIC_OPERATOR_SECRET`), required on the read endpoints that list
+//! sightings back out. An agent's per-agent credential authenticates that
+//! one host's own writes -- it must not also authenticate reading the rest
+//! of the fleet's data, hence the separate operator credential.
 
 mod auth;
 mod host;
 mod sighting;
 
 use anyhow::Context;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::Router;
 use sqlx::PgPool;
 use std::net::SocketAddr;
@@ -23,6 +29,7 @@ use std::net::SocketAddr;
 pub(crate) struct AppState {
     pool: PgPool,
     bootstrap_secret: String,
+    operator_secret: String,
 }
 
 #[tokio::main]
@@ -35,6 +42,10 @@ async fn main() -> anyhow::Result<()> {
         "NSIC_ENROLLMENT_SECRET must be set: the console refuses to start without a \
          bootstrap enrollment secret to authorize new agents",
     )?;
+    let operator_secret = std::env::var("NSIC_OPERATOR_SECRET").context(
+        "NSIC_OPERATOR_SECRET must be set: the console refuses to start without a \
+         credential gating read access to fleet-wide sighting data",
+    )?;
 
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://nsic:nsic@localhost:5432/nsic".to_string());
@@ -44,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
     let app = build_router(AppState {
         pool,
         bootstrap_secret,
+        operator_secret,
     });
 
     // Unauthenticated transport is still plain HTTP with no TLS (see
@@ -66,6 +78,14 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/agents/{host_id}/sightings",
             post(sighting::report_sighting),
+        )
+        .route(
+            "/api/v1/hosts/{host_id}/sightings",
+            get(sighting::list_host_sightings),
+        )
+        .route(
+            "/api/v1/indicators/{sha256}/sightings",
+            get(sighting::list_indicator_sightings),
         )
         .with_state(state)
 }
