@@ -122,3 +122,91 @@ pub struct SightingListResponse {
     /// is deferred.
     pub truncated: bool,
 }
+
+/// An operator's request to pull a specific file off a specific host.
+/// `POST /api/v1/hosts/{host_id}/sample-requests`, operator-credential
+/// only -- this is the write half of sample retrieval (PR #8); reading
+/// the retrieved content itself back out is deferred to a follow-up PR
+/// the same way sighting reads (PR #7) followed sighting writes (PR #6).
+/// See the repo README's locked architecture decision #3: file contents
+/// leave a host only on explicit, logged, attributed analyst request --
+/// this struct, once inserted as a `sample_request` row, *is* that log
+/// entry (host, path, requester, and eventual outcome all live on one
+/// row).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SampleRequestCreate {
+    pub path: String,
+    /// Set when the requester already knows the hash (e.g. pivoting from
+    /// a sighting) and wants the console to flag it if the agent uploads
+    /// something else -- see [`SampleRequestStatus::Mismatched`]. Left
+    /// `None` for a cold request where the hash isn't known yet.
+    pub expected_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SampleRequestCreated {
+    pub request_id: Uuid,
+}
+
+/// Outcome of a sample request. `Mismatched` is deliberately distinct
+/// from `Fulfilled`: if the requester asserted an `expected_sha256` and
+/// the agent uploaded content hashing to something else, that is a real
+/// discrepancy (wrong file, file changed since the hash was recorded, or
+/// something worse) that must stay visible, not get silently accepted as
+/// a normal fulfillment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SampleRequestStatus {
+    Pending,
+    Fulfilled,
+    Mismatched,
+    Failed,
+}
+
+/// One row of `sample_request`, denormalized the same way `SightingView`
+/// is -- metadata and status only, never the sample's actual bytes. There
+/// is no endpoint that returns sample content yet (see above).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SampleRequestView {
+    pub id: Uuid,
+    pub host_id: Uuid,
+    pub path: String,
+    pub expected_sha256: Option<String>,
+    pub status: SampleRequestStatus,
+    pub failure_reason: Option<String>,
+    pub sha256: Option<String>,
+    pub size_bytes: Option<i64>,
+    pub requested_at: DateTime<Utc>,
+    pub resolved_at: Option<DateTime<Utc>>,
+}
+
+/// Response for `GET /api/v1/hosts/{host_id}/sample-requests` (operator,
+/// every request for a host) and `GET /api/v1/agents/{host_id}/
+/// sample-requests` (agent, its own pending requests only). Same
+/// fixed-cap-plus-`truncated`-flag shape as `SightingListResponse`, for
+/// the same reason.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SampleRequestListResponse {
+    pub requests: Vec<SampleRequestView>,
+    pub truncated: bool,
+}
+
+/// Body of `POST /api/v1/agents/{host_id}/sample-requests/{request_id}/
+/// failure`: the agent tried and could not fulfill a request (path not
+/// found, permission denied, etc.) and says so explicitly, rather than
+/// leaving the request stuck at `pending` forever with no way for an
+/// operator to tell "still in flight" from "never going to happen."
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SampleRequestFailure {
+    pub reason: String,
+}
+
+/// Response to a successful `POST .../content` upload: what the server
+/// actually computed and decided, which may differ from what the
+/// requester expected (see [`SampleRequestStatus::Mismatched`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SampleRequestFulfilled {
+    pub status: SampleRequestStatus,
+    pub sha256: String,
+    pub size_bytes: i64,
+}

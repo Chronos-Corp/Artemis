@@ -1,7 +1,8 @@
-//! Phase 1 fleet console. Accepts agent enrollment, heartbeats, and YARA
-//! sighting reports, and records them in the shared Postgres intel graph
-//! (the same schema `src-tauri` uses). See docs/phase1-design.md for
-//! what's deliberately not here yet (TLS, sample retrieval, a fleet UI).
+//! Phase 1 fleet console. Accepts agent enrollment, heartbeats, YARA
+//! sighting reports, and sample-retrieval requests, and records them in
+//! the shared Postgres intel graph (the same schema `src-tauri` uses).
+//! See docs/phase1-design.md for what's deliberately not here yet (TLS, a
+//! fleet UI, reading retrieved sample content back out).
 //!
 //! Three credentials gate this API (see `nsic_core::proto` and
 //! `crate::auth` for the full rationale, kept deliberately distinct rather
@@ -9,17 +10,23 @@
 //! operator configures via `NSIC_ENROLLMENT_SECRET`, required on every
 //! `POST /api/v1/agents/enroll` call; a per-agent credential minted at
 //! enroll time, required on every subsequent agent-authenticated request
-//! (heartbeat, sighting submission); and a console-operator credential
-//! (`NSIC_OPERATOR_SECRET`), required on the read endpoints that list
-//! sightings back out. An agent's per-agent credential authenticates that
-//! one host's own writes -- it must not also authenticate reading the rest
-//! of the fleet's data, hence the separate operator credential.
+//! (heartbeat, sighting submission, sample-request polling/fulfillment);
+//! and a console-operator credential (`NSIC_OPERATOR_SECRET`), required on
+//! the read endpoints that list sightings back out and on creating/
+//! listing sample requests. An agent's per-agent credential authenticates
+//! that one host's own writes -- it must not also authenticate reading or
+//! directing the rest of the fleet, hence the separate operator
+//! credential.
 
 mod auth;
 mod host;
+mod pagination;
+mod sample;
 mod sighting;
+mod validate;
 
 use anyhow::Context;
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use axum::Router;
 use sqlx::PgPool;
@@ -103,6 +110,19 @@ fn validate_secret_configuration(
 }
 
 fn build_router(state: AppState) -> Router {
+    // The sample-content upload route gets its own sub-router so only it
+    // carries a raised body-size limit -- every other route (all JSON)
+    // keeps axum's default, so a misbehaving JSON client can't force the
+    // server to buffer up to sample::MAX_SAMPLE_SIZE_BYTES on an endpoint
+    // that was never meant to receive anything that large.
+    let sample_content_route = Router::new()
+        .route(
+            "/api/v1/agents/{host_id}/sample-requests/{request_id}/content",
+            post(sample::fulfill_sample_request),
+        )
+        .layer(DefaultBodyLimit::max(sample::MAX_SAMPLE_SIZE_BYTES))
+        .with_state(state.clone());
+
     Router::new()
         .route("/api/v1/agents/enroll", post(host::enroll))
         .route("/api/v1/agents/{host_id}/heartbeat", post(host::heartbeat))
@@ -118,7 +138,20 @@ fn build_router(state: AppState) -> Router {
             "/api/v1/indicators/{sha256}/sightings",
             get(sighting::list_indicator_sightings),
         )
+        .route(
+            "/api/v1/hosts/{host_id}/sample-requests",
+            post(sample::create_sample_request).get(sample::list_sample_requests),
+        )
+        .route(
+            "/api/v1/agents/{host_id}/sample-requests",
+            get(sample::list_pending_sample_requests),
+        )
+        .route(
+            "/api/v1/agents/{host_id}/sample-requests/{request_id}/failure",
+            post(sample::fail_sample_request),
+        )
         .with_state(state)
+        .merge(sample_content_route)
 }
 
 #[cfg(test)]
