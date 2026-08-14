@@ -113,4 +113,12 @@ pub struct SightingView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SightingListResponse {
     pub sightings: Vec<SightingView>,
+    /// `true` if there were more matching rows than the server's row cap
+    /// and `sightings` was cut short -- without this, a caller has no way
+    /// to distinguish "this host/hash has exactly N sightings" from "this
+    /// host/hash has at least N, possibly many more." Not a page cursor:
+    /// there is still no way to fetch the rows past the cap, only a signal
+    /// that they exist. See docs/phase1-design.md for why real pagination
+    /// is deferred.
+    pub truncated: bool,
 }

@@ -122,7 +122,12 @@ pub async fn list_host_sightings(
 ) -> Result<Json<SightingListResponse>, (StatusCode, String)> {
     authenticate_operator(&state.operator_secret, &headers)?;
 
-    let rows = sqlx::query(
+    // ORDER BY tie-breaks past last_seen with the rest of the primary key
+    // (host_id is already fixed by WHERE): last_seen alone is not unique
+    // per row, so without a full tie-break the row order -- and therefore
+    // which rows land inside vs. past the cap -- is not guaranteed stable
+    // across two calls that return the same underlying data.
+    let mut rows = sqlx::query(
         "SELECT ho.id AS host_id, ho.hostname, h.indicator_id, i.value AS sha256, \
                 h.detection_id, d.name AS detection_name, h.source, h.confidence, \
                 h.path, h.ruleset_fingerprint, h.first_seen, h.last_seen, h.received_at \
@@ -131,17 +136,20 @@ pub async fn list_host_sightings(
          JOIN indicator i ON i.id = h.indicator_id \
          JOIN detection d ON d.id = h.detection_id \
          WHERE h.host_id = $1 \
-         ORDER BY h.last_seen DESC \
+         ORDER BY h.last_seen DESC, h.detection_id, h.indicator_id, h.source, \
+                  h.ruleset_fingerprint \
          LIMIT $2",
     )
     .bind(host_id)
-    .bind(SIGHTING_LIST_LIMIT)
+    .bind(SIGHTING_LIST_LIMIT + 1)
     .fetch_all(&state.pool)
     .await
     .map_err(internal_error)?;
 
+    let truncated = truncate_to_limit(&mut rows, SIGHTING_LIST_LIMIT as usize);
     Ok(Json(SightingListResponse {
         sightings: rows.into_iter().map(sighting_view_from_row).collect(),
+        truncated,
     }))
 }
 
@@ -160,7 +168,11 @@ pub async fn list_indicator_sightings(
     authenticate_operator(&state.operator_secret, &headers)?;
     validate_lowercase_sha256(&sha256, "sha256")?;
 
-    let rows = sqlx::query(
+    // Same tie-break reasoning as list_host_sightings, with indicator_id
+    // fixed by WHERE instead of host_id, so the remaining primary-key
+    // columns break ties here: host_id, detection_id, source,
+    // ruleset_fingerprint.
+    let mut rows = sqlx::query(
         "SELECT ho.id AS host_id, ho.hostname, h.indicator_id, i.value AS sha256, \
                 h.detection_id, d.name AS detection_name, h.source, h.confidence, \
                 h.path, h.ruleset_fingerprint, h.first_seen, h.last_seen, h.received_at \
@@ -169,19 +181,37 @@ pub async fn list_indicator_sightings(
          JOIN indicator i ON i.id = h.indicator_id \
          JOIN detection d ON d.id = h.detection_id \
          WHERE i.kind = $1 AND i.value = $2 \
-         ORDER BY h.last_seen DESC \
+         ORDER BY h.last_seen DESC, h.host_id, h.detection_id, h.source, \
+                  h.ruleset_fingerprint \
          LIMIT $3",
     )
     .bind(IndicatorKind::Sha256)
     .bind(&sha256)
-    .bind(SIGHTING_LIST_LIMIT)
+    .bind(SIGHTING_LIST_LIMIT + 1)
     .fetch_all(&state.pool)
     .await
     .map_err(internal_error)?;
 
+    let truncated = truncate_to_limit(&mut rows, SIGHTING_LIST_LIMIT as usize);
     Ok(Json(SightingListResponse {
         sightings: rows.into_iter().map(sighting_view_from_row).collect(),
+        truncated,
     }))
+}
+
+/// Both list endpoints fetch one row past `SIGHTING_LIST_LIMIT` so this
+/// can tell "exactly at the cap" apart from "past the cap" by whether the
+/// extra row showed up, then trims it back off before the response is
+/// built -- the cap itself must never leak an extra row to the caller.
+/// Generic over the row type (rather than `sqlx::postgres::PgRow`
+/// directly) purely so the off-by-one logic can be unit-tested on a plain
+/// `Vec` without a database; the real call sites always pass `PgRow`.
+fn truncate_to_limit<T>(rows: &mut Vec<T>, limit: usize) -> bool {
+    let truncated = rows.len() > limit;
+    if truncated {
+        rows.truncate(limit);
+    }
+    truncated
 }
 
 fn sighting_view_from_row(row: sqlx::postgres::PgRow) -> SightingView {
@@ -407,7 +437,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::YARA_SIGHTING_SOURCE;
+    use super::{truncate_to_limit, YARA_SIGHTING_SOURCE};
     use crate::AppState;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -419,6 +449,32 @@ mod tests {
 
     const BOOTSTRAP_SECRET: &str = "test-bootstrap-secret";
     const OPERATOR_SECRET: &str = "test-operator-secret";
+
+    // No DB, no #[ignore]: this is the exact off-by-one logic the two list
+    // endpoints depend on to tell "the fleet has exactly the cap's worth
+    // of sightings" apart from "there are more past the cap" -- worth
+    // verifying directly rather than only indirectly, since reproducing it
+    // through the real endpoints would mean seeding 1000+ database rows.
+    #[test]
+    fn truncate_to_limit_trims_and_reports_truncation_past_the_cap() {
+        let mut rows = vec![1, 2, 3];
+        assert!(truncate_to_limit(&mut rows, 2));
+        assert_eq!(rows, vec![1, 2]);
+    }
+
+    #[test]
+    fn truncate_to_limit_reports_no_truncation_exactly_at_the_cap() {
+        let mut rows = vec![1, 2];
+        assert!(!truncate_to_limit(&mut rows, 2));
+        assert_eq!(rows, vec![1, 2]);
+    }
+
+    #[test]
+    fn truncate_to_limit_reports_no_truncation_under_the_cap() {
+        let mut rows = vec![1];
+        assert!(!truncate_to_limit(&mut rows, 2));
+        assert_eq!(rows, vec![1]);
+    }
 
     fn valid_sha256(seed: &str) -> String {
         format!("{seed:0<64}")
@@ -1232,5 +1288,70 @@ mod tests {
         assert_eq!(for_host_b.len(), 1, "expected exactly one row for host B");
         assert_eq!(for_host_a[0].detection_name, "Alpha");
         assert_eq!(for_host_b[0].detection_name, "Beta");
+    }
+
+    /// Two sightings for the same host with the exact same `last_seen`
+    /// (the only column the original `ORDER BY` sorted on) must still come
+    /// back in a stable, repeatable order across separate requests --
+    /// `ORDER BY last_seen DESC` alone does not guarantee that for tied
+    /// rows, since Postgres is free to return ties in any order absent a
+    /// fully-determining sort key. Calls the endpoint twice and asserts
+    /// the two responses agree, rather than asserting one specific order:
+    /// the tie-break columns are internal ids this test doesn't control,
+    /// so "the same every time" is the actual guarantee being tested, not
+    /// any particular ordering.
+    #[tokio::test]
+    #[ignore]
+    async fn list_host_sightings_orders_deterministically_when_last_seen_ties() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+        let tied_at = Utc::now().trunc_subsecs(6);
+
+        for (sha_seed, rule) in [("d0000000e000001", "Rule1"), ("d0000000e000002", "Rule2")] {
+            let response = app
+                .clone()
+                .oneshot(sighting_request_full(
+                    enrolled.host_id,
+                    Some(&enrolled.credential),
+                    &valid_sha256(sha_seed),
+                    rule,
+                    &valid_fingerprint("f"),
+                    Some("/tmp/eicar.txt"),
+                    tied_at,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let fetch_order = || {
+            let app = app.clone();
+            let enrolled_host_id = enrolled.host_id;
+            async move {
+                let response = app
+                    .oneshot(list_host_sightings_request(
+                        enrolled_host_id,
+                        Some(OPERATOR_SECRET),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let listed: nsic_core::proto::SightingListResponse =
+                    serde_json::from_slice(&bytes).unwrap();
+                listed
+                    .sightings
+                    .into_iter()
+                    .map(|v| v.detection_name)
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        let first_order = fetch_order().await;
+        let second_order = fetch_order().await;
+        assert_eq!(
+            first_order, second_order,
+            "identical last_seen values must not produce a different row order between calls"
+        );
     }
 }

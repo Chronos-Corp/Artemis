@@ -366,26 +366,71 @@ have confirmed an id exists in the first place, so treating "no
 sightings" and "no such host" identically doesn't leak anything an
 operator couldn't already tell another way once one exists.
 
-**A fixed row cap, not real pagination.** Both endpoints `LIMIT 1000`.
-That's a ceiling against an unbounded response, not a cursor -- there's no
-way to reach rows past the cap. Real pagination is deferred until a fleet
-actually produces enough sightings per host or per hash to hit it (see
+**A fixed row cap, not real pagination -- and callers can tell when
+they've hit it.** Both endpoints fetch `SIGHTING_LIST_LIMIT + 1` (1001)
+rows, and if that extra row shows up, trim it back off and set
+`SightingListResponse::truncated = true`. Without the extra-row probe, a
+response capped at exactly 1000 rows is indistinguishable from a host or
+hash that genuinely has exactly 1000 sightings -- `truncated` is what lets
+a caller tell "this is everything" from "there's more, and this endpoint
+can't hand it to you yet." Still not a cursor -- there's no way to reach
+the rows past the cap, only a signal that they exist. The off-by-one trim
+logic (`truncate_to_limit`) is a small generic helper specifically so it
+can be unit-tested directly on a plain `Vec` without a database, rather
+than only indirectly by seeding 1000+ rows through the real endpoint.
+Real pagination is deferred until a fleet actually produces enough
+sightings per host or per hash to make the cap a real problem (see
 below).
+
+**`ORDER BY last_seen DESC` alone doesn't guarantee a stable order for
+ties.** Two sightings for the same host observed at the exact same
+instant used to sort however Postgres felt like breaking the tie, which
+is fine for a one-off read but means two separate calls to the same
+endpoint over unchanged data weren't guaranteed to return rows in the
+same order -- silently inconsistent with the row that happened to land
+at the cap potentially differing between two truncated responses of the
+same query. Both queries now tie-break on the rest of the relevant
+primary-key columns (whichever ones the `WHERE` clause doesn't already
+fix), so the full sort key is unique per row and the order is
+deterministic. Verified with a test that submits two sightings with
+identical `last_seen`, calls the endpoint twice, and asserts the two
+responses return rows in the same order.
 
 **This is the first PR in this sequence with DB-backed tests actually
 executed, not just reviewed.** A local Postgres 16 instance was available
-in this sandbox (unlike prior PRs, where none was), so all 34 tests
-(`cargo test -- --include-ignored`) ran for real, including the 9 new
-tests for these two endpoints -- missing/wrong operator credential, a
-per-agent credential rejected, an unknown host returning an empty list,
-malformed sha256 rejected, and the full round trip confirming every
-denormalized field on the response actually matches what was reported.
-The write-then-read path was also exercised end to end against the real
-binaries (`nsic-console` + `nsic-agent`), not just the in-process test
-harness: enroll, scan-and-report a real EICAR match, then `curl` both new
-endpoints with the operator credential and confirm the JSON matches, and
-confirm the console still refuses to start without
-`NSIC_OPERATOR_SECRET` set.
+in this sandbox (unlike prior PRs, where none was), so the full DB-backed
+suite (`cargo test -- --include-ignored`) ran for real, including tests
+for missing/wrong operator credential, a per-agent credential rejected,
+an unknown host returning an empty list, malformed sha256 rejected, the
+full round trip confirming every denormalized field on the response
+actually matches what was reported, and the tie-break/ordering-stability
+test above. The write-then-read path was also exercised end to end
+against the real binaries (`nsic-console` + `nsic-agent`), not just the
+in-process test harness: enroll, scan-and-report a real EICAR match, then
+`curl` both new endpoints with the operator credential and confirm the
+JSON (including `truncated: false`) matches, and confirm the console
+still refuses to start without `NSIC_OPERATOR_SECRET` set, or with
+`NSIC_ENROLLMENT_SECRET`/`NSIC_OPERATOR_SECRET` empty or equal to each
+other (`validate_secret_configuration` in `main.rs` -- see below).
+
+**Bootstrap and operator secrets can't silently collapse into the same
+value.** The console now refuses to start if either
+`NSIC_ENROLLMENT_SECRET` or `NSIC_OPERATOR_SECRET` is empty, or if the
+two are equal. Nothing upstream of this PR would have caught an operator
+setting both to the same value in their environment -- every check this
+design relies on (`authenticate_host`'s per-agent lookup aside)
+ultimately reduces to "does the presented token equal the configured
+one," so if the two configured values are equal, a valid *bootstrap*
+secret would also pass the *operator* check, quietly reopening exactly
+the read-access-via-enrollment-secret conflation this PR's whole
+credential design exists to avoid. Plain `==`, not `auth::secrets_match`'s
+constant-time comparison: this runs once at process startup on two local
+config values, not a request path an attacker can measure timing on.
+Unit-tested directly (`validate_secret_configuration` in
+`crates/console/src/main.rs`) rather than only via the console's startup
+behavior, and confirmed live: starting the binary with
+`NSIC_ENROLLMENT_SECRET=same NSIC_OPERATOR_SECRET=same` fails fast with a
+clear error before touching Postgres.
 
 ## What's deliberately not here yet
 
@@ -443,15 +488,31 @@ confirm the console still refuses to start without
   discover valid `host_id`s through the API at all -- only from an
   enroll response at enrollment time, or by querying Postgres directly.
   PR #7's read endpoints assume the caller already has a `host_id` or a
-  sha256 in hand from somewhere; a host directory is its own PR.
+  sha256 in hand from somewhere; a host directory is its own PR. (An
+  unknown `host_id` returning `200` with an empty list rather than `404`
+  was reconsidered during review and kept deliberately, for exactly this
+  reason -- see PR #7 above.)
 - **Real pagination on the PR #7 list endpoints.** Both currently
-  `LIMIT 1000` with no cursor -- a ceiling against an unbounded response,
-  not a way to reach rows past it. Fine while no fleet has produced that
-  many sightings for one host or hash; not fine indefinitely.
+  `LIMIT 1000`, with a `truncated` flag signaling when a response was cut
+  short (see PR #7 above) but still no cursor to actually reach the rows
+  past the cap. Fine while no fleet has produced that many sightings for
+  one host or hash; not fine indefinitely.
 - **Operator-credential rotation.** Same gap as per-agent credentials
   below, for the new `NSIC_OPERATOR_SECRET`: it's a single static value
   with no rotation flow, and (unlike per-agent credentials) isn't even
   hashed before comparison -- there's nothing per-row to hash it against.
+- **Operator identity is a single shared secret, not per-user.** Every
+  holder of `NSIC_OPERATOR_SECRET` looks identical to the console --
+  there's no way to tell which analyst issued a given read, let alone
+  restrict what any individual analyst can see. Fine for one operator
+  running this locally; a real multi-user fleet UI needs per-user
+  identity and RBAC before this credential model is adequate for it.
+- **`SightingView.sha256` assumes every indicator is a sha256.** True
+  today (`SightingRequest` only ever carries a sha256, per PR #6), so the
+  read side mirrors that narrowness rather than generalizing ahead of
+  need. Once a non-sha256 indicator kind can produce a sighting, this
+  field needs to become something like a `(kind, value)` pair instead of
+  assuming the one kind that exists right now.
 - **The same hash/scan TOCTOU exists in `src-tauri`'s desktop verdict
   engine, unfixed.** `verdict.rs`'s `resolve()` still hashes a file
   (`hash_file_cached`) and separately opens it again to YARA-scan it
@@ -545,7 +606,7 @@ curl -H "Authorization: Bearer $NSIC_OPERATOR_SECRET" \
 # -> {"sightings": [{"host_id": "...", "hostname": "...", "sha256": "...",
 #     "detection_name": "...", "source": "agent:yara_scan", "confidence": 65,
 #     "path": "...", "ruleset_fingerprint": "...", "first_seen": "...",
-#     "last_seen": "...", "received_at": "..."}]}
+#     "last_seen": "...", "received_at": "..."}], "truncated": false}
 ```
 
 `--enrollment-secret` and `--credential` both fall back to
