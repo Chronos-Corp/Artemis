@@ -14,11 +14,18 @@
 //!   [`EnrollResponse::credential`]. The agent stores it locally and
 //!   presents it as a bearer token on every subsequent authenticated
 //!   request (heartbeat, sighting submission). The console stores only
-//!   its hash, never the raw value.
+//!   its hash, never the raw value. It can be replaced without
+//!   re-enrolling (losing the host's id and history) via
+//!   `POST /api/v1/hosts/{host_id}/credential/rotate`, which returns a
+//!   fresh value in [`CredentialRotated::credential`] under the same
+//!   shown-once contract, or invalidated outright via
+//!   `POST /api/v1/hosts/{host_id}/credential/revoke`, both
+//!   operator-credential gated -- see docs/phase1-design.md.
 //!
-//! There is still no TLS in Phase 1 (see docs/phase1-design.md), so both
-//! credentials cross the wire in plaintext today. That is a tracked gap,
-//! not an oversight.
+//! TLS is opt-in in Phase 1 (see docs/phase1-design.md) -- when not
+//! configured, both credentials cross the wire in plaintext. That's a
+//! deliberate default-off tradeoff for local development, not an
+//! oversight.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -60,6 +67,15 @@ pub struct HeartbeatRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatResponse {
     pub received_at: DateTime<Utc>,
+}
+
+/// Response to a credential rotation request. Operator-credential gated,
+/// same "shown exactly once" contract as `EnrollResponse::credential` --
+/// the console stores only this new credential's hash from here on, so a
+/// lost response means rotating again, not recovering the old value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialRotated {
+    pub credential: String,
 }
 
 /// Reports that this host observed a YARA rule match against a file.

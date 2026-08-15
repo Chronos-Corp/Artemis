@@ -188,7 +188,9 @@ cargo test -p nsic-core -p agent -p console -- --ignored --nocapture  # DB-backe
 The console can optionally serve HTTPS (`NSIC_TLS_CERT_PATH`/
 `NSIC_TLS_KEY_PATH`, both or neither) instead of plain HTTP, and the
 agent has a matching `--tls-ca-cert`/`NSIC_TLS_CA_CERT` option to trust a
-self-signed or internal-CA console certificate. See
+self-signed or internal-CA console certificate. An operator can also
+rotate or revoke a host's per-agent credential in place, without deleting
+the host and losing its sighting/sample-request history. See
 [`docs/phase1-design.md`](docs/phase1-design.md) for how to run the agent
 against the console locally (with or without TLS) and what this scaffold
 does and doesn't do yet.
