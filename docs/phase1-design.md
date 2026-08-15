@@ -905,24 +905,42 @@ no real credential can ever collide with it, and every subsequent
 `authenticate_host` call for that host fails the same way a wrong
 credential always did. This is the same trick `0004_host_credential.sql`
 already used for hosts enrolled before the per-agent credential concept
-existed (`legacy-host-requires-re-enrollment`) -- but that sentinel means
-*re-enroll under a new host id*, since no real credential was ever
-minted for those rows to rotate back to. This PR's sentinel means the
-opposite: the host id and its history are intact, and `rotate` alone
-brings it back online in place. Distinguished by two different sentinel
-strings specifically so a database inspection of `credential_hash` can
-tell "never had a real credential" from "explicitly revoked" apart, in
-case that distinction ever matters for an incident writeup.
+existed (`legacy-host-requires-re-enrollment`), and `rotate` treats both
+sentinels identically: `set_host_credential`'s `UPDATE` overwrites
+whatever `credential_hash` currently holds without inspecting it first,
+so rotating a legacy-sentinel host recovers it in place exactly the same
+way it recovers a revoked one -- re-enrolling under a brand-new host id
+is not the only way to give a legacy host a working credential, only the
+only way to recover its *original* enrollment record if that ever
+matters. (An earlier draft of this doc claimed re-enrollment was the
+legacy sentinel's only recovery path; that was wrong about what the code
+actually does, caught in review, and fixed here rather than by changing
+the code to match the incorrect claim -- keeping "any operator can
+recover any host in place via rotate" was judged the more useful
+behavior.) The two sentinel strings still differ so a database inspection
+of `credential_hash` can tell "never had a real credential" from
+"explicitly revoked" apart, in case that distinction matters for an
+incident writeup.
 
-**A new nullable `credential_rotated_at` column, not an event log.**
-`0007_credential_rotation.sql` adds one timestamp to `host`, set by both
-`rotate` and `revoke`, `NULL` until either happens for the first time.
-This says *whether and when* a host's original enrollment credential
-stopped being current, but not *which* of rotate/revoke did it, how many
-times, or (per the operator-identity gap already logged above) *who*
-triggered it -- a real per-host credential-history table is a
-reasonable future addition once there's an actual per-analyst identity
-to attribute it to, not before.
+**An append-only `host_credential_event` log, not a single "last
+changed" column.** An earlier draft of this PR added a nullable
+`credential_rotated_at` timestamp to `host`, overwritten by both `rotate`
+and `revoke`. Caught in review: overwriting one column on every call
+means only the *most recent* event survives -- revoke during a
+compromise, rotate during recovery, rotate again later would leave the
+database showing only the final rotation, with no record a revocation
+ever happened or when, directly undermining the audit trail this PR
+exists to preserve (locked architecture decision #3). Fixed by replacing
+that column with `host_credential_event` (`id`, `host_id`, `event_type`
+-- `'rotated'` or `'revoked'` -- `occurred_at`), an append-only table
+`set_host_credential` inserts into rather than updates, in the same
+transaction as the `credential_hash` write so the two can't drift apart
+on a crash between them. Still doesn't capture *who* triggered an event
+or *why* (per the operator-identity gap already logged above, there's no
+per-analyst identity yet to attribute it to) -- just that a specific kind
+of event happened and when, which is enough to answer "was this host
+ever revoked, and did it recover" without losing history to the next
+rotation.
 
 **Existence is checked explicitly, not inferred from `rows_affected`.**
 An `UPDATE ... WHERE id = $1` that touches zero rows can't distinguish
@@ -938,17 +956,48 @@ by returning 401 instead" reasoning `create_sample_request` already
 established for its own unknown-`host_id` case, not the
 existence-hiding `401` agent-facing endpoints like `heartbeat` use.
 
-**Verified against a live Postgres.** New tests in
-`crates/console/src/host.rs` cover: rotating replaces the old credential
-(old one stops authenticating a heartbeat, new one works); rotating
-twice leaves only the second credential valid; rotate/revoke both reject
-a missing operator credential, a wrong operator credential, a host's own
-per-agent credential, and an unknown `host_id`; revoking locks out the
-host's existing, otherwise-still-correct credential; and revoke followed
-by rotate recovers the host with a fresh working credential, without
-re-enrolling. A cross-host test confirms rotating one host's credential
-doesn't disturb a second, unrelated host's. Full workspace suite
-(`nsic-core`, `console`, `agent`) run clean.
+**`Cache-Control: no-store` on both credential-bearing responses.**
+`enroll` and `rotate` are the only two responses in this API that hand
+back a raw, usable secret; both now set `Cache-Control: no-store` so an
+intermediate cache or the calling HTTP client's own response cache can't
+retain a value that's shown exactly once and never recoverable from the
+console again. Added during review, alongside the other two fixes above,
+rather than as a separate follow-up PR -- cheap, small, and touches
+exactly the two handlers this PR already modifies.
+
+**`revoke`'s doc comment was tightened to not overclaim retroactive
+cancellation.** It now says explicitly what was previously implied
+loosely by "locks the host out immediately": revocation changes what
+`authenticate_host` accepts on *subsequent* calls, and has no effect on
+a request that already passed that check before revocation completed --
+there is no in-flight-request cancellation anywhere in this API, and the
+wording should not have suggested otherwise.
+
+**Verified against a live Postgres, and against the real binaries.** Tests
+in `crates/console/src/host.rs` cover: rotating replaces the old
+credential (old one stops authenticating a heartbeat, new one works);
+rotating twice leaves only the second credential valid; rotate/revoke
+both reject a missing operator credential, a wrong operator credential, a
+host's own per-agent credential, and an unknown `host_id`; revoking locks
+out the host's existing, otherwise-still-correct credential; revoke
+followed by rotate recovers the host with a fresh working credential,
+without re-enrolling; a cross-host test confirms rotating one host's
+credential doesn't disturb a second, unrelated host's; revoke-then-
+rotate-then-rotate leaves three separate rows in `host_credential_event`
+rather than one overwritten row (the direct regression test for the
+column-vs-log review finding above); a legacy-sentinel host recovers in
+place via `rotate` (the direct test for the recovery-path documentation
+fix above); and both `enroll` and `rotate` set `Cache-Control: no-store`.
+Full workspace suite (`nsic-core`, `console`, `agent`; 107 tests) run
+twice for rerun-safety. Also exercised against the real
+`nsic-console`/`nsic-agent` binaries: enrolled a host, revoked it and
+confirmed its original credential now gets `401`, rotated it and
+confirmed the new credential works, rotated a second time and confirmed
+all three events (`revoked`, `rotated`, `rotated`) persisted in
+`host_credential_event` with distinct timestamps in order, seeded a
+legacy-sentinel host directly via SQL and confirmed `rotate` recovers it
+in place, and confirmed `rotate`'s response carries
+`Cache-Control: no-store` over the wire.
 
 **Deliberately out of scope:** rotating `NSIC_OPERATOR_SECRET` itself
 (still a restart-with-a-new-env-var operation, see below) and any CLI
@@ -1103,15 +1152,20 @@ wrapped in `nsic-agent`.
 ## Data model
 
 `host` (`src-tauri/migrations/0003_hosts.sql`, amended by
-`0004_host_credential.sql` and `0007_credential_rotation.sql`): id,
-hostname, os, agent_version, `credential_hash` (SHA-256 hex of the
-per-agent credential, `NOT NULL` -- or one of two sentinel strings that
-can never match a real hash, marking a pre-credential legacy host or an
-explicitly revoked one; see PR #12 above), enrolled_at,
-last_heartbeat_at, `credential_rotated_at` (nullable, set by PR #12's
-rotate/revoke endpoints, `NULL` until either has happened once).
-Additive to the Phase 0 schema in `0001_init.sql` / `0002_verdict_indexes.sql`,
-not a redesign of it.
+`0004_host_credential.sql`): id, hostname, os, agent_version,
+`credential_hash` (SHA-256 hex of the per-agent credential, `NOT NULL` --
+or one of two sentinel strings that can never match a real hash, marking
+a pre-credential legacy host or an explicitly revoked one; see PR #12
+above), enrolled_at, last_heartbeat_at. Additive to the Phase 0 schema in
+`0001_init.sql` / `0002_verdict_indexes.sql`, not a redesign of it.
+
+`host_credential_event` (`src-tauri/migrations/
+0007_credential_rotation.sql`): an append-only log of `rotate`/`revoke`
+events against a host's credential, added by PR #12 specifically because
+a single overwritten column on `host` would have lost this history on
+every subsequent call (see PR #12 above). `id`, `host_id` (`ON DELETE
+CASCADE`, same tension already logged for `sample_request.host_id`
+below), `event_type` (`'rotated'` or `'revoked'`), `occurred_at`.
 
 `host_sighted_indicator` (`src-tauri/migrations/
 0005_host_sighted_indicator.sql`): the edge PR #6 adds, carrying the full

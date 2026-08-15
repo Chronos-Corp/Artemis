@@ -1,5 +1,7 @@
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::header::CACHE_CONTROL;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::IntoResponse;
 use axum::Json;
 use chrono::Utc;
 use nsic_core::proto::{
@@ -19,12 +21,21 @@ use crate::AppState;
 /// credential can ever hash to this value -- `authenticate_host` rejects
 /// every request for this host until an operator rotates in a fresh
 /// credential. Distinct from `0004_host_credential.sql`'s
-/// `'legacy-host-requires-re-enrollment'` sentinel: that one marks a host
-/// that never had a real credential at all and can only recover by
-/// re-enrolling under a new host id, losing its old one's history. A
-/// revoked host keeps its id and history and can recover in place via
-/// `rotate_credential`.
+/// `'legacy-host-requires-re-enrollment'` sentinel, which marks a host
+/// that never had a real credential minted for it at all -- but
+/// `rotate_credential` doesn't care which sentinel (if any) is currently
+/// stored, so it recovers a legacy host in place exactly the same way it
+/// recovers a revoked one; see that function's doc comment.
 const REVOKED_CREDENTIAL_SENTINEL: &str = "revoked-requires-credential-rotation";
+
+/// A response header set on every response that hands back a raw
+/// credential (`enroll`, `rotate_credential`): the value is shown exactly
+/// once and is never recoverable from the console again, so it must not
+/// be retained by an intermediate cache or the browser/HTTP client's own
+/// response cache beyond this one delivery.
+fn no_store() -> [(axum::http::HeaderName, HeaderValue); 1] {
+    [(CACHE_CONTROL, HeaderValue::from_static("no-store"))]
+}
 
 /// Enrolls a new host, provided the caller presents the console's
 /// bootstrap enrollment secret as a bearer token. On success, mints a
@@ -34,7 +45,7 @@ pub async fn enroll(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<EnrollRequest>,
-) -> Result<Json<EnrollResponse>, (StatusCode, String)> {
+) -> Result<impl IntoResponse, (StatusCode, String)> {
     let presented = bearer_token(&headers).ok_or((
         StatusCode::UNAUTHORIZED,
         "missing bootstrap enrollment credential".to_string(),
@@ -61,10 +72,13 @@ pub async fn enroll(
     .await
     .map_err(internal_error)?;
 
-    Ok(Json(EnrollResponse {
-        host_id,
-        credential,
-    }))
+    Ok((
+        no_store(),
+        Json(EnrollResponse {
+            host_id,
+            credential,
+        }),
+    ))
 }
 
 /// Records a heartbeat for an already-enrolled host, provided the caller
@@ -101,27 +115,40 @@ pub async fn heartbeat(
 /// revocation -- see `revoke_credential`). The host's id, enrollment
 /// history, and every sighting/sample-request it's associated with are
 /// untouched; only the credential changes.
+///
+/// This also recovers a host stuck on either sentinel value
+/// (`REVOKED_CREDENTIAL_SENTINEL`, or `0004_host_credential.sql`'s
+/// legacy `'legacy-host-requires-re-enrollment'`) in place: the `UPDATE`
+/// below doesn't inspect the current `credential_hash` value before
+/// overwriting it, so it works identically regardless of what was there
+/// before. Re-enrolling under a brand-new host id is still the only way
+/// to recover a legacy host's *original* enrollment record if that
+/// matters, but it is not the only way to give one a working credential.
 pub async fn rotate_credential(
     State(state): State<AppState>,
     Path(host_id): Path<Uuid>,
     headers: HeaderMap,
-) -> Result<Json<CredentialRotated>, (StatusCode, String)> {
+) -> Result<impl IntoResponse, (StatusCode, String)> {
     authenticate_operator(&state.operator_secret, &headers)?;
 
     let credential = generate_credential();
     let credential_hash = hash_credential(&credential);
-    set_host_credential(&state, host_id, &credential_hash).await?;
+    set_host_credential(&state, host_id, &credential_hash, "rotated").await?;
 
-    Ok(Json(CredentialRotated { credential }))
+    Ok((no_store(), Json(CredentialRotated { credential })))
 }
 
-/// Invalidates a host's credential without issuing a new one, for
-/// decommissioning or an in-progress compromise where an operator wants
-/// the host locked out immediately and doesn't yet want to hand it
-/// anything usable. Recoverable in place via `rotate_credential` later --
-/// unlike deleting the `host` row outright, this doesn't discard the
-/// host's sighting/sample-request audit trail to achieve the same
-/// lockout. Operator-credential gated, same reasoning as
+/// Blocks all subsequent authentication attempts for a host without
+/// issuing a new credential, for decommissioning or an in-progress
+/// compromise where an operator wants a suspected-compromised host
+/// stopped now and doesn't yet want to hand it anything usable. This
+/// changes what `authenticate_host` will accept going forward; it has no
+/// effect on a request that already passed that check before this call
+/// completed; there is no in-flight-request cancellation here or
+/// anywhere else in this API. Recoverable in place via
+/// `rotate_credential` later -- unlike deleting the `host` row outright,
+/// this doesn't discard the host's sighting/sample-request audit trail to
+/// achieve the same lockout. Operator-credential gated, same reasoning as
 /// `rotate_credential`.
 pub async fn revoke_credential(
     State(state): State<AppState>,
@@ -130,40 +157,58 @@ pub async fn revoke_credential(
 ) -> Result<StatusCode, (StatusCode, String)> {
     authenticate_operator(&state.operator_secret, &headers)?;
 
-    set_host_credential(&state, host_id, REVOKED_CREDENTIAL_SENTINEL).await?;
+    set_host_credential(&state, host_id, REVOKED_CREDENTIAL_SENTINEL, "revoked").await?;
 
     Ok(StatusCode::OK)
 }
 
-/// Shared by `rotate_credential` and `revoke_credential`: both write a new
-/// value into `credential_hash` and stamp `credential_rotated_at`,
-/// differing only in what that value is (a real hash vs. a sentinel that
-/// can never match one). A single `UPDATE ... WHERE id = $1` can't
-/// distinguish "no such host" from "host exists, nothing changed," so
-/// existence is checked first and reported as 404 -- the same "operator
-/// already privileged, no existence to hide" reasoning
-/// `create_sample_request` already applies to its own unknown-`host_id`
-/// case, unlike the deliberately existence-hiding 401s on agent-facing
-/// endpoints like `heartbeat`.
+/// Shared by `rotate_credential` and `revoke_credential`: both overwrite
+/// `credential_hash` (differing only in what value they write -- a real
+/// hash vs. a sentinel that can never match one) and append a row to
+/// `host_credential_event` recording which of the two just happened.
+/// Deliberately an append-only log rather than a single "last changed"
+/// column on `host`: overwriting one timestamp on every call would lose
+/// the fact and timing of every event but the most recent, which for a
+/// design built around preserving an audit trail (locked architecture
+/// decision #3) is exactly the provenance this feature exists to keep.
+/// Both writes happen in one transaction so a crash between them can't
+/// leave a credential change with no corresponding event, or vice versa.
+///
+/// A single `UPDATE ... WHERE id = $1` can't distinguish "no such host"
+/// from "host exists, nothing changed," so existence is checked via
+/// `rows_affected` and reported as 404 -- the same "operator already
+/// privileged, no existence to hide" reasoning `create_sample_request`
+/// already applies to its own unknown-`host_id` case, unlike the
+/// deliberately existence-hiding 401s on agent-facing endpoints like
+/// `heartbeat`.
 async fn set_host_credential(
     state: &AppState,
     host_id: Uuid,
     new_credential_hash: &str,
+    event_type: &str,
 ) -> Result<(), (StatusCode, String)> {
-    let rows_affected = sqlx::query(
-        "UPDATE host SET credential_hash = $1, credential_rotated_at = $2 WHERE id = $3",
-    )
-    .bind(new_credential_hash)
-    .bind(Utc::now())
-    .bind(host_id)
-    .execute(&state.pool)
-    .await
-    .map_err(internal_error)?
-    .rows_affected();
+    let mut tx = state.pool.begin().await.map_err(internal_error)?;
+
+    let rows_affected = sqlx::query("UPDATE host SET credential_hash = $1 WHERE id = $2")
+        .bind(new_credential_hash)
+        .bind(host_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?
+        .rows_affected();
 
     if rows_affected == 0 {
         return Err((StatusCode::NOT_FOUND, "unknown host_id".to_string()));
     }
+
+    sqlx::query("INSERT INTO host_credential_event (host_id, event_type) VALUES ($1, $2)")
+        .bind(host_id)
+        .bind(event_type)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal_error)?;
+
+    tx.commit().await.map_err(internal_error)?;
     Ok(())
 }
 
@@ -706,5 +751,115 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// The regression this PR's review round exists to fix: a single
+    /// "last changed" column on `host` would leave only the most recent
+    /// of these three events. Revoke, then rotate, then rotate again must
+    /// all persist as separate rows in `host_credential_event`, not
+    /// collapse into one.
+    #[tokio::test]
+    #[ignore]
+    async fn credential_events_accumulate_instead_of_being_overwritten() {
+        let state = test_state().await;
+        let app = crate::build_router(state.clone());
+        let enrolled = enroll(&app).await;
+
+        let response = app
+            .clone()
+            .oneshot(revoke_credential_request(
+                enrolled.host_id,
+                Some(OPERATOR_SECRET),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(rotate_credential_request(
+                    enrolled.host_id,
+                    Some(OPERATOR_SECRET),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let events: Vec<String> = sqlx::query_scalar(
+            "SELECT event_type FROM host_credential_event WHERE host_id = $1 ORDER BY occurred_at ASC",
+        )
+        .bind(enrolled.host_id)
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(events, vec!["revoked", "rotated", "rotated"]);
+    }
+
+    /// `rotate_credential` doesn't inspect the current `credential_hash`
+    /// value before overwriting it, so it recovers a host stuck on the
+    /// PR #4 legacy sentinel (`'legacy-host-requires-re-enrollment'`,
+    /// from a host enrolled before per-agent credentials existed) exactly
+    /// the same way it recovers a `REVOKED_CREDENTIAL_SENTINEL` host --
+    /// in place, keeping the same host id, rather than requiring
+    /// re-enrollment under a new one.
+    #[tokio::test]
+    #[ignore]
+    async fn rotate_credential_recovers_a_legacy_sentinel_host_in_place() {
+        let state = test_state().await;
+        let app = crate::build_router(state.clone());
+
+        let host_id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO host (hostname, os, agent_version, credential_hash) \
+             VALUES ('legacy-host', 'linux', '0.0.1', 'legacy-host-requires-re-enrollment') \
+             RETURNING id",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(rotate_credential_request(host_id, Some(OPERATOR_SECRET)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let rotated: nsic_core::proto::CredentialRotated = serde_json::from_slice(&bytes).unwrap();
+
+        let response = app
+            .oneshot(heartbeat_request(host_id, Some(&rotated.credential)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Both endpoints hand back a raw, shown-once credential (`enroll`'s
+    /// and `rotate_credential`'s) -- neither response may be retained by
+    /// an intermediate cache or client-side response cache beyond this
+    /// one delivery.
+    #[tokio::test]
+    #[ignore]
+    async fn enroll_and_rotate_credential_responses_are_not_cacheable() {
+        let app = crate::build_router(test_state().await);
+
+        let response = app
+            .clone()
+            .oneshot(enroll_request(Some(BOOTSTRAP_SECRET)))
+            .await
+            .unwrap();
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let enrolled: nsic_core::proto::EnrollResponse = serde_json::from_slice(&bytes).unwrap();
+
+        let response = app
+            .oneshot(rotate_credential_request(
+                enrolled.host_id,
+                Some(OPERATOR_SECRET),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
     }
 }
