@@ -440,20 +440,31 @@ fn dpkg_lookup(path: &Path, is_symlink: bool) -> Option<(FileAuthenticity, Produ
         Err(_) => return None,
     };
 
-    let package = if search.status.success() {
-        parse_dpkg_search_output(&String::from_utf8_lossy(&search.stdout), &path_str)
-    } else {
-        None
-    };
-
-    let Some(package) = package else {
-        return Some((
-            FileAuthenticity {
-                status: AuthenticityStatus::Unpackaged,
-                detail: Some("no installed package owns this path".into()),
-            },
-            ProductContext::default(),
-        ));
+    let package = match classify_dpkg_search(
+        search.status.code(),
+        &String::from_utf8_lossy(&search.stdout),
+        &String::from_utf8_lossy(&search.stderr),
+        &path_str,
+    ) {
+        DpkgSearchOutcome::Owned(package) => package,
+        DpkgSearchOutcome::Unowned => {
+            return Some((
+                FileAuthenticity {
+                    status: AuthenticityStatus::Unpackaged,
+                    detail: Some("no installed package owns this path".into()),
+                },
+                ProductContext::default(),
+            ));
+        }
+        DpkgSearchOutcome::LookupFailed(detail) => {
+            return Some((
+                FileAuthenticity {
+                    status: AuthenticityStatus::Unknown,
+                    detail: Some(detail),
+                },
+                ProductContext::default(),
+            ));
+        }
     };
 
     let query = std::process::Command::new("dpkg-query")
@@ -490,6 +501,54 @@ fn dpkg_lookup(path: &Path, is_symlink: bool) -> Option<(FileAuthenticity, Produ
     // resolve a symlink at the final component.
     let authenticity = verify_dpkg_checksum(&package, path, &path_str);
     Some((authenticity, product_context))
+}
+
+/// What a `dpkg -S` invocation resolved to, before any process-spawning is
+/// involved -- kept separate from `dpkg_lookup` specifically so the exit-
+/// code classification can be unit-tested with simulated codes rather than
+/// requiring a real dpkg database to exercise (a follow-up review's own
+/// suggestion).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DpkgSearchOutcome {
+    Owned(String),
+    Unowned,
+    LookupFailed(String),
+}
+
+/// Classifies a completed `dpkg -S` invocation per `dpkg-query(1)`'s
+/// documented exit-status contract: 0 is success, 1 is the *documented*
+/// "no file/package found" negative result, and anything else (2, or a
+/// signal with no exit code at all) is a fatal/unrecoverable query error
+/// -- database inaccessible or corrupt, out-of-memory, invalid invocation.
+/// A follow-up review caught that the previous version of this code
+/// collapsed every non-success exit into `Unpackaged`, misreporting a
+/// failed lookup ("we don't know") as a real negative result ("we know
+/// this isn't package-owned"). Absence of evidence is not evidence of
+/// absence.
+fn classify_dpkg_search(
+    status_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+    path: &str,
+) -> DpkgSearchOutcome {
+    match status_code {
+        Some(0) => match parse_dpkg_search_output(stdout, path) {
+            Some(package) => DpkgSearchOutcome::Owned(package),
+            // Exit 0 but no line exactly matches the queried path -- dpkg's
+            // own glob matching found something, but not the exact file we
+            // asked about (see `parse_dpkg_search_output`'s doc comment).
+            // Still a real negative result, not a failure.
+            None => DpkgSearchOutcome::Unowned,
+        },
+        Some(1) => DpkgSearchOutcome::Unowned,
+        other => DpkgSearchOutcome::LookupFailed(format!(
+            "dpkg -S exited with {} querying the package database -- {}",
+            other
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "no exit code (killed by a signal)".to_string()),
+            stderr.trim()
+        )),
+    }
 }
 
 /// Parses `dpkg -S <path>` output: lines of `package[:arch]: /abs/path`,
@@ -1025,6 +1084,55 @@ mod tests {
             parse_dpkg_search_output(stdout, "/usr/lib/x86_64-linux-gnu/libc.so.6"),
             Some("libc6:amd64".to_string())
         );
+    }
+
+    // ---- classify_dpkg_search (the fatal-error-vs-not-found fix) ----
+
+    #[test]
+    fn classify_dpkg_search_success_with_exact_match_is_owned() {
+        let outcome = classify_dpkg_search(Some(0), "coreutils: /usr/bin/ls\n", "", "/usr/bin/ls");
+        assert_eq!(outcome, DpkgSearchOutcome::Owned("coreutils".to_string()));
+    }
+
+    #[test]
+    fn classify_dpkg_search_success_without_exact_match_is_unowned() {
+        // Exit 0 but the only line doesn't exactly match -- dpkg's glob
+        // matching found something else, which is correctly rejected by
+        // parse_dpkg_search_output, and that's a real negative result,
+        // not a failure.
+        let outcome = classify_dpkg_search(Some(0), "coreutils: /usr/bin/ls\n", "", "/usr/bin/*");
+        assert_eq!(outcome, DpkgSearchOutcome::Unowned);
+    }
+
+    #[test]
+    fn classify_dpkg_search_exit_1_is_the_documented_not_found_case() {
+        let outcome = classify_dpkg_search(
+            Some(1),
+            "",
+            "dpkg-query: no path found matching pattern /tmp/x",
+            "/tmp/x",
+        );
+        assert_eq!(outcome, DpkgSearchOutcome::Unowned);
+    }
+
+    #[test]
+    fn classify_dpkg_search_exit_2_is_a_fatal_lookup_failure_not_unpackaged() {
+        // The review's merge-blocking finding: dpkg-query(1) documents
+        // exit 2 as a fatal/unrecoverable error (database inaccessible or
+        // corrupt, out of memory, invalid invocation) -- categorically
+        // different from exit 1's documented "no file found." Collapsing
+        // both into Unpackaged reports "we don't know" as "we know this
+        // isn't package-owned."
+        let outcome = classify_dpkg_search(Some(2), "", "dpkg-query: error: ...", "/usr/bin/ls");
+        assert!(matches!(outcome, DpkgSearchOutcome::LookupFailed(_)));
+    }
+
+    #[test]
+    fn classify_dpkg_search_no_exit_code_is_also_a_fatal_lookup_failure() {
+        // A process killed by a signal reports no exit code at all --
+        // also must not be treated as "not found."
+        let outcome = classify_dpkg_search(None, "", "", "/usr/bin/ls");
+        assert!(matches!(outcome, DpkgSearchOutcome::LookupFailed(_)));
     }
 
     #[test]
