@@ -195,7 +195,11 @@ also serves a browser-facing fleet UI (server-rendered, no separate
 build step) at its root -- browse enrolled hosts, drill into a host's
 sightings and sample requests, request a new sample, and rotate/revoke
 credentials, gated by the same operator credential presented as HTTP
-Basic auth. See [`docs/phase1-design.md`](docs/phase1-design.md) for how to run the agent
+Basic auth. Every scan (whether or not it matches anything) reports
+coverage back to the console, so the fleet UI can flag a host that's
+never scanned or whose rules failed to load, distinctly from one that's
+scanning fine and genuinely finding nothing. See
+[`docs/phase1-design.md`](docs/phase1-design.md) for how to run the agent
 against the console locally (with or without TLS) and what this scaffold
 does and doesn't do yet.
 

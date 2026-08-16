@@ -6,7 +6,7 @@ use axum::Json;
 use chrono::Utc;
 use nsic_core::proto::{
     CredentialRotated, EnrollRequest, EnrollResponse, HeartbeatRequest, HeartbeatResponse,
-    HostListResponse, HostView,
+    HostListResponse, HostView, ScanReport, ScanReportResponse,
 };
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -16,6 +16,7 @@ use crate::auth::{
     internal_error, secrets_match,
 };
 use crate::pagination::truncate_to_limit;
+use crate::validate::{bad_request, validate_lowercase_sha256, validate_observed_at};
 use crate::AppState;
 
 /// Row cap for `list_hosts`, same reasoning and truncated-flag pattern as
@@ -114,6 +115,77 @@ pub async fn heartbeat(
     Ok(Json(HeartbeatResponse { received_at: now }))
 }
 
+/// Records that this host attempted a scan, independent of whether
+/// anything matched -- the sensor-health signal a sighting alone can't
+/// provide (see [`nsic_core::proto::ScanReport`]'s doc comment). Per-agent
+/// credential, same as heartbeat.
+///
+/// Unlike `heartbeat`'s unconditional overwrite of `last_heartbeat_at`
+/// (always the console's own clock, monotonic by construction),
+/// `req.scanned_at` is agent-claimed -- validated only for a
+/// 5-minute-future/2020-01-01 window, not otherwise trusted -- so a
+/// delayed retry or a race between overlapping scan invocations could
+/// legitimately deliver an older `scanned_at` after a newer one was
+/// already recorded. The `UPDATE`'s `WHERE` clause guards against that:
+/// it only replaces the stored snapshot when the incoming `scanned_at` is
+/// strictly newer (or nothing has been recorded yet), so a stale report
+/// can't regress it. That guard means this `UPDATE` can now legitimately
+/// affect zero rows for a well-formed but out-of-order report -- not just
+/// for an unknown host, which `authenticate_host` above already rules
+/// out -- so, unlike `set_host_credential`, there's deliberately no
+/// `rows_affected` check here: zero rows is an expected, silent outcome,
+/// not an error to surface to the agent.
+///
+/// `last_scan_received_at` records the console's own clock at write time,
+/// alongside the agent-claimed `last_scan_at` -- the same provenance
+/// pairing `host_sighted_indicator.received_at` gives sightings, so an
+/// analyst can compare what the agent claimed against when the console
+/// actually heard it.
+pub async fn report_scan(
+    State(state): State<AppState>,
+    Path(host_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(req): Json<ScanReport>,
+) -> Result<Json<ScanReportResponse>, (StatusCode, String)> {
+    authenticate_host(&state.pool, host_id, &headers).await?;
+    validate_scan_report(&req)?;
+
+    let received_at = Utc::now();
+    sqlx::query(
+        "UPDATE host SET last_scan_at = $1, last_scan_received_at = $2, \
+                last_scan_rule_count = $3, last_scan_ruleset_fingerprint = $4, \
+                last_scan_matched_count = $5 \
+         WHERE id = $6 AND (last_scan_at IS NULL OR $1 > last_scan_at)",
+    )
+    .bind(req.scanned_at)
+    .bind(received_at)
+    .bind(req.rule_count)
+    .bind(&req.ruleset_fingerprint)
+    .bind(req.matched_count)
+    .bind(host_id)
+    .execute(&state.pool)
+    .await
+    .map_err(internal_error)?;
+
+    Ok(Json(ScanReportResponse { received_at }))
+}
+
+/// Authentication proves which agent sent a request, not that the agent
+/// is bug-free or uncompromised -- the same reasoning
+/// `sighting::validate_sighting_request` already applies to sighting
+/// reports applies here.
+fn validate_scan_report(req: &ScanReport) -> Result<(), (StatusCode, String)> {
+    validate_lowercase_sha256(&req.ruleset_fingerprint, "ruleset_fingerprint")?;
+    if req.rule_count < 0 {
+        return Err(bad_request("rule_count must not be negative"));
+    }
+    if req.matched_count < 0 {
+        return Err(bad_request("matched_count must not be negative"));
+    }
+    validate_observed_at(req.scanned_at, "scanned_at")?;
+    Ok(())
+}
+
 /// Lists every enrolled host -- the fleet directory that's been a
 /// documented gap since PR #7 ("no way to discover valid host_ids
 /// through the API at all"). Operator-credential only, same as every
@@ -153,7 +225,9 @@ pub async fn get_host(
 /// that happen to want the same rows.
 pub(crate) async fn fetch_all_hosts(pool: &PgPool) -> sqlx::Result<(Vec<HostView>, bool)> {
     let mut rows = sqlx::query(
-        "SELECT id, hostname, os, agent_version, enrolled_at, last_heartbeat_at \
+        "SELECT id, hostname, os, agent_version, enrolled_at, last_heartbeat_at, \
+                last_scan_at, last_scan_received_at, last_scan_rule_count, \
+                last_scan_ruleset_fingerprint, last_scan_matched_count \
          FROM host ORDER BY hostname, id LIMIT $1",
     )
     .bind(HOST_LIST_LIMIT + 1)
@@ -170,7 +244,9 @@ pub(crate) async fn fetch_all_hosts(pool: &PgPool) -> sqlx::Result<(Vec<HostView
 /// Shared by `get_host` (JSON API) and the fleet UI's host detail page.
 pub(crate) async fn fetch_host(pool: &PgPool, host_id: Uuid) -> sqlx::Result<Option<HostView>> {
     let row = sqlx::query(
-        "SELECT id, hostname, os, agent_version, enrolled_at, last_heartbeat_at \
+        "SELECT id, hostname, os, agent_version, enrolled_at, last_heartbeat_at, \
+                last_scan_at, last_scan_received_at, last_scan_rule_count, \
+                last_scan_ruleset_fingerprint, last_scan_matched_count \
          FROM host WHERE id = $1",
     )
     .bind(host_id)
@@ -187,6 +263,11 @@ fn host_view_from_row(row: sqlx::postgres::PgRow) -> HostView {
         agent_version: row.get("agent_version"),
         enrolled_at: row.get("enrolled_at"),
         last_heartbeat_at: row.get("last_heartbeat_at"),
+        last_scan_at: row.get("last_scan_at"),
+        last_scan_received_at: row.get("last_scan_received_at"),
+        last_scan_rule_count: row.get("last_scan_rule_count"),
+        last_scan_ruleset_fingerprint: row.get("last_scan_ruleset_fingerprint"),
+        last_scan_matched_count: row.get("last_scan_matched_count"),
     }
 }
 
@@ -302,6 +383,7 @@ mod tests {
     use crate::AppState;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use chrono::Utc;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
@@ -344,6 +426,35 @@ mod tests {
         let mut builder = Request::builder()
             .method("POST")
             .uri(format!("/api/v1/agents/{host_id}/heartbeat"))
+            .header("content-type", "application/json");
+        if let Some(token) = bearer {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        builder.body(Body::from(body.to_string())).unwrap()
+    }
+
+    fn valid_fingerprint(seed: &str) -> String {
+        format!("{seed:0<64}")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_report_request(
+        host_id: uuid::Uuid,
+        bearer: Option<&str>,
+        rule_count: i32,
+        ruleset_fingerprint: &str,
+        matched_count: i32,
+        scanned_at: chrono::DateTime<chrono::Utc>,
+    ) -> Request<Body> {
+        let body = serde_json::json!({
+            "rule_count": rule_count,
+            "ruleset_fingerprint": ruleset_fingerprint,
+            "matched_count": matched_count,
+            "scanned_at": scanned_at.to_rfc3339(),
+        });
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/agents/{host_id}/scans"))
             .header("content-type", "application/json");
         if let Some(token) = bearer {
             builder = builder.header("authorization", format!("Bearer {token}"));
@@ -1059,5 +1170,318 @@ mod tests {
         let host: nsic_core::proto::HostView = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(host.id, enrolled.host_id);
         assert_eq!(host.hostname, "test-host");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn report_scan_rejects_missing_credential() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+        let response = app
+            .oneshot(scan_report_request(
+                enrolled.host_id,
+                None,
+                3,
+                &valid_fingerprint("f"),
+                0,
+                Utc::now(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn report_scan_rejects_forged_credential() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+        let response = app
+            .oneshot(scan_report_request(
+                enrolled.host_id,
+                Some("forged-credential"),
+                3,
+                &valid_fingerprint("f"),
+                0,
+                Utc::now(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A per-agent credential must not authorize reporting scan coverage
+    /// for a *different* host -- same cross-host check every other
+    /// per-agent-credentialed endpoint already enforces.
+    #[tokio::test]
+    #[ignore]
+    async fn report_scan_rejects_credential_for_different_host() {
+        let app = crate::build_router(test_state().await);
+        let host_a = enroll(&app).await;
+        let host_b = enroll(&app).await;
+        let response = app
+            .oneshot(scan_report_request(
+                host_b.host_id,
+                Some(&host_a.credential),
+                3,
+                &valid_fingerprint("f"),
+                0,
+                Utc::now(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn report_scan_rejects_malformed_ruleset_fingerprint() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+        let response = app
+            .oneshot(scan_report_request(
+                enrolled.host_id,
+                Some(&enrolled.credential),
+                3,
+                "not-a-fingerprint",
+                0,
+                Utc::now(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn report_scan_rejects_negative_rule_count() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+        let response = app
+            .oneshot(scan_report_request(
+                enrolled.host_id,
+                Some(&enrolled.credential),
+                -1,
+                &valid_fingerprint("f"),
+                0,
+                Utc::now(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn report_scan_rejects_negative_matched_count() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+        let response = app
+            .oneshot(scan_report_request(
+                enrolled.host_id,
+                Some(&enrolled.credential),
+                3,
+                &valid_fingerprint("f"),
+                -1,
+                Utc::now(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn report_scan_rejects_scanned_at_too_far_in_future() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+        let response = app
+            .oneshot(scan_report_request(
+                enrolled.host_id,
+                Some(&enrolled.credential),
+                3,
+                &valid_fingerprint("f"),
+                0,
+                Utc::now() + chrono::Duration::days(1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// The full happy path and the actual point of this feature: a scan
+    /// report with zero matches -- the case `report_sightings` on the
+    /// agent side is a no-op for, and so would otherwise leave this host
+    /// looking identical to one that never scanned at all -- still
+    /// updates the host's coverage fields, visible through `get_host`.
+    #[tokio::test]
+    #[ignore]
+    async fn report_scan_with_zero_matches_updates_coverage_fields() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+        let fingerprint = valid_fingerprint("f");
+        let scanned_at = Utc::now();
+
+        let response = app
+            .clone()
+            .oneshot(scan_report_request(
+                enrolled.host_id,
+                Some(&enrolled.credential),
+                12,
+                &fingerprint,
+                0,
+                scanned_at,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(get_host_request(enrolled.host_id, Some(OPERATOR_SECRET)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let host: nsic_core::proto::HostView = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(host.last_scan_rule_count, Some(12));
+        assert_eq!(host.last_scan_ruleset_fingerprint, Some(fingerprint));
+        assert_eq!(host.last_scan_matched_count, Some(0));
+        assert!(host.last_scan_at.is_some());
+    }
+
+    /// A host that's never reported a scan must show `None` for all four
+    /// coverage fields together -- the "never scanned" state
+    /// `ui::scan_status_badge` keys off of.
+    #[tokio::test]
+    #[ignore]
+    async fn a_host_with_no_scan_report_has_no_coverage_fields() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+
+        let response = app
+            .oneshot(get_host_request(enrolled.host_id, Some(OPERATOR_SECRET)))
+            .await
+            .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let host: nsic_core::proto::HostView = serde_json::from_slice(&bytes).unwrap();
+        assert!(host.last_scan_at.is_none());
+        assert!(host.last_scan_rule_count.is_none());
+        assert!(host.last_scan_ruleset_fingerprint.is_none());
+        assert!(host.last_scan_matched_count.is_none());
+    }
+
+    /// A later scan report overwrites the earlier one's coverage fields
+    /// -- unlike `host_credential_event`, there's no accumulation here to
+    /// preserve, only "what's the most recent state."
+    #[tokio::test]
+    #[ignore]
+    async fn a_second_scan_report_overwrites_the_first() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+
+        let response = app
+            .clone()
+            .oneshot(scan_report_request(
+                enrolled.host_id,
+                Some(&enrolled.credential),
+                5,
+                &valid_fingerprint("a"),
+                1,
+                Utc::now(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let second_fingerprint = valid_fingerprint("b");
+        let response = app
+            .clone()
+            .oneshot(scan_report_request(
+                enrolled.host_id,
+                Some(&enrolled.credential),
+                7,
+                &second_fingerprint,
+                0,
+                Utc::now(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(get_host_request(enrolled.host_id, Some(OPERATOR_SECRET)))
+            .await
+            .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let host: nsic_core::proto::HostView = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(host.last_scan_rule_count, Some(7));
+        assert_eq!(host.last_scan_ruleset_fingerprint, Some(second_fingerprint));
+        assert_eq!(host.last_scan_matched_count, Some(0));
+    }
+
+    /// A scan report whose `scanned_at` is *older* than what's already
+    /// stored must not regress the snapshot -- the out-of-order case a
+    /// plain unconditional overwrite (like `a_second_scan_report_
+    /// overwrites_the_first` above exercises for the in-order case) can't
+    /// tell apart from a legitimate newer report. Unlike `last_heartbeat_at`
+    /// (always the console's own clock), `scanned_at` is agent-claimed and
+    /// only bounds-checked, not otherwise trusted, so a delayed retry or a
+    /// race between overlapping scan invocations really can deliver an
+    /// older timestamp after a newer one was already recorded.
+    #[tokio::test]
+    #[ignore]
+    async fn a_stale_out_of_order_scan_report_does_not_overwrite_a_newer_snapshot() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+
+        let newer_scanned_at = Utc::now();
+        let newer_fingerprint = valid_fingerprint("aaaa");
+        let response = app
+            .clone()
+            .oneshot(scan_report_request(
+                enrolled.host_id,
+                Some(&enrolled.credential),
+                9,
+                &newer_fingerprint,
+                2,
+                newer_scanned_at,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let older_scanned_at = newer_scanned_at - chrono::Duration::hours(1);
+        let older_fingerprint = valid_fingerprint("bbbb");
+        let response = app
+            .clone()
+            .oneshot(scan_report_request(
+                enrolled.host_id,
+                Some(&enrolled.credential),
+                3,
+                &older_fingerprint,
+                0,
+                older_scanned_at,
+            ))
+            .await
+            .unwrap();
+        // The stale report is still well-formed and authenticated, so the
+        // agent gets its usual 200 -- the guard is silent from the caller's
+        // perspective, the same way a heartbeat never tells an agent
+        // whether it changed anything either.
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(get_host_request(enrolled.host_id, Some(OPERATOR_SECRET)))
+            .await
+            .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let host: nsic_core::proto::HostView = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            host.last_scan_at.unwrap().timestamp_millis(),
+            newer_scanned_at.timestamp_millis()
+        );
+        assert_eq!(host.last_scan_rule_count, Some(9));
+        assert_eq!(host.last_scan_ruleset_fingerprint, Some(newer_fingerprint));
+        assert_eq!(host.last_scan_matched_count, Some(2));
     }
 }

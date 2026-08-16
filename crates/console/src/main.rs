@@ -242,6 +242,7 @@ fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/agents/enroll", post(host::enroll))
         .route("/api/v1/agents/{host_id}/heartbeat", post(host::heartbeat))
+        .route("/api/v1/agents/{host_id}/scans", post(host::report_scan))
         .route("/api/v1/hosts", get(host::list_hosts))
         .route("/api/v1/hosts/{host_id}", get(host::get_host))
         .route(

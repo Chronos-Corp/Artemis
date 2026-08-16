@@ -90,6 +90,21 @@ pub struct HostView {
     pub agent_version: String,
     pub enrolled_at: DateTime<Utc>,
     pub last_heartbeat_at: Option<DateTime<Utc>>,
+    /// The rest of this struct's scan-coverage fields are `None` together
+    /// until the host's agent reports its first scan (see
+    /// [`ScanReport`]) -- a host that heartbeats but never scans, or
+    /// whose YARA rules directory fails to load, is now distinguishable
+    /// from one that scanned recently with rules loaded and simply found
+    /// nothing.
+    pub last_scan_at: Option<DateTime<Utc>>,
+    /// The console's own clock when `last_scan_at` was recorded -- unlike
+    /// `last_scan_at` itself (agent-claimed, can legitimately arrive out
+    /// of order), this is always monotonic, the same provenance role
+    /// `host_sighted_indicator.received_at` plays for sightings.
+    pub last_scan_received_at: Option<DateTime<Utc>>,
+    pub last_scan_rule_count: Option<i32>,
+    pub last_scan_ruleset_fingerprint: Option<String>,
+    pub last_scan_matched_count: Option<i32>,
 }
 
 /// Response for `GET /api/v1/hosts`, the fleet directory. Was a
@@ -131,6 +146,35 @@ pub struct SightingRequest {
 pub struct SightingResponse {
     pub indicator_id: Uuid,
     pub recorded_at: DateTime<Utc>,
+}
+
+/// Reports that this host attempted a scan, independent of whether
+/// anything matched -- the sensor-health/coverage signal
+/// [`SightingRequest`] alone can't provide, since a sighting only ever
+/// fires on a match. Sent once per `nsic-agent scan` invocation
+/// (regardless of `matches.len()`), right alongside any
+/// [`SightingRequest`]s that same scan also produced. `rule_count` and
+/// `matched_count` are `i32` (not `u32`) to match the Postgres `INTEGER`
+/// column they're stored in directly; the console still validates both
+/// are non-negative rather than trusting the wire type, the same
+/// explicit-validation-at-the-boundary posture every other endpoint in
+/// this file takes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanReport {
+    pub rule_count: i32,
+    /// `YaraEngine::ruleset_fingerprint` at scan time -- same value
+    /// [`SightingRequest::ruleset_fingerprint`] carries when a scan
+    /// matches, but sent here unconditionally so a zero-rule ruleset
+    /// (fingerprinting the empty set) is visible too, not only a
+    /// nonempty one that happened to match something.
+    pub ruleset_fingerprint: String,
+    pub matched_count: i32,
+    pub scanned_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanReportResponse {
+    pub received_at: DateTime<Utc>,
 }
 
 /// One row of the intel graph's `host_sighted_indicator` edge, denormalized

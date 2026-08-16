@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::auth::{authenticate_host, authenticate_operator, internal_error};
 use crate::pagination::truncate_to_limit;
-use crate::validate::{bad_request, validate_lowercase_sha256};
+use crate::validate::{bad_request, validate_lowercase_sha256, validate_observed_at};
 use crate::AppState;
 
 /// Hard cap on rows returned by the list endpoints below. Not real
@@ -28,17 +28,6 @@ const SIGHTING_LIST_LIMIT: i64 = 1000;
 /// distinguishable in the graph.
 const YARA_SIGHTING_SOURCE: &str = "agent:yara_scan";
 const YARA_SIGHTING_CONFIDENCE: i16 = 65;
-
-/// How far ahead of the console's own clock an agent's claimed
-/// `observed_at` is tolerated before being rejected outright, and (with
-/// `earliest_plausible_observed_at` below) how far in the past. This
-/// bounds, but does not eliminate, what a misconfigured or compromised
-/// endpoint clock can claim: anything within the window is still
-/// accepted at face value. What actually limits the damage is
-/// `received_at` on `host_sighted_indicator` -- a server-controlled
-/// ingestion timestamp analysts can compare the claim against, not a
-/// guarantee the claim is honest.
-const MAX_FUTURE_SKEW: chrono::Duration = chrono::Duration::minutes(5);
 
 /// Records that `host_id` observed a YARA rule match, provided the caller
 /// presents that host's own per-agent credential and the payload passes
@@ -251,32 +240,9 @@ fn validate_sighting_request(req: &SightingRequest) -> Result<(), (StatusCode, S
         ));
     }
 
-    let now = Utc::now();
-    if req.observed_at > now + MAX_FUTURE_SKEW {
-        return Err(bad_request(&format!(
-            "observed_at {} is too far in the future (more than 5 minutes ahead of the \
-             console's clock)",
-            req.observed_at
-        )));
-    }
-    if req.observed_at < earliest_plausible_observed_at() {
-        return Err(bad_request(&format!(
-            "observed_at {} predates any plausible deployment of this software",
-            req.observed_at
-        )));
-    }
+    validate_observed_at(req.observed_at, "observed_at")?;
 
     Ok(())
-}
-
-/// A floor sanity bound, not a moving target: nothing this project ever
-/// produced can predate its own existence. Catches obviously-bogus clocks
-/// (an unset RTC defaulting to the epoch, etc.) without constraining
-/// legitimate delayed or batched reports.
-fn earliest_plausible_observed_at() -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
-        .expect("valid constant")
-        .with_timezone(&Utc)
 }
 
 /// Reimplements `src-tauri`'s `db::indicators::upsert_indicator` with a
