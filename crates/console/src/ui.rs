@@ -85,10 +85,11 @@ pub async fn host_directory(State(state): State<AppState>, headers: HeaderMap) -
         return challenge;
     }
 
-    let (hosts, truncated) = match fetch_all_hosts(&state.pool).await {
-        Ok(v) => v,
-        Err(e) => return db_error_page(e),
-    };
+    let (hosts, truncated) =
+        match fetch_all_hosts(&state.pool, state.scan_staleness_threshold).await {
+            Ok(v) => v,
+            Err(e) => return db_error_page(e),
+        };
 
     layout(
         "Fleet",
@@ -156,7 +157,7 @@ pub async fn host_detail(
 /// `rotate_credential_action`'s doc comment for why that renders a
 /// separate, minimal success page instead of routing through here.
 async fn render_host_detail(state: &AppState, host_id: Uuid, flash: Option<&str>) -> Response {
-    let host = match fetch_host(&state.pool, host_id).await {
+    let host = match fetch_host(&state.pool, host_id, state.scan_staleness_threshold).await {
         Ok(Some(h)) => h,
         Ok(None) => return not_found_page("No such host."),
         Err(e) => return db_error_page(e),
@@ -339,13 +340,18 @@ fn status_badge(status: SampleRequestStatus) -> Markup {
     html! { span class=(format!("badge {class}")) { (label) } }
 }
 
-/// The sensor-health signal this PR exists to surface: a host that's
-/// never sent a scan-coverage report, or whose most recent one loaded
-/// zero rules, looks identical to a genuinely clean host if all an
-/// operator can see is the sightings list -- this badge is what makes
-/// that distinction visible without having to cross-reference two pages.
-/// A host with no sightings *and* a healthy, recent, rule-loaded scan
-/// report is a real "nothing found," not an absent sensor.
+/// The sensor-health signal this feature exists to surface, now four
+/// states rather than three: a host that's never sent a scan-coverage
+/// report, whose most recent one loaded zero rules, whose most recent one
+/// is older than `AppState::scan_staleness_threshold` (`host.scan_stale`),
+/// or a healthy, recent, rule-loaded scan -- all of which look identical
+/// from the sightings list alone. A host with no sightings *and* a
+/// healthy, recent, rule-loaded scan report is a real "nothing found,"
+/// not an absent or dead sensor. "Never scanned" and "0 rules loaded"
+/// both take priority over "stale": each names a strictly worse, more
+/// specific condition than "the sensor ran recently enough with rules
+/// loaded, just a while ago," so showing "stale" instead would bury the
+/// more actionable problem.
 fn scan_status_badge(host: &HostView) -> Markup {
     let Some(last_scan_at) = host.last_scan_at else {
         return html! { span class="badge badge-err" { "never scanned" } };
@@ -354,6 +360,13 @@ fn scan_status_badge(host: &HostView) -> Markup {
         return html! { span class="badge badge-err" { "0 rules loaded" } };
     }
     let rule_count = host.last_scan_rule_count.unwrap_or_default();
+    if host.scan_stale {
+        return html! {
+            span class="badge badge-warn" {
+                "stale (last scan " (format_time(last_scan_at)) ", " (rule_count) " rules)"
+            }
+        };
+    }
     html! {
         span class="badge badge-ok" {
             (format_time(last_scan_at)) " (" (rule_count) " rules)"
@@ -647,6 +660,7 @@ mod tests {
             bootstrap_secret: BOOTSTRAP_SECRET.to_string(),
             operator_secret: OPERATOR_SECRET.to_string(),
             csrf_token: CSRF_TOKEN.to_string(),
+            scan_staleness_threshold: chrono::Duration::hours(24),
         }
     }
 
@@ -854,6 +868,10 @@ mod tests {
         let row = extract_host_row(&body, enrolled.host_id);
         assert!(row.contains("12 rules"));
         assert!(!row.contains("never scanned"));
+        assert!(
+            !row.contains("stale"),
+            "a scan reported moments ago must not read as stale"
+        );
 
         let response = app
             .oneshot(get(
@@ -865,6 +883,62 @@ mod tests {
         let body = body_string(response).await;
         assert!(body.contains("12 rules loaded"));
         assert!(body.contains("0 match(es)"));
+    }
+
+    /// A host whose most recent scan is older than the console's
+    /// staleness threshold (24h in `test_state`) is flagged distinctly
+    /// from a healthy recent scan -- `badge-warn`, not `badge-ok`, and
+    /// with the "stale" label -- on both the fleet directory and the host
+    /// detail page (`scan_status_badge` is shared by both).
+    #[tokio::test]
+    #[ignore]
+    async fn host_pages_flag_a_stale_scan_report() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+
+        let scan = serde_json::json!({
+            "rule_count": 9,
+            "ruleset_fingerprint": format!("{:0<64}", "de"),
+            "matched_count": 0,
+            "scanned_at": (chrono::Utc::now() - chrono::Duration::hours(48)).to_rfc3339(),
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/agents/{}/scans", enrolled.host_id))
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {}", enrolled.credential))
+                    .body(Body::from(scan.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(get("/hosts".to_string(), Some(OPERATOR_SECRET)))
+            .await
+            .unwrap();
+        let body = body_string(response).await;
+        let row = extract_host_row(&body, enrolled.host_id);
+        assert!(row.contains("badge-warn"));
+        assert!(row.contains("stale"));
+        assert!(!row.contains("never scanned"));
+        assert!(!row.contains("0 rules loaded"));
+
+        let response = app
+            .oneshot(get(
+                format!("/hosts/{}", enrolled.host_id),
+                Some(OPERATOR_SECRET),
+            ))
+            .await
+            .unwrap();
+        let body = body_string(response).await;
+        assert!(body.contains("badge-warn"));
+        assert!(body.contains("stale"));
     }
 
     /// A host whose most recent scan loaded zero rules (a broken or

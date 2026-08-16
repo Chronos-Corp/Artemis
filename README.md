@@ -198,7 +198,9 @@ credentials, gated by the same operator credential presented as HTTP
 Basic auth. Every scan (whether or not it matches anything) reports
 coverage back to the console, so the fleet UI can flag a host that's
 never scanned or whose rules failed to load, distinctly from one that's
-scanning fine and genuinely finding nothing. See
+scanning fine and genuinely finding nothing -- and distinctly again from
+one whose last scan is simply old, flagged as "stale" once it passes a
+configurable threshold (`NSIC_SCAN_STALENESS_HOURS`, default 24h). See
 [`docs/phase1-design.md`](docs/phase1-design.md) for how to run the agent
 against the console locally (with or without TLS) and what this scaffold
 does and doesn't do yet.

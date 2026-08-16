@@ -425,6 +425,7 @@ mod tests {
             bootstrap_secret: BOOTSTRAP_SECRET.to_string(),
             operator_secret: OPERATOR_SECRET.to_string(),
             csrf_token: CSRF_TOKEN.to_string(),
+            scan_staleness_threshold: chrono::Duration::hours(24),
         }
     }
 
