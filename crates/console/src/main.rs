@@ -17,9 +17,10 @@
 //! enroll time, required on every subsequent agent-authenticated request
 //! (heartbeat, sighting submission, sample-request polling/fulfillment);
 //! and a console-operator credential (`NSIC_OPERATOR_SECRET`), required on
-//! the read endpoints that list sightings back out and on creating/
-//! listing sample requests. An agent's per-agent credential authenticates
-//! that one host's own writes -- it must not also authenticate reading or
+//! the read endpoints that list sightings back out, on creating/listing
+//! sample requests, and on rotating or revoking a host's per-agent
+//! credential. An agent's per-agent credential authenticates that one
+//! host's own writes -- it must not also authenticate reading or
 //! directing the rest of the fleet, hence the separate operator
 //! credential.
 
@@ -204,6 +205,14 @@ fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/agents/enroll", post(host::enroll))
         .route("/api/v1/agents/{host_id}/heartbeat", post(host::heartbeat))
+        .route(
+            "/api/v1/hosts/{host_id}/credential/rotate",
+            post(host::rotate_credential),
+        )
+        .route(
+            "/api/v1/hosts/{host_id}/credential/revoke",
+            post(host::revoke_credential),
+        )
         .route(
             "/api/v1/agents/{host_id}/sightings",
             post(sighting::report_sighting),

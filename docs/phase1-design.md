@@ -62,7 +62,14 @@ sequence, and why it's ordered this way:
    a self-signed or internal-CA console certificate, so a real deployment
    isn't forced to sit behind a separate TLS-terminating proxy just to
    stop shipping secrets in the clear.
-10. **Later, not started:** fleet UI, credential rotation.
+10. **PR #12 — credential rotation and revocation.** Until now, a
+    compromised or decommissioned host's per-agent credential could only
+    be invalidated by deleting its `host` row outright, discarding its
+    sighting/sample-request audit trail to do it. Two new
+    operator-credential-gated endpoints let an operator replace a host's
+    credential in place, or lock it out without issuing a new one, while
+    keeping the host's id and history intact.
+11. **Later, not started:** fleet UI.
 
 Auth before telemetry, deliberately: once YARA and sighting submission
 exist, the agent starts producing intelligence the console has to trust.
@@ -860,6 +867,145 @@ starting in some ambiguous state. The full 91-test suite (`nsic-core`,
 GitHub Actions' standard `ubuntu-latest` runner image, but not yet
 confirmed against a real CI run at the time this was written.
 
+### PR #12: credential rotation and revocation
+
+Until this PR, a compromised or decommissioned host's per-agent
+credential could only be invalidated by deleting its `host` row
+outright -- which also deletes every sighting and sample request tied to
+that host, since `sample_request.host_id` (and, transitively, sightings
+via `host_sighted_indicator`) cascade on host deletion. For a design
+whose whole premise is an evidence trail (locked architecture decision
+#3), "revoke a credential" and "destroy the audit trail" being the same
+operation was a real gap. Two new operator-credential-gated endpoints
+close it without touching that trail:
+
+- `POST /api/v1/hosts/{host_id}/credential/rotate` -- mints a fresh
+  per-agent credential the same way `enroll` does, overwrites
+  `host.credential_hash` with its hash, and returns the raw value exactly
+  once (`CredentialRotated::credential`), the identical shown-once
+  contract `EnrollResponse::credential` already has. Whatever credential
+  the host was presenting before this call, compromised or not,
+  immediately stops authenticating -- there's only ever one valid
+  credential per host at a time, so rotating *is* revoking the old one as
+  a side effect.
+- `POST /api/v1/hosts/{host_id}/credential/revoke` -- locks the host out
+  without handing back anything usable, for the case where an operator
+  wants a suspected-compromised host stopped *now* and doesn't yet want
+  to issue it a working replacement (or is decommissioning it and never
+  will).
+
+**Both reuse the enroll-vs-heartbeat sentinel trick, not a new
+mechanism.** `authenticate_host` already only ever compares a presented
+credential's hash against one stored value; there's no separate
+"is this credential revoked" flag to add or forget to check. `revoke`
+writes a fixed, non-hash-shaped sentinel string
+(`revoked-requires-credential-rotation`) into `credential_hash` --
+`hash_credential` always produces exactly 64 lowercase hex characters, so
+no real credential can ever collide with it, and every subsequent
+`authenticate_host` call for that host fails the same way a wrong
+credential always did. This is the same trick `0004_host_credential.sql`
+already used for hosts enrolled before the per-agent credential concept
+existed (`legacy-host-requires-re-enrollment`), and `rotate` treats both
+sentinels identically: `set_host_credential`'s `UPDATE` overwrites
+whatever `credential_hash` currently holds without inspecting it first,
+so rotating a legacy-sentinel host recovers it in place exactly the same
+way it recovers a revoked one -- re-enrolling under a brand-new host id
+is not the only way to give a legacy host a working credential, only the
+only way to recover its *original* enrollment record if that ever
+matters. (An earlier draft of this doc claimed re-enrollment was the
+legacy sentinel's only recovery path; that was wrong about what the code
+actually does, caught in review, and fixed here rather than by changing
+the code to match the incorrect claim -- keeping "any operator can
+recover any host in place via rotate" was judged the more useful
+behavior.) The two sentinel strings still differ so a database inspection
+of `credential_hash` can tell "never had a real credential" from
+"explicitly revoked" apart, in case that distinction matters for an
+incident writeup.
+
+**An append-only `host_credential_event` log, not a single "last
+changed" column.** An earlier draft of this PR added a nullable
+`credential_rotated_at` timestamp to `host`, overwritten by both `rotate`
+and `revoke`. Caught in review: overwriting one column on every call
+means only the *most recent* event survives -- revoke during a
+compromise, rotate during recovery, rotate again later would leave the
+database showing only the final rotation, with no record a revocation
+ever happened or when, directly undermining the audit trail this PR
+exists to preserve (locked architecture decision #3). Fixed by replacing
+that column with `host_credential_event` (`id`, `host_id`, `event_type`
+-- `'rotated'` or `'revoked'` -- `occurred_at`), an append-only table
+`set_host_credential` inserts into rather than updates, in the same
+transaction as the `credential_hash` write so the two can't drift apart
+on a crash between them. Still doesn't capture *who* triggered an event
+or *why* (per the operator-identity gap already logged above, there's no
+per-analyst identity yet to attribute it to) -- just that a specific kind
+of event happened and when, which is enough to answer "was this host
+ever revoked, and did it recover" without losing history to the next
+rotation.
+
+**Existence is checked explicitly, not inferred from `rows_affected`.**
+An `UPDATE ... WHERE id = $1` that touches zero rows can't distinguish
+"no such host" from "host exists, value happened to already be identical
+to what was written" -- the latter never actually occurs here (a fresh
+random credential or the fixed revoke sentinel are never equal to
+whatever was already stored by pure chance), but relying on that would
+be a coincidence load-bearing enough to be worth not depending on.
+`set_host_credential` (`crates/console/src/host.rs`, shared by both
+handlers) treats zero rows affected as "unknown host_id" and returns
+`404` -- the same "operator is already privileged, nothing left to hide
+by returning 401 instead" reasoning `create_sample_request` already
+established for its own unknown-`host_id` case, not the
+existence-hiding `401` agent-facing endpoints like `heartbeat` use.
+
+**`Cache-Control: no-store` on both credential-bearing responses.**
+`enroll` and `rotate` are the only two responses in this API that hand
+back a raw, usable secret; both now set `Cache-Control: no-store` so an
+intermediate cache or the calling HTTP client's own response cache can't
+retain a value that's shown exactly once and never recoverable from the
+console again. Added during review, alongside the other two fixes above,
+rather than as a separate follow-up PR -- cheap, small, and touches
+exactly the two handlers this PR already modifies.
+
+**`revoke`'s doc comment was tightened to not overclaim retroactive
+cancellation.** It now says explicitly what was previously implied
+loosely by "locks the host out immediately": revocation changes what
+`authenticate_host` accepts on *subsequent* calls, and has no effect on
+a request that already passed that check before revocation completed --
+there is no in-flight-request cancellation anywhere in this API, and the
+wording should not have suggested otherwise.
+
+**Verified against a live Postgres, and against the real binaries.** Tests
+in `crates/console/src/host.rs` cover: rotating replaces the old
+credential (old one stops authenticating a heartbeat, new one works);
+rotating twice leaves only the second credential valid; rotate/revoke
+both reject a missing operator credential, a wrong operator credential, a
+host's own per-agent credential, and an unknown `host_id`; revoking locks
+out the host's existing, otherwise-still-correct credential; revoke
+followed by rotate recovers the host with a fresh working credential,
+without re-enrolling; a cross-host test confirms rotating one host's
+credential doesn't disturb a second, unrelated host's; revoke-then-
+rotate-then-rotate leaves three separate rows in `host_credential_event`
+rather than one overwritten row (the direct regression test for the
+column-vs-log review finding above); a legacy-sentinel host recovers in
+place via `rotate` (the direct test for the recovery-path documentation
+fix above); and both `enroll` and `rotate` set `Cache-Control: no-store`.
+Full workspace suite (`nsic-core`, `console`, `agent`; 107 tests) run
+twice for rerun-safety. Also exercised against the real
+`nsic-console`/`nsic-agent` binaries: enrolled a host, revoked it and
+confirmed its original credential now gets `401`, rotated it and
+confirmed the new credential works, rotated a second time and confirmed
+all three events (`revoked`, `rotated`, `rotated`) persisted in
+`host_credential_event` with distinct timestamps in order, seeded a
+legacy-sentinel host directly via SQL and confirmed `rotate` recovers it
+in place, and confirmed `rotate`'s response carries
+`Cache-Control: no-store` over the wire.
+
+**Deliberately out of scope:** rotating `NSIC_OPERATOR_SECRET` itself
+(still a restart-with-a-new-env-var operation, see below) and any CLI
+subcommand for calling these endpoints -- consistent with every other
+operator-only action so far (creating/listing sample requests, reading
+sightings back out), which are `curl`-with-a-bearer-token only, not
+wrapped in `nsic-agent`.
+
 ## What's deliberately not here yet
 
 - **Sensor health / scan coverage.** PR #6 only sends positive sightings
@@ -901,9 +1047,6 @@ confirmed against a real CI run at the time this was written.
   certificate requirement, so it doesn't replace or strengthen the
   existing bearer-credential model, just stops those credentials
   travelling in plaintext.
-- **Credential rotation and revocation.** A compromised or decommissioned
-  host's credential can't currently be invalidated short of deleting its
-  `host` row outright. No rotation flow exists either.
 - **Rate limiting on `/api/v1/agents/enroll`.** The bootstrap secret is a
   single shared value; nothing currently throttles guesses against it.
 - **Bootstrap-secret strength enforcement.** `NSIC_ENROLLMENT_SECRET` is
@@ -934,10 +1077,14 @@ confirmed against a real CI run at the time this was written.
   short (see PR #7 above) but still no cursor to actually reach the rows
   past the cap. Fine while no fleet has produced that many sightings for
   one host or hash; not fine indefinitely.
-- **Operator-credential rotation.** Same gap as per-agent credentials
-  below, for the new `NSIC_OPERATOR_SECRET`: it's a single static value
-  with no rotation flow, and (unlike per-agent credentials) isn't even
-  hashed before comparison -- there's nothing per-row to hash it against.
+- **Operator-credential rotation.** PR #12 covers the per-agent
+  credential; `NSIC_OPERATOR_SECRET` itself still has no rotation flow.
+  It's a single static value with no per-row state to update, so
+  "rotating" it today just means changing the environment variable and
+  restarting the console -- every operator loses access simultaneously,
+  there's no staged handoff. It also isn't hashed before comparison
+  (unlike per-agent credentials) -- there's nothing per-row to hash it
+  against.
 - **Operator identity is a single shared secret, not per-user.** Every
   holder of `NSIC_OPERATOR_SECRET` looks identical to the console --
   there's no way to tell which analyst issued a given read, let alone
@@ -1006,9 +1153,19 @@ confirmed against a real CI run at the time this was written.
 
 `host` (`src-tauri/migrations/0003_hosts.sql`, amended by
 `0004_host_credential.sql`): id, hostname, os, agent_version,
-`credential_hash` (SHA-256 hex of the per-agent credential, `NOT NULL`),
-enrolled_at, last_heartbeat_at. Additive to the Phase 0 schema in
+`credential_hash` (SHA-256 hex of the per-agent credential, `NOT NULL` --
+or one of two sentinel strings that can never match a real hash, marking
+a pre-credential legacy host or an explicitly revoked one; see PR #12
+above), enrolled_at, last_heartbeat_at. Additive to the Phase 0 schema in
 `0001_init.sql` / `0002_verdict_indexes.sql`, not a redesign of it.
+
+`host_credential_event` (`src-tauri/migrations/
+0007_credential_rotation.sql`): an append-only log of `rotate`/`revoke`
+events against a host's credential, added by PR #12 specifically because
+a single overwritten column on `host` would have lost this history on
+every subsequent call (see PR #12 above). `id`, `host_id` (`ON DELETE
+CASCADE`, same tension already logged for `sample_request.host_id`
+below), `event_type` (`'rotated'` or `'revoked'`), `occurred_at`.
 
 `host_sighted_indicator` (`src-tauri/migrations/
 0005_host_sighted_indicator.sql`): the edge PR #6 adds, carrying the full
@@ -1115,13 +1272,22 @@ curl -o retrieved-sample.bin -H "Authorization: Bearer $NSIC_OPERATOR_SECRET" \
 curl -o retrieved-sample.bin -H "Authorization: Bearer $NSIC_OPERATOR_SECRET" \
   http://localhost:8787/api/v1/samples/<sha256>/content
 # -> same content, looked up by hash instead of by request
+
+curl -X POST -H "Authorization: Bearer $NSIC_OPERATOR_SECRET" \
+  http://localhost:8787/api/v1/hosts/<uuid>/credential/rotate
+# -> {"credential": "<new-token>"}  -- old credential stops working immediately
+
+curl -X POST -H "Authorization: Bearer $NSIC_OPERATOR_SECRET" \
+  http://localhost:8787/api/v1/hosts/<uuid>/credential/revoke
+# -> 200, empty body -- host locked out until an operator rotates it a new one
 ```
 
 `--enrollment-secret` and `--credential` both fall back to
 `NSIC_ENROLLMENT_SECRET` / `NSIC_AGENT_CREDENTIAL` if omitted. The
-sighting- and sample-request-list endpoints, and both download
-endpoints, have no dedicated CLI command yet -- `curl` (or any HTTP
-client) with the operator credential as a bearer token, as above.
+sighting- and sample-request-list endpoints, both download endpoints, and
+the credential rotate/revoke endpoints have no dedicated CLI command yet
+-- `curl` (or any HTTP client) with the operator credential as a bearer
+token, as above.
 
 ### Running it locally, with TLS
 
