@@ -79,7 +79,16 @@ sequence, and why it's ordered this way:
     fills a long-documented gap along the way: `GET /api/v1/hosts` and
     `GET /api/v1/hosts/{host_id}`, the "list all hosts" endpoint noted as
     missing since PR #7.
-12. **Later, not started:** plugin/scripting support (see "What's
+12. **PR #14 — sensor health / scan coverage.** A gap flagged since PR
+    #6: a sighting only ever fires on a YARA match, so zero active rules
+    and zero detections looked identical from the console's side -- a
+    host that never scanned, or whose rules directory failed to load,
+    was indistinguishable from one that scanned and genuinely found
+    nothing. `nsic-agent scan` now reports scan coverage (rule count,
+    ruleset fingerprint, match count) to the console unconditionally,
+    not only on a match, and the fleet UI surfaces it as a "never
+    scanned" / "0 rules loaded" / healthy badge per host.
+13. **Later, not started:** plugin/scripting support (see "What's
     deliberately not here yet" below for the near-term answer already
     available without building anything new).
 
@@ -1202,17 +1211,122 @@ byte-identical via `diff`; and confirmed `host_credential_event`
 accumulated both events (`rotated`, then `revoked`) in order, the same
 accumulation property PR #12 already established.
 
+### PR #14: sensor health / scan coverage
+
+Flagged as a gap since PR #6: `nsic-agent scan` only ever tells the
+console about a *match* -- `report_sightings` is a no-op when nothing
+matched, so a clean scan sends nothing at all. That made zero active
+YARA rules and zero detections look identical from the console's side:
+both are just an absence of sightings for that host. A host that never
+scanned anything, or whose rules directory failed to load (an empty or
+missing `--rules-dir`, `YaraEngine::load` degrading silently to zero
+rules per its own documented behavior), was indistinguishable from a
+genuinely clean one -- exactly the "no sightings from host H" ==
+"host H is clean" inference the fleet UI was explicitly not allowed to
+make until this landed.
+
+**A snapshot on `host`, not an append-only log.** `0008_scan_coverage.sql`
+adds four nullable columns -- `last_scan_at`, `last_scan_rule_count`,
+`last_scan_ruleset_fingerprint`, `last_scan_matched_count` -- overwritten
+unconditionally on every scan report, the same "most recent state" shape
+`last_heartbeat_at` already has, not the accumulating-history shape
+`host_credential_event` uses. The two aren't analogous: a credential
+rotation or revocation is a security-relevant event worth a durable
+record of *when it happened*, but a scan report is closer to a
+heartbeat -- "is the sensor alive and loaded with rules right now,"
+where only the latest answer matters. If scan-cadence history over time
+becomes a real need later, that's a distinct feature, not something this
+PR builds ahead of an actual use for it.
+
+**The agent sends one coverage report per scan invocation,
+unconditionally -- separate from, and in addition to, per-match sighting
+reports.** `report_scan_coverage` (`crates/agent/src/main.rs`) fires
+every time `scan` runs with console reporting configured, whether or not
+`matches` is empty; `report_sightings` is unchanged, still a no-op when
+there's nothing to report. `POST /api/v1/agents/{host_id}/scans`
+(`host::report_scan`), per-agent credential, same as heartbeat and
+sightings.
+
+**Validation reuses, rather than reimplements, the sighting endpoint's
+timestamp bounds.** `ScanReport::scanned_at` needed the identical
+"reject more than 5 minutes in the future, or before 2020-01-01" check
+`SightingRequest::observed_at` already had -- rather than a second copy
+of that logic in `host.rs`, both constants and the check itself moved
+from `sighting.rs` into a new `validate::validate_observed_at`, called
+by both `sighting::validate_sighting_request` and
+`host::validate_scan_report`. `rule_count`/`matched_count` are validated
+non-negative explicitly rather than relying on the wire type (`i32`, not
+`u32` -- chosen to match the Postgres `INTEGER` columns directly,
+avoiding a cast at the query-binding boundary), consistent with this
+codebase's posture of validating at the trust boundary rather than
+leaning on a type-level constraint alone.
+
+**Two new JSON fields, not a new endpoint, for reading it back.** Rather
+than a separate "sensor health" endpoint, the four coverage columns were
+added directly to the existing `HostView`/`GET /api/v1/hosts`/
+`GET /api/v1/hosts/{host_id}` (added one PR ago) -- the natural place an
+operator or script already looks to answer "what's this host's current
+state," not a fact that needed its own read path.
+
+**The fleet UI is where this actually pays off.** A `scan_status_badge`
+helper (`ui.rs`) renders one of three states per host: "never scanned"
+(no coverage report ever received -- `badge-err`), "0 rules loaded" (a
+report was received, but the ruleset was empty -- also `badge-err`,
+and deliberately distinguished from "never scanned" rather than lumped
+together, since a broken rules directory and a genuinely absent sensor
+call for different operator responses), or a healthy badge showing the
+last-scan time and rule count. Shown as a column on the fleet directory
+and a dedicated "Sensor" section on the host detail page (rule count,
+ruleset fingerprint, match count, last-scan time).
+
+**Verified against a live Postgres and the real binaries.** 20 new tests
+(10 in `host.rs` covering `report_scan`'s auth, validation, the
+zero-matches-still-updates-coverage case, the never-reported-means-all-
+fields-None case, and overwrite-not-accumulate semantics across two
+reports; 4 in `ui.rs` covering the three badge states and that both the
+fleet directory and host detail page surface reported coverage) --
+full workspace suite now **145 tests**, run twice for rerun-safety. Live
+end to end against the real `nsic-console`/`nsic-agent` binaries:
+enrolled a host, scanned a genuinely benign file with console reporting
+configured, and confirmed the agent printed "reported scan coverage"
+with *no* corresponding sighting -- exactly the case that used to be
+silent -- while `GET /api/v1/hosts/{host_id}` and the fleet UI both
+showed `last_scan_rule_count: 1`, `last_scan_matched_count: 0`; scanned
+an EICAR test string on the same host and confirmed both a coverage
+report and a sighting fired, and the host detail page showed both;
+enrolled a second host and scanned it with an empty rules directory,
+confirming the fleet UI showed "0 rules loaded" specifically, not "never
+scanned"; confirmed a third, freshly enrolled host with no scan yet
+showed "never scanned"; and confirmed an unauthenticated `POST .../scans`
+is rejected (`401`).
+
+**A real test-authoring pitfall, caught and fixed, not just avoided by
+luck:** the first draft of the two new fleet-UI badge tests asserted
+`!body.contains("never scanned")` against the *entire* fleet directory
+page. Since the directory lists every host in this sandbox's persistent,
+shared-across-test-runs local Postgres instance, that assertion could
+fail depending on which unrelated hosts earlier test runs happened to
+leave behind -- a different flakiness shape than the "same fixed sha256
+seed accumulates rows" issue PR #6's tests already had to account for,
+but the same root cause (a local dev database that persists across runs,
+not a fresh one per test). Fixed with `extract_host_row`, which scopes
+an assertion to the specific `<tr>` containing the host under test
+rather than the whole page.
+
 ## What's deliberately not here yet
 
-- **Sensor health / scan coverage.** PR #6 only sends positive sightings
-  -- a match. Zero active YARA rules and zero YARA detections currently
-  look identical from the console's side: both are just an absence of
-  sightings for that host. That's fine as long as nothing downstream
-  treats "no sightings from host H" as "host H is clean" -- a host that
-  never scanned anything, or whose rules failed to load, is
-  indistinguishable from a genuinely clean one today. Sensor health /
-  scan coverage reporting needs to land before a future fleet UI is
-  allowed to make that inference.
+- **Scan coverage is per-invocation, not continuous.** PR #14 makes a
+  single `nsic-agent scan` call report whether it happened and what it
+  found, but the agent is still a one-shot CLI -- there's no scheduled or
+  continuous scanning yet, so "sensor health" currently only answers "did
+  the last invocation this host was run for succeed," not "is this host
+  being scanned on any kind of cadence." That needs the agent to stop
+  being one-shot first (see below).
+- **No staleness alerting on scan coverage.** The fleet UI shows *when*
+  a host last scanned, but doesn't flag a host whose last scan is old
+  (a week ago, a month ago) as needing attention -- an operator has to
+  notice the timestamp themselves. Straightforward to add once there's a
+  concrete policy for what "stale" means for this product.
 - **Ruleset fingerprint is not yet path-separator-portable.** The
   canonical manifest in `YaraEngine::load` includes each rule file's
   relative path as raw text. On Windows that path uses `\`, on Unix `/`,
@@ -1377,12 +1491,17 @@ accumulation property PR #12 already established.
 ## Data model
 
 `host` (`src-tauri/migrations/0003_hosts.sql`, amended by
-`0004_host_credential.sql`): id, hostname, os, agent_version,
-`credential_hash` (SHA-256 hex of the per-agent credential, `NOT NULL` --
-or one of two sentinel strings that can never match a real hash, marking
-a pre-credential legacy host or an explicitly revoked one; see PR #12
-above), enrolled_at, last_heartbeat_at. Additive to the Phase 0 schema in
-`0001_init.sql` / `0002_verdict_indexes.sql`, not a redesign of it.
+`0004_host_credential.sql` and `0008_scan_coverage.sql`): id, hostname,
+os, agent_version, `credential_hash` (SHA-256 hex of the per-agent
+credential, `NOT NULL` -- or one of two sentinel strings that can never
+match a real hash, marking a pre-credential legacy host or an explicitly
+revoked one; see PR #12 above), enrolled_at, last_heartbeat_at,
+`last_scan_at`/`last_scan_rule_count`/`last_scan_ruleset_fingerprint`/
+`last_scan_matched_count` (all nullable, all `NULL` together until the
+host's agent reports its first scan; overwritten -- not accumulated --
+on every subsequent report; see PR #14 above). Additive to the Phase 0
+schema in `0001_init.sql` / `0002_verdict_indexes.sql`, not a redesign of
+it.
 
 `host_credential_event` (`src-tauri/migrations/
 0007_credential_rotation.sql`): an append-only log of `rotate`/`revoke`
@@ -1459,17 +1578,24 @@ cargo run -p agent --bin nsic-agent -- scan path/to/file --rules-dir yara-rules
 
 cargo run -p agent --bin nsic-agent -- scan path/to/file --rules-dir yara-rules \
   --console-url http://localhost:8787 --host-id <uuid> --credential <token>
-# -> (same JSON as above, then, for each match:)
+# -> (same JSON as above, then, always:)
+# -> reported scan coverage: received_at=...
+# -> (then, only if something matched:)
 # -> reported sighting: indicator_id=<uuid> rule=<rule name>
 
 curl -H "Authorization: Bearer $NSIC_OPERATOR_SECRET" \
   http://localhost:8787/api/v1/hosts
 # -> {"hosts": [{"id": "...", "hostname": "...", "os": "...",
-#     "agent_version": "...", "enrolled_at": "...", "last_heartbeat_at": "..."}],
+#     "agent_version": "...", "enrolled_at": "...", "last_heartbeat_at": "...",
+#     "last_scan_at": "...", "last_scan_rule_count": 1,
+#     "last_scan_ruleset_fingerprint": "...", "last_scan_matched_count": 0}],
 #     "truncated": false}
 curl -H "Authorization: Bearer $NSIC_OPERATOR_SECRET" \
   http://localhost:8787/api/v1/hosts/<uuid>
 # -> {"id": "...", "hostname": "...", ...}  -- same shape, one host
+# -> last_scan_at is null until the agent's first scan-coverage report;
+#    the fleet UI's "/hosts" and "/hosts/<uuid>" pages render this as a
+#    "never scanned" / "0 rules loaded" / healthy badge, see PR #14 above
 
 curl -H "Authorization: Bearer $NSIC_OPERATOR_SECRET" \
   http://localhost:8787/api/v1/hosts/<uuid>/sightings

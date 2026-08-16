@@ -9,8 +9,14 @@
 //! already logged by the console the moment an operator created it.
 //!
 //! Local YARA scanning (via `nsic-core`'s `yara-scan` feature) is real,
-//! and `scan` can optionally report what it finds to a console as
-//! sightings -- see docs/phase1-design.md for what's still not here
+//! and `scan` can optionally report to a console: one sighting per match
+//! (a no-op if nothing matched), and, unconditionally, one scan-coverage
+//! report -- rule count, ruleset fingerprint, match count, whether or not
+//! anything matched. The coverage report is what lets the console tell
+//! "this host scanned and found nothing" apart from "this host never
+//! scanned, or its rules never loaded," which a sighting alone (match-
+//! only) can't distinguish -- see docs/phase1-design.md's "sensor health"
+//! section. See docs/phase1-design.md for what's still not here
 //! (batching many files/hosts in one request, credential persistence).
 //!
 //! `--tls-ca-cert` (every subcommand that talks to a console) trusts an
@@ -26,8 +32,8 @@ use clap::{Parser, Subcommand};
 use nsic_core::hashing::{compute_hashes, hash_bytes};
 use nsic_core::proto::{
     EnrollRequest, EnrollResponse, HeartbeatRequest, HeartbeatResponse, SampleRequestFailure,
-    SampleRequestFulfilled, SampleRequestListResponse, SightingRequest, SightingResponse,
-    MAX_SAMPLE_SIZE_BYTES,
+    SampleRequestFulfilled, SampleRequestListResponse, ScanReport, ScanReportResponse,
+    SightingRequest, SightingResponse, MAX_SAMPLE_SIZE_BYTES,
 };
 use nsic_core::yara_scan::YaraEngine;
 use reqwest::Response;
@@ -184,6 +190,16 @@ async fn main() -> Result<()> {
 
             match (console_url, host_id, credential) {
                 (Some(console_url), Some(host_id), Some(credential)) => {
+                    report_scan_coverage(
+                        &console_url,
+                        host_id,
+                        &credential,
+                        engine.rule_count,
+                        &engine.ruleset_fingerprint,
+                        matches.len(),
+                        tls_ca_cert.as_deref(),
+                    )
+                    .await?;
                     report_sightings(
                         &console_url,
                         host_id,
@@ -311,6 +327,42 @@ fn build_http_client(ca_cert_path: Option<&Path>) -> Result<reqwest::Client> {
         .add_root_certificate(cert)
         .build()
         .context("building HTTP client with custom TLS CA certificate")
+}
+
+/// Reports that this scan happened, independent of whether anything
+/// matched -- the sensor-health signal `report_sightings` alone can't
+/// provide, since a sighting only ever fires on a match. Sent once per
+/// `scan` invocation, unconditionally: a zero-rule ruleset or a
+/// zero-match scan is exactly the case `report_sightings` (a no-op when
+/// `matches` is empty) would otherwise leave completely invisible to the
+/// console -- indistinguishable from this host never having scanned at
+/// all. See docs/phase1-design.md's "sensor health / scan coverage"
+/// section.
+async fn report_scan_coverage(
+    console_url: &str,
+    host_id: Uuid,
+    credential: &str,
+    rule_count: usize,
+    ruleset_fingerprint: &str,
+    matched_count: usize,
+    tls_ca_cert: Option<&Path>,
+) -> Result<()> {
+    let req = ScanReport {
+        rule_count: rule_count as i32,
+        ruleset_fingerprint: ruleset_fingerprint.to_string(),
+        matched_count: matched_count as i32,
+        scanned_at: Utc::now(),
+    };
+    let response = build_http_client(tls_ca_cert)?
+        .post(format!("{console_url}/api/v1/agents/{host_id}/scans"))
+        .bearer_auth(credential)
+        .json(&req)
+        .send()
+        .await
+        .context("reporting scan coverage")?;
+    let resp: ScanReportResponse = parse_or_report(response, "scan report").await?;
+    println!("reported scan coverage: received_at={}", resp.received_at);
+    Ok(())
 }
 
 /// Reports one sighting per YARA match found, in sequence (this PR does

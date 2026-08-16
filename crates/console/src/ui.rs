@@ -34,7 +34,9 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use maud::{html, Markup, PreEscaped, DOCTYPE};
-use nsic_core::proto::{SampleRequestCreate, SampleRequestStatus, SampleRequestView, SightingView};
+use nsic_core::proto::{
+    HostView, SampleRequestCreate, SampleRequestStatus, SampleRequestView, SightingView,
+};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -106,6 +108,7 @@ pub async fn host_directory(State(state): State<AppState>, headers: HeaderMap) -
                             th { "Agent version" }
                             th { "Enrolled" }
                             th { "Last heartbeat" }
+                            th { "Sensor" }
                         }
                     }
                     tbody {
@@ -116,6 +119,7 @@ pub async fn host_directory(State(state): State<AppState>, headers: HeaderMap) -
                                 td { (host.agent_version) }
                                 td { (format_time(host.enrolled_at)) }
                                 td { (format_optional_time(host.last_heartbeat_at)) }
+                                td { (scan_status_badge(host)) }
                             }
                         }
                     }
@@ -183,6 +187,23 @@ async fn render_host_detail(state: &AppState, host_id: Uuid, flash: Option<&str>
         }
         @if flash == Some("sample_requested") {
             div class="banner" { "Sample request created." }
+        }
+
+        section {
+            h2 { "Sensor" }
+            (scan_status_badge(&host))
+            @if let Some(last_scan_at) = host.last_scan_at {
+                p class="meta" {
+                    "last scan " (format_time(last_scan_at))
+                    " -- " (host.last_scan_rule_count.unwrap_or_default()) " rules loaded"
+                    " -- " (host.last_scan_matched_count.unwrap_or_default()) " match(es)"
+                }
+                @if let Some(fingerprint) = &host.last_scan_ruleset_fingerprint {
+                    p class="meta" { "ruleset " code { (short_hash(fingerprint)) } }
+                }
+            } @else {
+                p class="meta" { "This host has never sent a scan-coverage report -- its sensor may be inactive, or scanning was never run with console reporting configured." }
+            }
         }
 
         section {
@@ -316,6 +337,28 @@ fn status_badge(status: SampleRequestStatus) -> Markup {
         SampleRequestStatus::Failed => ("failed", "badge-err"),
     };
     html! { span class=(format!("badge {class}")) { (label) } }
+}
+
+/// The sensor-health signal this PR exists to surface: a host that's
+/// never sent a scan-coverage report, or whose most recent one loaded
+/// zero rules, looks identical to a genuinely clean host if all an
+/// operator can see is the sightings list -- this badge is what makes
+/// that distinction visible without having to cross-reference two pages.
+/// A host with no sightings *and* a healthy, recent, rule-loaded scan
+/// report is a real "nothing found," not an absent sensor.
+fn scan_status_badge(host: &HostView) -> Markup {
+    let Some(last_scan_at) = host.last_scan_at else {
+        return html! { span class="badge badge-err" { "never scanned" } };
+    };
+    if host.last_scan_rule_count == Some(0) {
+        return html! { span class="badge badge-err" { "0 rules loaded" } };
+    }
+    let rule_count = host.last_scan_rule_count.unwrap_or_default();
+    html! {
+        span class="badge badge-ok" {
+            (format_time(last_scan_at)) " (" (rule_count) " rules)"
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -693,6 +736,20 @@ mod tests {
         &rest[..end]
     }
 
+    /// The fleet directory lists every host in the (persistent, shared
+    /// across test runs against a local dev database) `host` table, not
+    /// just the one this test created -- a plain `body.contains(...)`
+    /// check against the whole page can pass or fail depending on what
+    /// unrelated hosts other tests have left behind. Scopes an assertion
+    /// to just the `<tr>` containing this host's own detail-page link.
+    fn extract_host_row(body: &str, host_id: uuid::Uuid) -> &str {
+        let marker = format!("href=\"/hosts/{host_id}\"");
+        let start = body.find(&marker).expect("host's row present in page");
+        let row_start = body[..start].rfind("<tr>").expect("row start present") + "<tr>".len();
+        let row_end = body[start..].find("</tr>").expect("row end present");
+        &body[row_start..start + row_end]
+    }
+
     #[tokio::test]
     #[ignore]
     async fn host_directory_rejects_missing_credential() {
@@ -736,6 +793,120 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_string(response).await;
         assert!(body.contains("fleet-directory-host"));
+    }
+
+    /// A freshly enrolled host has never sent a scan-coverage report --
+    /// the fleet directory must say so plainly rather than showing a
+    /// blank cell indistinguishable from a healthy host with nothing to
+    /// display yet. This is the actual sensor-health signal this feature
+    /// exists to surface.
+    #[tokio::test]
+    #[ignore]
+    async fn host_directory_flags_a_host_that_has_never_scanned() {
+        let app = crate::build_router(test_state().await);
+        enroll_named(&app, "never-scanned-host").await;
+
+        let response = app
+            .oneshot(get("/hosts".to_string(), Some(OPERATOR_SECRET)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_string(response).await;
+        assert!(body.contains("never scanned"));
+    }
+
+    /// Once a host reports scan coverage, the fleet directory and host
+    /// detail page both surface it -- rule count, ruleset fingerprint,
+    /// and match count, not just a bare timestamp.
+    #[tokio::test]
+    #[ignore]
+    async fn host_pages_show_reported_scan_coverage() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+
+        let scan = serde_json::json!({
+            "rule_count": 12,
+            "ruleset_fingerprint": format!("{:0<64}", "abc"),
+            "matched_count": 0,
+            "scanned_at": chrono::Utc::now().to_rfc3339(),
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/agents/{}/scans", enrolled.host_id))
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {}", enrolled.credential))
+                    .body(Body::from(scan.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(get("/hosts".to_string(), Some(OPERATOR_SECRET)))
+            .await
+            .unwrap();
+        let body = body_string(response).await;
+        let row = extract_host_row(&body, enrolled.host_id);
+        assert!(row.contains("12 rules"));
+        assert!(!row.contains("never scanned"));
+
+        let response = app
+            .oneshot(get(
+                format!("/hosts/{}", enrolled.host_id),
+                Some(OPERATOR_SECRET),
+            ))
+            .await
+            .unwrap();
+        let body = body_string(response).await;
+        assert!(body.contains("12 rules loaded"));
+        assert!(body.contains("0 match(es)"));
+    }
+
+    /// A host whose most recent scan loaded zero rules (a broken or
+    /// missing rules directory) is a distinct, worse condition than
+    /// "never scanned" -- the sensor ran, but has nothing to detect
+    /// with. Must be flagged separately, not lumped in with a healthy
+    /// scan.
+    #[tokio::test]
+    #[ignore]
+    async fn host_directory_flags_zero_rules_loaded_distinctly_from_never_scanned() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+
+        let scan = serde_json::json!({
+            "rule_count": 0,
+            "ruleset_fingerprint": format!("{:0<64}", "0"),
+            "matched_count": 0,
+            "scanned_at": chrono::Utc::now().to_rfc3339(),
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/agents/{}/scans", enrolled.host_id))
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {}", enrolled.credential))
+                    .body(Body::from(scan.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(get("/hosts".to_string(), Some(OPERATOR_SECRET)))
+            .await
+            .unwrap();
+        let body = body_string(response).await;
+        let row = extract_host_row(&body, enrolled.host_id);
+        assert!(row.contains("0 rules loaded"));
+        assert!(!row.contains("never scanned"));
     }
 
     /// `security_headers` is applied as a layer on the whole UI
