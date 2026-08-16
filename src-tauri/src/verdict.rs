@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 use crate::bloom::BloomState;
 use crate::db::indicators as db;
 use crate::hashing;
-use crate::models::{DetectionKind, IndicatorKind, Verdict, VerdictTier};
+use crate::models::{derive_relationships, DetectionKind, IndicatorKind, Verdict, VerdictTier};
 use crate::yara_scan::YaraEngine;
 
 /// Tracks (sha256, rule_name) pairs already persisted this session, so
@@ -64,6 +64,7 @@ pub async fn resolve(
     // is the local-miss-skips-the-round-trip path the agent model depends
     // on for instant clicks at fleet scale.
     let bloom_hit = bloom.contains(&hash.sha256).await || bloom.contains(&hash.md5).await;
+    let mut malware_family_relationships = Vec::new();
     if bloom_hit {
         let sha_rows = db::hash_matches(pool, IndicatorKind::Sha256, &hash.sha256).await?;
         entries.extend(db::hash_matches_to_provenance(
@@ -75,6 +76,15 @@ pub async fn resolve(
             md5_rows,
             VerdictTier::ExactHash,
         ));
+
+        // Malware-family attribution can only exist for a hash the bloom
+        // filter already knows about: `indicator_attributed_to_malware_family`
+        // foreign-keys onto the same `indicator` row `all_known_bad_hashes`
+        // (the bloom filter's own source) is built from. A bloom miss
+        // therefore provably means no family edge exists either, so this
+        // stays inside the same skip-the-round-trip path as the hash
+        // matches above rather than always running.
+        malware_family_relationships = db::malware_family_matches(pool, &hash.sha256).await?;
     }
 
     // Tier 3: YARA is orthogonal to known-bad hash status, always runs.
@@ -119,12 +129,22 @@ pub async fn resolve(
     // freshness context either way.
     let intel_freshness = db::all_sync_states(pool).await?;
 
+    // The RELATE-stage structured relationship view (Apollo Constitution
+    // §6): most kinds are pure-derived from the provenance entries already
+    // gathered above, but malware-family attribution has its own edge
+    // table (populated by ingestion, not derivable from provenance alone)
+    // so it needs its own query, fetched above alongside the other hash
+    // lookups.
+    let mut threat_relationships = derive_relationships(&entries);
+    threat_relationships.extend(malware_family_relationships);
+
     Ok(Verdict {
         path: path_str,
         sha256: hash.sha256,
         md5: hash.md5,
         entries,
         intel_freshness,
+        threat_relationships,
     })
 }
 
@@ -234,6 +254,101 @@ mod tests {
             "expected a YaraHit entry for the EICAR rule, got: {:?}",
             verdict.entries
         );
+
+        // PR #19: the same YARA hit must also surface as a structured
+        // Detection relationship, not just a ProvenanceEntry -- proving
+        // `derive_relationships` actually runs inside `resolve()`, not
+        // just in isolation against constructed inputs (see nsic-core's
+        // unit tests for that).
+        assert!(
+            verdict
+                .threat_relationships
+                .iter()
+                .any(|r| r.kind == crate::models::RelationshipKind::Detection
+                    && r.target == "Example_EICAR_Test_File"),
+            "expected a Detection relationship for the EICAR rule, got: {:?}",
+            verdict.threat_relationships
+        );
+    }
+
+    /// Malware-family attribution has its own edge table (not derivable
+    /// from provenance entries alone -- see `derive_relationships`'s doc
+    /// comment), so it needs its own live test proving `resolve()` and
+    /// `db::malware_family_matches` actually connect end to end. Seeds a
+    /// fresh, uniquely-named family against a freshly hashed temp file (a
+    /// new random-content file each run means a new indicator row each
+    /// run, so this can't collide with any other test or real data in
+    /// this shared sandbox database).
+    #[tokio::test]
+    #[ignore]
+    async fn malware_family_attribution_surfaces_as_a_threat_relationship() {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://nsic:nsic@localhost:5432/nsic".to_string());
+        let pool = crate::db::connect_and_migrate(&database_url)
+            .await
+            .expect("connect to test database");
+
+        let rules_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("yara-rules");
+        let yara = Arc::new(YaraEngine::load(&rules_dir).expect("load yara rules"));
+        let bloom = BloomState::empty();
+        let recent_yara_hits = RecentYaraHits::new();
+
+        let mut tmp = tempfile::NamedTempFile::new().expect("create temp file");
+        let unique_marker = uuid::Uuid::new_v4();
+        tmp.write_all(format!("malware family test content {unique_marker}").as_bytes())
+            .unwrap();
+        tmp.flush().unwrap();
+
+        let hash = crate::hashing::hash_file_cached(&pool, tmp.path())
+            .await
+            .expect("hash temp file");
+
+        let (indicator_id, _) =
+            crate::db::indicators::upsert_indicator(&pool, IndicatorKind::Sha256, &hash.sha256)
+                .await
+                .expect("seed indicator");
+        let family_name = format!("TestFamily-{unique_marker}");
+        let (family_id, _) = crate::db::indicators::upsert_malware_family(&pool, &family_name)
+            .await
+            .expect("seed malware family");
+        let now = Utc::now();
+        crate::db::indicators::upsert_indicator_attributed_to_malware_family(
+            &pool,
+            indicator_id,
+            family_id,
+            "test-source",
+            90,
+            now,
+            now,
+        )
+        .await
+        .expect("seed attribution edge");
+
+        // Malware-family attribution is gated behind the same bloom check
+        // as the other hash-match queries (see resolve()'s comment on
+        // why that's provably safe, not lossy) -- seed it directly rather
+        // than waiting for a full refresh.
+        bloom.insert(&hash.sha256).await;
+
+        let verdict = resolve(&pool, &bloom, &yara, &recent_yara_hits, tmp.path())
+            .await
+            .expect("resolve verdict");
+
+        let relationship = verdict
+            .threat_relationships
+            .iter()
+            .find(|r| r.kind == crate::models::RelationshipKind::MalwareFamily)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a MalwareFamily relationship, got: {:?}",
+                    verdict.threat_relationships
+                )
+            });
+        assert_eq!(relationship.target, family_name);
+        assert_eq!(relationship.strength, crate::models::derive_strength(90));
     }
 
     /// `intel_freshness` must reflect `feed_sync_state`, not just exist as

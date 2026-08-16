@@ -5,7 +5,8 @@ use sqlx::{PgExecutor, PgPool};
 use uuid::Uuid;
 
 use crate::models::{
-    DetectionKind, IndicatorKind, IntelSourceFreshness, ProvenanceEntry, VerdictTier,
+    derive_strength, DetectionKind, IndicatorKind, IntelSourceFreshness, ProvenanceEntry,
+    RelationshipKind, ThreatRelationship, VerdictTier,
 };
 
 /// Returns (report_id, was_inserted). was_inserted uses the `xmax = 0` trick
@@ -98,6 +99,60 @@ where
         "#,
         indicator_id,
         report_id,
+        source,
+        confidence,
+        first_seen,
+        last_seen,
+    )
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+/// Returns (malware_family_id, was_inserted).
+pub async fn upsert_malware_family<'e, E>(executor: E, name: &str) -> Result<(Uuid, bool)>
+where
+    E: PgExecutor<'e>,
+{
+    let rec = sqlx::query!(
+        r#"
+        INSERT INTO malware_family (name)
+        VALUES ($1)
+        ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+        RETURNING id, (xmax = 0) AS "inserted!"
+        "#,
+        name,
+    )
+    .fetch_one(executor)
+    .await?;
+    Ok((rec.id, rec.inserted))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_indicator_attributed_to_malware_family<'e, E>(
+    executor: E,
+    indicator_id: Uuid,
+    malware_family_id: Uuid,
+    source: &str,
+    confidence: i16,
+    first_seen: DateTime<Utc>,
+    last_seen: DateTime<Utc>,
+) -> Result<()>
+where
+    E: PgExecutor<'e>,
+{
+    sqlx::query!(
+        r#"
+        INSERT INTO indicator_attributed_to_malware_family
+            (indicator_id, malware_family_id, source, confidence, first_seen, last_seen)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (indicator_id, malware_family_id, source) DO UPDATE SET
+            confidence = EXCLUDED.confidence,
+            first_seen = LEAST(indicator_attributed_to_malware_family.first_seen, EXCLUDED.first_seen),
+            last_seen = GREATEST(indicator_attributed_to_malware_family.last_seen, EXCLUDED.last_seen)
+        "#,
+        indicator_id,
+        malware_family_id,
         source,
         confidence,
         first_seen,
@@ -433,6 +488,74 @@ pub async fn yara_matches(pool: &PgPool, sha256: &str) -> Result<Vec<ProvenanceE
             detection_name: Some(r.detection_name),
             matched_value: sha256.to_string(),
             cve_ids: r.cve_ids,
+        })
+        .collect())
+}
+
+struct MalwareFamilyMatchRow {
+    family_name: String,
+    source: String,
+    confidence: i16,
+    first_seen: DateTime<Utc>,
+    last_seen: DateTime<Utc>,
+    report_id: Option<Uuid>,
+    report_title: Option<String>,
+    report_url: Option<String>,
+}
+
+/// Malware-family attribution for this exact hash, joined to whichever
+/// report the *same* source observed it in (if any) so the relationship
+/// carries the same provenance a hash-match entry would. Not derivable
+/// from `ProvenanceEntry` the way most other relationship kinds are (see
+/// `models::derive_relationships`) -- family attribution has its own edge
+/// table, populated directly by ingestion from MalwareBazaar's `signature`
+/// and ThreatFox's `malware_printable` fields.
+pub async fn malware_family_matches(
+    pool: &PgPool,
+    sha256: &str,
+) -> Result<Vec<ThreatRelationship>> {
+    let rows = sqlx::query_as!(
+        MalwareFamilyMatchRow,
+        r#"
+        SELECT
+            mf.name AS family_name,
+            iamf.source,
+            iamf.confidence,
+            iamf.first_seen,
+            iamf.last_seen,
+            r.id AS "report_id?",
+            r.title AS report_title,
+            r.url AS report_url
+        FROM indicator i
+        JOIN indicator_attributed_to_malware_family iamf ON iamf.indicator_id = i.id
+        JOIN malware_family mf ON mf.id = iamf.malware_family_id
+        LEFT JOIN indicator_observed_in_report iorr
+            ON iorr.indicator_id = i.id AND iorr.source = iamf.source
+        LEFT JOIN report r ON r.id = iorr.report_id
+        WHERE i.kind = 'sha256' AND i.value = $1
+        "#,
+        sha256,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| ThreatRelationship {
+            kind: RelationshipKind::MalwareFamily,
+            strength: derive_strength(r.confidence),
+            target: r.family_name,
+            explanation:
+                "This file's hash is attributed to a known malware family -- look for other \
+                 variants, configs, payloads, and family-specific detections."
+                    .to_string(),
+            source: r.source,
+            confidence: r.confidence,
+            first_seen: r.first_seen,
+            last_seen: r.last_seen,
+            report_id: r.report_id,
+            report_title: r.report_title,
+            report_url: r.report_url,
         })
         .collect())
 }

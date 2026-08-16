@@ -76,24 +76,42 @@ What works today:
   rather than guessing -- see the module doc comment. Deliberately does
   not touch Postgres at all, so it keeps working even when the intel
   database is unreachable.
+- **Threat Relationship Model (PR #19).** `get_verdict` now also returns
+  `threat_relationships: ThreatRelationship[]` (`crates/nsic-core/src/models.rs`)
+  -- the Apollo Constitution &sect;6 RELATE-stage structured view, distinct
+  from `entries`' verdict-tier framing ("why did this file get flagged").
+  Every relationship carries an explicit `kind` (IOC / CVE / threat actor /
+  campaign / malware family / ATT&amp;CK technique / detection / risk-based)
+  and `strength` (direct/strong/contextual/weak -- Open &middot; 3's
+  requested vocabulary, `derive_strength`, a first HYPOTHESIS-level answer
+  banded from confidence values already in real use across the codebase,
+  not a locked one), plus an `explanation` stating what a hunt on it would
+  look for. Most relationships are pure-derived from existing provenance
+  entries (`derive_relationships`); **malware family attribution is newly
+  real data**, not just restructured existing data -- MalwareBazaar's
+  `signature` and ThreatFox's `malware_printable` fields were previously
+  only used as report title text, now upserted as their own graph node and
+  edge (`malware_family` / `indicator_attributed_to_malware_family`,
+  migration `0009`). CVE/threat-actor/campaign relationship kinds are
+  structurally supported (the graph tables already existed) but correctly
+  surface no data yet, since no ingestion populates them until later
+  hunt-pack work; ATT&amp;CK technique has no data source at all yet and is
+  declared in the vocabulary without a code path, the same precedent
+  `DetectionKind::Sigma` already sets for detection content this codebase
+  doesn't ingest either.
 
 What's stubbed or deliberately not built yet, in build order (see
 [`docs/apollo-constitution.md`](docs/apollo-constitution.md#12-current-product-build-doctrine)
 for the full sequencing rationale):
 
-- **Threat Relationship Model (PR #19).** CVE/IOC/APT/campaign/malware/
-  risk associations are not yet structured, actionable objects with an
-  explicit strength vocabulary (direct/strong/contextual/weak) -- see
-  Open &middot; 3 in the Apollo Constitution.
 - **Recursive Hunt Engine (PR #20) -- the other half of Apollo's core
   product promise.** Today's verdict engine only goes one direction: file
   in, correlation out. There is no command that goes the other way --
-  pick a CVE/IOC/APT relationship a file surfaced, and scan the chosen
-  directory scope recursively for every other file associated with it.
-  `fs_browse.rs` lists one directory level at a time; nothing walks a
-  tree looking for matches. Blocked on PR #19 existing first, per
-  the Apollo Constitution's build doctrine -- not something to build
-  ahead of the relationship model it depends on.
+  pick a relationship a file surfaced, and scan the chosen directory scope
+  recursively for every other file associated with it. `fs_browse.rs`
+  lists one directory level at a time; nothing walks a tree looking for
+  matches. The Threat Relationship Model (PR #19, done -- see "What works
+  today" above) is what a recursive hunt now has to pivot on.
 - Fuzzy hashing (imphash / TLSH / ssdeep). The indicator kind and query
   path exist; nothing computes these values yet, so tier 2 (fuzzy match)
   never fires in Phase 0.
@@ -348,9 +366,10 @@ Do not jump ahead; each phase de-risks the next.
   verdict (PR #17, done -- see "What works today" above), a File
   Intelligence Model (PR #18, done -- see "What works today" above --
   what a file is actually *for*, not just its hash/reputation), a
-  Threat Relationship Model (PR #19 -- CVE/IOC/
-  APT/campaign/malware/risk associations as structured, actionable
-  objects with an explicit strength vocabulary), a Recursive Hunt Engine
+  Threat Relationship Model (PR #19, done -- see "What works today" above
+  -- CVE/IOC/APT/campaign/malware/risk associations as structured,
+  actionable objects with an explicit strength vocabulary), a Recursive
+  Hunt Engine
   (PR #20 -- the actual missing pivot: today's verdict engine only goes
   file-in, correlation-out, never indicator-in, matching-files-out), a
   first real KEV-seeded Hunt Pack to prove the engine (PR #21), then Hunt

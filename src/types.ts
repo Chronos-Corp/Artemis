@@ -48,12 +48,71 @@ export interface IntelSourceFreshness {
   last_successful_sync_at: string | null;
 }
 
+// ---------------------------------------------------------------------
+// Threat Relationship Intelligence (Apollo Constitution §6) -- the
+// RELATE-stage structured view, distinct from ProvenanceEntry's
+// verdict-tier framing ("why did this file get flagged").
+// ---------------------------------------------------------------------
+
+export type RelationshipKind =
+  | "ioc"
+  | "cve"
+  | "threat_actor"
+  | "campaign"
+  | "malware_family"
+  | "attack_technique"
+  | "detection"
+  | "risk_based";
+
+export const RELATIONSHIP_KIND_LABELS: Record<RelationshipKind, string> = {
+  ioc: "IOC",
+  cve: "CVE",
+  threat_actor: "Threat actor",
+  campaign: "Campaign",
+  malware_family: "Malware family",
+  attack_technique: "ATT&CK technique",
+  detection: "Detection",
+  risk_based: "Risk-based",
+};
+
+export type RelationshipStrength = "direct" | "strong" | "contextual" | "weak";
+
+export const RELATIONSHIP_STRENGTH_LABELS: Record<RelationshipStrength, string> = {
+  direct: "Direct",
+  strong: "Strong",
+  contextual: "Contextual",
+  weak: "Weak",
+};
+
+// Strongest first, matching how the provenance list is already sorted.
+export const RELATIONSHIP_STRENGTH_ORDER: RelationshipStrength[] = [
+  "direct",
+  "strong",
+  "contextual",
+  "weak",
+];
+
+export interface ThreatRelationship {
+  kind: RelationshipKind;
+  strength: RelationshipStrength;
+  target: string;
+  explanation: string;
+  source: string;
+  confidence: number;
+  first_seen: string;
+  last_seen: string;
+  report_id: string | null;
+  report_title: string | null;
+  report_url: string | null;
+}
+
 export interface Verdict {
   path: string;
   sha256: string;
   md5: string;
   entries: ProvenanceEntry[];
   intel_freshness: IntelSourceFreshness[];
+  threat_relationships: ThreatRelationship[];
 }
 
 export interface SyncSummary {

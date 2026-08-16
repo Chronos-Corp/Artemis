@@ -2,6 +2,7 @@ import type { FileEntry, FileIntelligence, IntelSourceFreshness, Verdict } from 
 import { TIER_LABELS } from "../types";
 import { formatDate, formatRelativeTime } from "../format";
 import { FileIntelPanel } from "./FileIntelPanel";
+import { ThreatRelationshipList } from "./ThreatRelationshipList";
 
 interface Props {
   file: FileEntry | null;
@@ -102,6 +103,8 @@ export function VerdictPanel({
           </div>
 
           <IntelCoverage sources={verdict.intel_freshness} />
+
+          <ThreatRelationshipList relationships={verdict.threat_relationships} />
 
           {verdict.entries.length === 0 ? (
             <div className="verdict-no-match">

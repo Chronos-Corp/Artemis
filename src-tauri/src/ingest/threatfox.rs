@@ -55,7 +55,9 @@ fn resolve_indicator(ioc_type: &str, ioc: &str) -> Option<(IndicatorKind, String
 }
 
 /// Pulls recent ThreatFox IOCs and folds the ones this project's indicator
-/// model can represent (hashes, domains, IPs) into the intel graph.
+/// model can represent (hashes, domains, IPs) into the intel graph, plus a
+/// malware-family attribution edge when the IOC carries one (PR #19's
+/// Threat Relationship Model).
 pub async fn sync(pool: &PgPool, api_key: &str) -> Result<SyncSummary> {
     let client = reqwest::Client::new();
     let resp = client
@@ -130,6 +132,23 @@ pub async fn sync(pool: &PgPool, api_key: &str) -> Result<SyncSummary> {
             last_seen,
         )
         .await?;
+
+        // ThreatFox's `malware_printable` is a family/classification name,
+        // not just report display text -- previously only used as the
+        // report title. See the matching comment in malwarebazaar.rs.
+        if let Some(family_name) = &ioc.malware_printable {
+            let (family_id, _) = db::upsert_malware_family(&mut *tx, family_name).await?;
+            db::upsert_indicator_attributed_to_malware_family(
+                &mut *tx,
+                indicator_id,
+                family_id,
+                SOURCE,
+                ioc.confidence_level,
+                first_seen,
+                last_seen,
+            )
+            .await?;
+        }
     }
 
     tx.commit().await?;
