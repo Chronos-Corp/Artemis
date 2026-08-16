@@ -56,7 +56,18 @@ export function FileIntelPanel({ intel, loading, error }: Props) {
         </div>
         {identity.is_hidden && <div className="file-intel-flag">Hidden</div>}
         {identity.is_executable && <div className="file-intel-flag">Executable</div>}
+        {identity.is_symlink && <div className="file-intel-flag">Symlink</div>}
       </div>
+
+      {identity.is_symlink && (
+        <div className="file-intel-field">
+          <span className="file-intel-label">Points to</span> {identity.symlink_target}
+          <span className="file-intel-detail">
+            {" "}
+            -- authenticity below reflects this exact path, not the target
+          </span>
+        </div>
+      )}
 
       <div className={`file-intel-status ${authenticityClass(authenticity.status)}`}>
         <span className="file-intel-status-label">Authenticity:</span>{" "}
@@ -84,7 +95,11 @@ export function FileIntelPanel({ intel, loading, error }: Props) {
       </div>
 
       {local_context.similarly_named_siblings.length > 0 && (
-        <div className="file-intel-status expectedness-warn">
+        <div
+          className={`file-intel-status ${
+            expectedness.status === "unexpected" ? "expectedness-warn" : "expectedness-unknown"
+          }`}
+        >
           <span className="file-intel-status-label">Similarly named nearby:</span>{" "}
           {local_context.similarly_named_siblings.join(", ")}
         </div>

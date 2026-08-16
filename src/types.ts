@@ -86,6 +86,8 @@ export interface FileIdentity {
   extension: string | null;
   is_hidden: boolean;
   is_executable: boolean;
+  is_symlink: boolean;
+  symlink_target: string | null;
   created: string | null;
   modified: string | null;
   accessed: string | null;
@@ -102,6 +104,7 @@ export interface ProductContext {
   package: string | null;
   version: string | null;
   vendor: string | null;
+  description: string | null;
 }
 
 export type PurposeSource = "package_catalog" | "unknown";
@@ -121,6 +124,7 @@ export interface FileExpectedness {
 export interface LocalContext {
   sibling_count: number;
   similarly_named_siblings: string[];
+  available: boolean;
 }
 
 export interface FileIntelligence {

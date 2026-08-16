@@ -57,18 +57,25 @@ What works today:
 - **File Intelligence Model (PR #18).** Every selected file also gets a
   File Intelligence Object (`get_file_intelligence`, `src-tauri/src/file_intel.rs`)
   -- identity (content-sniffed file type, not just extension; hidden/
-  executable flags; timestamps), authenticity (package-manager checksum
-  verification against the file's install-time record), product context
-  (owning package/version), purpose (a summary derived from that package
-  match), expectedness (a rollup with explicit reasons, including a
-  same-directory masquerading check for near-miss filenames like
-  `svch0st.exe` beside `svchost.exe`), and local context. This answers
-  "what is this file and what's it for," independent of `get_verdict`'s
-  "is this file threat-relevant" -- see Apollo Constitution &sect;5. v1
-  package-manager support is dpkg-only (Debian/Ubuntu); other platforms
-  report authenticity as `unknown` rather than guessing -- see the module
-  doc comment. Deliberately does not touch Postgres at all, so it keeps
-  working even when the intel database is unreachable.
+  executable/symlink flags; timestamps), authenticity (package-manager
+  checksum verification against the file's install-time record, keyed to
+  the *selected* path -- a symlink never inherits its target's package
+  identity), product context (owning package/version), purpose (the
+  package's real short description when one exists, worded explicitly as
+  package-level rather than claiming Apollo identified this specific
+  file's individual role), expectedness (a rollup with explicit reasons --
+  checksum mismatch always wins; a same-directory masquerading check for
+  near-miss filenames like `svch0st.exe` beside `svchost.exe` is treated
+  as weak contextual evidence that cannot override a Verified checksum,
+  since legitimate tool families like `mount`/`umount` genuinely sit
+  within a small edit distance of each other), and local context. This
+  answers "what is this file and what's it for," independent of
+  `get_verdict`'s "is this file threat-relevant" -- see Apollo
+  Constitution &sect;5. v1 package-manager support is dpkg-only
+  (Debian/Ubuntu); other platforms report authenticity as `unknown`
+  rather than guessing -- see the module doc comment. Deliberately does
+  not touch Postgres at all, so it keeps working even when the intel
+  database is unreachable.
 
 What's stubbed or deliberately not built yet, in build order (see
 [`docs/apollo-constitution.md`](docs/apollo-constitution.md#12-current-product-build-doctrine)

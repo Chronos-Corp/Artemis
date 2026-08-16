@@ -39,6 +39,15 @@ pub struct FileIdentity {
     /// decisions" #4). A leading-dot check is meaningful on both.
     pub is_hidden: bool,
     pub is_executable: bool,
+    /// True when the selected path itself (not some ancestor directory) is
+    /// a symlink. Kept as part of Identity rather than silently resolved
+    /// away, because a symlink's own location and name are a real part of
+    /// what it is -- see `dpkg_lookup`'s doc comment for why package
+    /// ownership must never be attributed through this boundary.
+    pub is_symlink: bool,
+    /// The symlink's literal target, unresolved (i.e. exactly what
+    /// `readlink` returns), when `is_symlink` is true.
+    pub symlink_target: Option<String>,
     pub created: Option<DateTime<Utc>>,
     pub modified: Option<DateTime<Utc>>,
     pub accessed: Option<DateTime<Utc>>,
@@ -78,6 +87,13 @@ pub struct ProductContext {
     pub package: Option<String>,
     pub version: Option<String>,
     pub vendor: Option<String>,
+    /// The package's short description (dpkg's `Description` field, first
+    /// line only -- the extended multi-line body is discarded). This is
+    /// package-level ("GNU core utilities"), not necessarily specific to
+    /// this individual file's own role within the package -- `derive_purpose`
+    /// words its summary to make that distinction explicit rather than
+    /// implying Apollo identified this exact file's function.
+    pub description: Option<String>,
 }
 
 // ---------------------------------------------------------------------
@@ -130,6 +146,13 @@ pub struct LocalContext {
     /// stray characters) -- a classic masquerading signal, e.g. `svchost.exe`
     /// next to `svch0st.exe`.
     pub similarly_named_siblings: Vec<String>,
+    /// False when the parent directory could not be listed at all
+    /// (permission denied, vanished mid-scan, or has no parent). Exists so
+    /// "we could not check" stays distinguishable from "we checked and
+    /// found nothing" -- an empty `similarly_named_siblings` means
+    /// something different depending on which of those actually happened,
+    /// and `derive_expectedness` treats them differently.
+    pub available: bool,
 }
 
 // ---------------------------------------------------------------------
@@ -155,11 +178,21 @@ pub async fn resolve(path: &Path) -> Result<FileIntelligence> {
         .with_context(|| format!("stat {}", path.display()))?;
 
     let file_type = sniff_path(path).await?;
-    let identity = build_identity(path, &meta, file_type);
+    let symlink_meta = tokio::fs::symlink_metadata(path).await.ok();
+    let is_symlink = symlink_meta.is_some_and(|m| m.file_type().is_symlink());
+    let symlink_target = if is_symlink {
+        tokio::fs::read_link(path)
+            .await
+            .ok()
+            .map(|t| t.to_string_lossy().to_string())
+    } else {
+        None
+    };
+    let identity = build_identity(path, &meta, file_type, is_symlink, symlink_target);
 
     let path_owned = path.to_path_buf();
     let (authenticity, product_context) = tokio::task::spawn_blocking(move || {
-        dpkg_lookup(&path_owned).unwrap_or_else(|| {
+        dpkg_lookup(&path_owned, is_symlink).unwrap_or_else(|| {
             (
                 FileAuthenticity {
                     status: AuthenticityStatus::Unknown,
@@ -186,7 +219,13 @@ pub async fn resolve(path: &Path) -> Result<FileIntelligence> {
     })
 }
 
-fn build_identity(path: &Path, meta: &std::fs::Metadata, file_type: String) -> FileIdentity {
+fn build_identity(
+    path: &Path,
+    meta: &std::fs::Metadata,
+    file_type: String,
+    is_symlink: bool,
+    symlink_target: Option<String>,
+) -> FileIdentity {
     let extension = path.extension().map(|e| e.to_string_lossy().to_lowercase());
     let is_hidden = path
         .file_name()
@@ -208,6 +247,8 @@ fn build_identity(path: &Path, meta: &std::fs::Metadata, file_type: String) -> F
         extension,
         is_hidden,
         is_executable,
+        is_symlink,
+        symlink_target,
         created: meta.created().ok().map(Into::into),
         modified: meta.modified().ok().map(Into::into),
         accessed: meta.accessed().ok().map(Into::into),
@@ -220,7 +261,17 @@ async fn sniff_path(path: &Path) -> Result<String> {
         .await
         .with_context(|| format!("open {} for type sniffing", path.display()))?;
     let mut buf = [0u8; 512];
-    let n = file.read(&mut buf).await.unwrap_or(0);
+    // A read error is not evidence the file is empty -- propagate it
+    // rather than silently reporting "Empty file" for what might be a
+    // permission error or a mid-read I/O failure (a follow-up review
+    // caught this: the previous `.unwrap_or(0)` here made those
+    // indistinguishable). A genuinely empty file still reads `Ok(0)`
+    // without error, so `sniff_file_type(&[])` -> "Empty file" is
+    // unaffected for the real empty-file case.
+    let n = file
+        .read(&mut buf)
+        .await
+        .with_context(|| format!("read {} for type sniffing", path.display()))?;
     Ok(sniff_file_type(&buf[..n]))
 }
 
@@ -312,15 +363,44 @@ fn is_mostly_printable(bytes: &[u8]) -> bool {
 // dpkg-backed authenticity / product context
 // ---------------------------------------------------------------------
 
+/// Resolves the path to query dpkg's ownership database with, without ever
+/// resolving a symlink at the *final* path component. A symlinked *parent*
+/// directory (e.g. Ubuntu's `/bin` -> `/usr/bin`) is still safe to
+/// normalize, since dpkg's manifest stores canonical paths and that's just
+/// a different spelling of the same file, not a different file.
+///
+/// This distinction is the fix for a real bug a follow-up review caught:
+/// canonicalizing the whole path before the ownership lookup meant a
+/// symlink like `/tmp/update-service -> /usr/bin/ls` inherited coreutils'
+/// package identity and a matching checksum, reporting `Verified`/
+/// `Expected` for a path no package actually owns. `dpkg -S` on the
+/// literal symlink path correctly reports "not found" for a path like
+/// that (confirmed live in this sandbox) -- the bug was entirely in
+/// resolving the symlink away before ever asking.
+pub(crate) fn ownership_lookup_path(path: &Path, is_symlink: bool) -> PathBuf {
+    if !is_symlink {
+        return std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => {
+            std::fs::canonicalize(parent)
+                .map(|p| p.join(name))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
 /// Runs the dpkg lookup chain for one path: which package (if any) owns
-/// it, that package's version/maintainer, and whether the on-disk content
-/// still matches the checksum dpkg recorded at install time. Synchronous
-/// (spawns processes and reads files); callers run this on the blocking
-/// pool. Returns `None` if `dpkg` itself is not present on this system --
-/// distinct from `dpkg` running and reporting "not owned by any package."
-fn dpkg_lookup(path: &Path) -> Option<(FileAuthenticity, ProductContext)> {
-    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let path_str = canonical.to_string_lossy().to_string();
+/// it, that package's version/maintainer/description, and whether the
+/// on-disk content still matches the checksum dpkg recorded at install
+/// time. Synchronous (spawns processes and reads files); callers run this
+/// on the blocking pool. Returns `None` if `dpkg` itself is not present on
+/// this system -- distinct from `dpkg` running and reporting "not owned by
+/// any package."
+fn dpkg_lookup(path: &Path, is_symlink: bool) -> Option<(FileAuthenticity, ProductContext)> {
+    let lookup_path = ownership_lookup_path(path, is_symlink);
+    let path_str = lookup_path.to_string_lossy().to_string();
 
     let search = std::process::Command::new("dpkg")
         .arg("-S")
@@ -359,13 +439,28 @@ fn dpkg_lookup(path: &Path) -> Option<(FileAuthenticity, ProductContext)> {
         .map(|o| parse_dpkg_query_output(&String::from_utf8_lossy(&o.stdout)))
         .unwrap_or((None, None));
 
+    let description = std::process::Command::new("dpkg-query")
+        .arg("-W")
+        .arg("-f=${Description}\n")
+        .arg(&package)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| parse_dpkg_description(&String::from_utf8_lossy(&o.stdout)));
+
     let product_context = ProductContext {
         package: Some(package.clone()),
         version,
         vendor,
+        description,
     };
 
-    let authenticity = verify_dpkg_checksum(&package, &canonical, &path_str);
+    // Checksum verification reads the *selected* path's content -- letting
+    // a plain file read follow a symlink to its target is normal, correct
+    // I/O (this is about which bytes exist at this location, not a trust
+    // decision), whereas the ownership lookup above deliberately does not
+    // resolve a symlink at the final component.
+    let authenticity = verify_dpkg_checksum(&package, path, &path_str);
     Some((authenticity, product_context))
 }
 
@@ -395,12 +490,32 @@ fn parse_dpkg_query_output(stdout: &str) -> (Option<String>, Option<String>) {
     (version.map(str::to_string), vendor.map(str::to_string))
 }
 
+/// Parses `dpkg-query -W -f='${Description}\n' <pkg>` output. dpkg's
+/// `Description` field is multi-line -- a short summary on the first line,
+/// then an extended body with each line prefixed by a space (Debian
+/// control-file convention). Only the first line is a real short
+/// description; the rest is discarded rather than folded into a
+/// one-sentence purpose summary.
+fn parse_dpkg_description(stdout: &str) -> Option<String> {
+    let first_line = stdout.lines().next()?.trim();
+    if first_line.is_empty() {
+        None
+    } else {
+        Some(first_line.to_string())
+    }
+}
+
 /// Compares the file's current MD5 against the checksum dpkg recorded at
 /// install time in `/var/lib/dpkg/info/<pkg>.md5sums`. That file is a
 /// dpkg-maintained artifact of any Debian/Ubuntu install, so this needs no
 /// extra tooling (`debsums` is not installed in this sandbox or on
 /// `ubuntu-latest`, so this deliberately does not depend on it).
-fn verify_dpkg_checksum(package: &str, canonical_path: &Path, path_str: &str) -> FileAuthenticity {
+///
+/// `content_path` is deliberately the *selected* path (not a canonicalized
+/// one) -- reading its content follows a symlink naturally if it is one,
+/// which is correct here (this is "what bytes exist at this location,"
+/// not the ownership-attribution question `ownership_lookup_path` guards).
+fn verify_dpkg_checksum(package: &str, content_path: &Path, path_str: &str) -> FileAuthenticity {
     let candidates = [
         PathBuf::from(format!("/var/lib/dpkg/info/{package}.md5sums")),
         // Multi-arch packages are recorded as e.g. "libc6:amd64" by
@@ -433,7 +548,7 @@ fn verify_dpkg_checksum(package: &str, canonical_path: &Path, path_str: &str) ->
     };
 
     let actual = std::process::Command::new("md5sum")
-        .arg(canonical_path)
+        .arg(content_path)
         .output()
         .ok()
         .filter(|o| o.status.success())
@@ -444,8 +559,23 @@ fn verify_dpkg_checksum(package: &str, canonical_path: &Path, path_str: &str) ->
                 .map(str::to_string)
         });
 
-    match actual {
-        Some(actual_md5) if actual_md5.eq_ignore_ascii_case(&recorded_md5) => FileAuthenticity {
+    compare_checksums(package, &recorded_md5, actual.as_deref())
+}
+
+/// Decides what a recorded-vs-actual checksum comparison means. Pulled out
+/// of `verify_dpkg_checksum` as its own pure function specifically so the
+/// `Modified` (mismatch) branch can be unit-tested directly -- a follow-up
+/// review noted the previous test claiming to cover this branch didn't
+/// actually exercise it, and constructing a real mismatched dpkg
+/// environment isn't safe to do against this sandbox's actual
+/// `/var/lib/dpkg/info` (real, root-owned system state).
+fn compare_checksums(
+    package: &str,
+    recorded_md5: &str,
+    actual_md5: Option<&str>,
+) -> FileAuthenticity {
+    match actual_md5 {
+        Some(actual) if actual.eq_ignore_ascii_case(recorded_md5) => FileAuthenticity {
             status: AuthenticityStatus::Verified,
             detail: Some(format!("matches the checksum recorded by '{package}'")),
         },
@@ -482,19 +612,34 @@ fn parse_md5sums_file(contents: &str, relative_path: &str) -> Option<String> {
 // ---------------------------------------------------------------------
 
 fn derive_purpose(product_context: &ProductContext) -> FilePurpose {
-    match &product_context.package {
-        Some(package) => {
-            let version_suffix = product_context
-                .version
-                .as_deref()
-                .map(|v| format!(" ({v})"))
-                .unwrap_or_default();
-            FilePurpose {
-                summary: format!("Installed as part of the '{package}'{version_suffix} package."),
-                source: PurposeSource::PackageCatalog,
-            }
-        }
-        None => FilePurpose {
+    match (&product_context.package, &product_context.description) {
+        // A real package description is genuine purpose content (what the
+        // package normally does), not just product-context metadata --
+        // but it describes the package as a whole, not necessarily this
+        // specific file's individual role within it, so the summary says
+        // so explicitly rather than implying Apollo identified this exact
+        // file's function. A follow-up review caught the previous version
+        // of this function synthesizing a purpose-shaped sentence purely
+        // from the package *name*, with no actual description text behind
+        // it, while still claiming `PurposeSource::PackageCatalog`.
+        (Some(package), Some(description)) => FilePurpose {
+            summary: format!(
+                "Part of the '{package}' package: {description}. This describes the package \
+                 as a whole, not necessarily this specific file's individual role within it."
+            ),
+            source: PurposeSource::PackageCatalog,
+        },
+        // Package identity without a description is product context, not
+        // purpose -- there is no genuine "what does this do" content to
+        // report, so this is `Unknown`, not `PackageCatalog`.
+        (Some(package), None) => FilePurpose {
+            summary: format!(
+                "Installed as part of the '{package}' package; no package description was \
+                 available to describe its purpose."
+            ),
+            source: PurposeSource::Unknown,
+        },
+        (None, _) => FilePurpose {
             summary: "No package catalog entry matched this artifact; purpose is unknown."
                 .to_string(),
             source: PurposeSource::Unknown,
@@ -511,29 +656,49 @@ async fn build_local_context(path: &Path) -> Result<LocalContext> {
         return Ok(LocalContext {
             sibling_count: 0,
             similarly_named_siblings: Vec::new(),
+            available: false,
         });
     };
     let Some(target_name) = path.file_name().and_then(|n| n.to_str()) else {
         return Ok(LocalContext {
             sibling_count: 0,
             similarly_named_siblings: Vec::new(),
+            available: false,
         });
     };
 
+    // Distinguishes "the directory could not be listed at all" (available
+    // stays false) from "listed successfully but iteration hit a
+    // transient per-entry error partway through" (available stays true --
+    // whatever was collected before the error is still real data, unlike
+    // never having listed anything). A follow-up review noted the
+    // previous version made both of these indistinguishable from "listed
+    // successfully, found nothing."
     let mut sibling_names = Vec::new();
-    if let Ok(mut read_dir) = tokio::fs::read_dir(parent).await {
-        while let Some(entry) = read_dir.next_entry().await.unwrap_or(None) {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name != target_name {
-                sibling_names.push(name);
+    let available = match tokio::fs::read_dir(parent).await {
+        Ok(mut read_dir) => {
+            loop {
+                match read_dir.next_entry().await {
+                    Ok(Some(entry)) => {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if name != target_name {
+                            sibling_names.push(name);
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
             }
+            true
         }
-    }
+        Err(_) => false,
+    };
 
     let similarly_named_siblings = find_similarly_named(target_name, &sibling_names);
     Ok(LocalContext {
         sibling_count: sibling_names.len(),
         similarly_named_siblings,
+        available,
     })
 }
 
@@ -601,13 +766,33 @@ fn derive_expectedness(
     authenticity: &FileAuthenticity,
     local: &LocalContext,
 ) -> FileExpectedness {
+    // Checksum mismatch is the strongest, most direct negative signal
+    // available -- it always wins regardless of anything else.
+    if authenticity.status == AuthenticityStatus::Modified {
+        return FileExpectedness {
+            status: ExpectednessStatus::Unexpected,
+            reasons: vec![
+                "Content differs from the owning package's recorded checksum.".to_string(),
+            ],
+        };
+    }
+
     let mut unexpected_reasons = Vec::new();
 
-    if authenticity.status == AuthenticityStatus::Modified {
-        unexpected_reasons
-            .push("Content differs from the owning package's recorded checksum.".to_string());
-    }
-    if identity.is_executable && !local.similarly_named_siblings.is_empty() {
+    // A same-directory name-similarity match is weak, contextual evidence
+    // -- it must not override a Verified checksum, which is direct,
+    // corroborated evidence. Legitimate tool families genuinely sit within
+    // edit distance 1-2 of each other -- `mount`/`umount` and
+    // `expand`/`unexpand`, both pairs owned by the same real package,
+    // confirmed live in this sandbox -- so a review caught that the
+    // previous version of this function let that weak signal override
+    // `Verified` unconditionally. Only surface it as a reason for
+    // `Unexpected` when there is no stronger, direct evidence already
+    // saying otherwise.
+    if authenticity.status != AuthenticityStatus::Verified
+        && identity.is_executable
+        && !local.similarly_named_siblings.is_empty()
+    {
         unexpected_reasons.push(format!(
             "Filename closely resembles other files in the same directory (possible masquerading): {}.",
             local.similarly_named_siblings.join(", ")
@@ -631,11 +816,18 @@ fn derive_expectedness(
         };
     }
 
+    let mut reasons = vec![
+        "Insufficient deterministic signal to classify as expected or unexpected.".to_string(),
+    ];
+    if !local.available {
+        reasons.push(
+            "Same-directory listing was unavailable, so a masquerading check could not run."
+                .to_string(),
+        );
+    }
     FileExpectedness {
         status: ExpectednessStatus::Unknown,
-        reasons: vec![
-            "Insufficient deterministic signal to classify as expected or unexpected.".to_string(),
-        ],
+        reasons,
     }
 }
 
@@ -801,19 +993,113 @@ mod tests {
         assert_eq!(parse_md5sums_file(contents, "usr/bin/missing"), None);
     }
 
+    #[test]
+    fn parses_dpkg_description_takes_first_line_only() {
+        let stdout = "GNU core utilities\n This package contains the basic file, shell\n and text manipulation utilities.\n";
+        assert_eq!(
+            parse_dpkg_description(stdout),
+            Some("GNU core utilities".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_dpkg_description_empty_is_none() {
+        assert_eq!(parse_dpkg_description(""), None);
+        assert_eq!(parse_dpkg_description("\n"), None);
+    }
+
+    // ---- compare_checksums (the authenticity decision, isolated from any
+    // real filesystem/dpkg state -- a follow-up review noted the previous
+    // test claiming to cover the Modified branch didn't actually exercise
+    // it, and constructing a real mismatched dpkg environment isn't safe
+    // to do against this sandbox's actual /var/lib/dpkg/info) ----
+
+    #[test]
+    fn compare_checksums_matching_is_verified() {
+        let result = compare_checksums("coreutils", "abc123", Some("abc123"));
+        assert_eq!(result.status, AuthenticityStatus::Verified);
+    }
+
+    #[test]
+    fn compare_checksums_matching_is_case_insensitive() {
+        let result = compare_checksums("coreutils", "ABC123", Some("abc123"));
+        assert_eq!(result.status, AuthenticityStatus::Verified);
+    }
+
+    #[test]
+    fn compare_checksums_mismatch_is_modified() {
+        let result = compare_checksums("coreutils", "abc123", Some("def456"));
+        assert_eq!(result.status, AuthenticityStatus::Modified);
+        assert!(result.detail.unwrap().contains("coreutils"));
+    }
+
+    #[test]
+    fn compare_checksums_no_actual_checksum_is_unknown() {
+        let result = compare_checksums("coreutils", "abc123", None);
+        assert_eq!(result.status, AuthenticityStatus::Unknown);
+    }
+
+    // ---- ownership_lookup_path (the symlink-identity fix) ----
+
+    #[test]
+    fn ownership_lookup_path_resolves_a_non_symlink() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let target = dir.path().join("real-file");
+        std::fs::write(&target, b"content").unwrap();
+
+        let resolved = ownership_lookup_path(&target, false);
+        assert_eq!(resolved, std::fs::canonicalize(&target).unwrap());
+    }
+
+    #[test]
+    fn ownership_lookup_path_does_not_resolve_the_final_symlink() {
+        // This is the exact fix for the review's finding: a symlink's own
+        // path must be what gets queried against dpkg's ownership
+        // database, not wherever it happens to point.
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let link = dir.path().join("suspicious-name");
+        std::os::unix::fs::symlink("/usr/bin/ls", &link).unwrap();
+
+        let resolved = ownership_lookup_path(&link, true);
+        let fully_resolved = std::fs::canonicalize(&link).unwrap();
+
+        assert_ne!(
+            resolved, fully_resolved,
+            "must not silently resolve through to the symlink's target"
+        );
+        assert_eq!(resolved.file_name(), link.file_name());
+    }
+
     // ---- purpose / expectedness derivation ----
 
     #[test]
-    fn purpose_from_package_catalog() {
+    fn purpose_uses_real_package_description_when_available() {
         let ctx = ProductContext {
             package: Some("coreutils".to_string()),
             version: Some("9.4-2".to_string()),
             vendor: None,
+            description: Some("GNU core utilities".to_string()),
         };
         let purpose = derive_purpose(&ctx);
         assert_eq!(purpose.source, PurposeSource::PackageCatalog);
         assert!(purpose.summary.contains("coreutils"));
-        assert!(purpose.summary.contains("9.4-2"));
+        assert!(purpose.summary.contains("GNU core utilities"));
+    }
+
+    #[test]
+    fn purpose_is_unknown_when_package_found_but_no_description() {
+        // The review's finding: package identity alone (name/version) is
+        // product context, not purpose -- claiming `PackageCatalog` here
+        // without real description text would misrepresent what Apollo
+        // actually knows.
+        let ctx = ProductContext {
+            package: Some("some-pkg".to_string()),
+            version: Some("1.0".to_string()),
+            vendor: None,
+            description: None,
+        };
+        let purpose = derive_purpose(&ctx);
+        assert_eq!(purpose.source, PurposeSource::Unknown);
     }
 
     #[test]
@@ -828,9 +1114,19 @@ mod tests {
             extension: None,
             is_hidden,
             is_executable,
+            is_symlink: false,
+            symlink_target: None,
             created: None,
             modified: None,
             accessed: None,
+        }
+    }
+
+    fn local_context(similarly_named_siblings: Vec<String>) -> LocalContext {
+        LocalContext {
+            sibling_count: similarly_named_siblings.len() + 2,
+            similarly_named_siblings,
+            available: true,
         }
     }
 
@@ -840,10 +1136,7 @@ mod tests {
             status: AuthenticityStatus::Verified,
             detail: None,
         };
-        let local = LocalContext {
-            sibling_count: 3,
-            similarly_named_siblings: Vec::new(),
-        };
+        let local = local_context(Vec::new());
         let result = derive_expectedness(&identity(false, true), &authenticity, &local);
         assert_eq!(result.status, ExpectednessStatus::Expected);
     }
@@ -854,28 +1147,39 @@ mod tests {
             status: AuthenticityStatus::Modified,
             detail: None,
         };
-        let local = LocalContext {
-            sibling_count: 3,
-            similarly_named_siblings: Vec::new(),
-        };
+        let local = local_context(Vec::new());
         let result = derive_expectedness(&identity(false, true), &authenticity, &local);
         assert_eq!(result.status, ExpectednessStatus::Unexpected);
         assert!(result.reasons[0].contains("checksum"));
     }
 
     #[test]
-    fn expectedness_masquerading_sibling_is_unexpected() {
+    fn expectedness_masquerading_sibling_is_unexpected_when_unpackaged() {
         let authenticity = FileAuthenticity {
             status: AuthenticityStatus::Unpackaged,
             detail: None,
         };
-        let local = LocalContext {
-            sibling_count: 3,
-            similarly_named_siblings: vec!["svch0st.exe".to_string()],
-        };
+        let local = local_context(vec!["svch0st.exe".to_string()]);
         let result = derive_expectedness(&identity(false, true), &authenticity, &local);
         assert_eq!(result.status, ExpectednessStatus::Unexpected);
         assert!(result.reasons[0].contains("svch0st.exe"));
+    }
+
+    #[test]
+    fn expectedness_masquerading_sibling_does_not_override_verified() {
+        // The review's merge-blocking finding: a Verified checksum is
+        // direct, corroborated evidence and must not be overridden by a
+        // same-directory name-similarity match alone. Legitimate tool
+        // families (mount/umount, expand/unexpand) genuinely sit within
+        // edit distance 1-2 of each other -- see the live end-to-end
+        // version of this test below using the real pair on this sandbox.
+        let authenticity = FileAuthenticity {
+            status: AuthenticityStatus::Verified,
+            detail: None,
+        };
+        let local = local_context(vec!["umount".to_string()]);
+        let result = derive_expectedness(&identity(false, true), &authenticity, &local);
+        assert_eq!(result.status, ExpectednessStatus::Expected);
     }
 
     #[test]
@@ -884,10 +1188,22 @@ mod tests {
             status: AuthenticityStatus::Unpackaged,
             detail: None,
         };
-        let local = LocalContext {
-            sibling_count: 0,
-            similarly_named_siblings: Vec::new(),
+        let local = local_context(Vec::new());
+        let result = derive_expectedness(&identity(true, true), &authenticity, &local);
+        assert_eq!(result.status, ExpectednessStatus::Unexpected);
+    }
+
+    #[test]
+    fn expectedness_hidden_executable_still_flagged_even_when_verified() {
+        // Unlike masquerading-by-name, a hidden+executable placement
+        // anomaly is independent of content integrity -- a Verified
+        // checksum says the *bytes* are correct, not that the *location*
+        // is normal, so this reason is deliberately not suppressed.
+        let authenticity = FileAuthenticity {
+            status: AuthenticityStatus::Verified,
+            detail: None,
         };
+        let local = local_context(Vec::new());
         let result = derive_expectedness(&identity(true, true), &authenticity, &local);
         assert_eq!(result.status, ExpectednessStatus::Unexpected);
     }
@@ -900,12 +1216,25 @@ mod tests {
             status: AuthenticityStatus::Unpackaged,
             detail: None,
         };
+        let local = local_context(Vec::new());
+        let result = derive_expectedness(&identity(false, false), &authenticity, &local);
+        assert_eq!(result.status, ExpectednessStatus::Unknown);
+    }
+
+    #[test]
+    fn expectedness_notes_when_local_context_was_unavailable() {
+        let authenticity = FileAuthenticity {
+            status: AuthenticityStatus::Unpackaged,
+            detail: None,
+        };
         let local = LocalContext {
             sibling_count: 0,
             similarly_named_siblings: Vec::new(),
+            available: false,
         };
         let result = derive_expectedness(&identity(false, false), &authenticity, &local);
         assert_eq!(result.status, ExpectednessStatus::Unknown);
+        assert!(result.reasons.iter().any(|r| r.contains("unavailable")));
     }
 
     // ---- end-to-end, live against this sandbox's real dpkg state ----
@@ -923,7 +1252,13 @@ mod tests {
         assert_eq!(intel.product_context.package.as_deref(), Some("coreutils"));
         assert!(intel.product_context.version.is_some());
         assert_eq!(intel.purpose.source, PurposeSource::PackageCatalog);
+        assert!(
+            intel.purpose.summary.contains("GNU core utilities"),
+            "expected the real dpkg package description in the purpose summary, got: {}",
+            intel.purpose.summary
+        );
         assert!(intel.identity.is_executable);
+        assert!(!intel.identity.is_symlink);
         assert_eq!(intel.expectedness.status, ExpectednessStatus::Expected);
     }
 
@@ -942,22 +1277,114 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detects_a_modified_dpkg_owned_file() {
-        // Copies a real dpkg-owned binary's content into a temp file whose
-        // *name* dpkg still cannot resolve (temp files aren't package
-        // paths), so this specifically exercises `verify_dpkg_checksum`'s
-        // mismatch branch via a constructed scenario rather than the live
-        // system -- mutating a real system binary here would be both
-        // destructive and require privileges this sandbox doesn't grant.
-        // Covered directly instead: `parse_md5sums_file` returning a
-        // mismatched value is exactly what turns into `Modified`, and
-        // that parsing path is covered by `parses_md5sums_file` above.
-        // This test instead confirms the temp-file (unpackaged) path does
-        // NOT get misreported as Modified.
-        let tmp = tempfile::NamedTempFile::new().expect("create temp file");
-        std::fs::write(tmp.path(), b"not a real package file").unwrap();
-        let intel = resolve(tmp.path()).await.expect("resolve");
-        assert_ne!(intel.authenticity.status, AuthenticityStatus::Modified);
+    async fn a_verified_pair_of_legitimately_similar_names_is_expected_not_unexpected() {
+        // The review's merge-blocking finding, reproduced end-to-end
+        // against this sandbox's real dpkg state rather than only a
+        // constructed unit test: /usr/bin/mount and /usr/bin/umount are
+        // edit-distance 1 apart, both executable, and both genuinely owned
+        // (with matching checksums) by the same real "mount" package.
+        // Before the fix, resolving either one reported `Unexpected`
+        // purely because of the other's presence as a sibling, even
+        // though the checksum was already Verified.
+        let mount_owner = dpkg_query_owner("/usr/bin/mount");
+        let umount_owner = dpkg_query_owner("/usr/bin/umount");
+        if mount_owner.is_none() || umount_owner.is_none() || mount_owner != umount_owner {
+            eprintln!("skipping: /usr/bin/mount and /usr/bin/umount are not both dpkg-owned by the same package on this system");
+            return;
+        }
+
+        let intel = resolve(Path::new("/usr/bin/mount"))
+            .await
+            .expect("resolve file intelligence for /usr/bin/mount");
+
+        assert_eq!(intel.authenticity.status, AuthenticityStatus::Verified);
+        assert!(
+            intel
+                .local_context
+                .similarly_named_siblings
+                .contains(&"umount".to_string()),
+            "expected 'umount' to be flagged as a similarly named sibling by local_context \
+             (this test's premise), got: {:?}",
+            intel.local_context.similarly_named_siblings
+        );
+        assert_eq!(
+            intel.expectedness.status,
+            ExpectednessStatus::Expected,
+            "a Verified checksum must not be overridden by a same-package sibling's \
+             similar name, got reasons: {:?}",
+            intel.expectedness.reasons
+        );
+    }
+
+    /// Test-only helper mirroring the ownership half of `dpkg_lookup`,
+    /// used only to confirm the live-system premise of the test above
+    /// (that mount/umount are actually owned by the same package on
+    /// *this* machine) without duplicating production assertions into
+    /// the test itself.
+    fn dpkg_query_owner(path: &str) -> Option<String> {
+        let output = std::process::Command::new("dpkg")
+            .arg("-S")
+            .arg(path)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        parse_dpkg_search_output(&String::from_utf8_lossy(&output.stdout), path)
+    }
+
+    #[tokio::test]
+    async fn a_symlink_to_a_packaged_binary_does_not_inherit_its_package_identity() {
+        // The review's other merge-blocking finding, reproduced live: a
+        // symlink whose target is package-owned must not itself be
+        // reported as package-owned/Verified/Expected purely because its
+        // target is. Before the fix, canonicalizing the path before the
+        // dpkg lookup made a symlink like this indistinguishable from the
+        // real /usr/bin/ls for ownership-attribution purposes.
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let link = dir.path().join("update-service");
+        std::os::unix::fs::symlink("/usr/bin/ls", &link).unwrap();
+
+        let intel = resolve(&link)
+            .await
+            .expect("resolve file intelligence for the symlink");
+
+        assert!(intel.identity.is_symlink);
+        assert_eq!(
+            intel.identity.symlink_target.as_deref(),
+            Some("/usr/bin/ls")
+        );
+        assert_eq!(
+            intel.authenticity.status,
+            AuthenticityStatus::Unpackaged,
+            "a symlink must not inherit its target's package identity"
+        );
+        assert!(intel.product_context.package.is_none());
+    }
+
+    #[tokio::test]
+    async fn local_context_reports_unavailable_when_the_directory_cannot_be_listed() {
+        let unreachable = Path::new("/nonexistent-dir-xyz-apollo-test/somefile");
+        let local = build_local_context(unreachable)
+            .await
+            .expect("build_local_context itself should not error");
+        assert!(!local.available);
+        assert_eq!(local.sibling_count, 0);
+    }
+
+    #[tokio::test]
+    async fn sniff_path_propagates_a_real_read_error_instead_of_reporting_empty() {
+        // Reading a directory as a file is a genuine, portable way to
+        // trigger an I/O read error (EISDIR) without needing permission
+        // tricks that root would bypass anyway in this sandbox. Before
+        // the fix, `sniff_path`'s `.unwrap_or(0)` turned this into a
+        // silent "Empty file" instead of surfacing the failure.
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let err = sniff_path(dir.path()).await.unwrap_err();
+        assert!(
+            !err.to_string().is_empty(),
+            "expected a real error, not a swallowed one"
+        );
     }
 
     #[tokio::test]
