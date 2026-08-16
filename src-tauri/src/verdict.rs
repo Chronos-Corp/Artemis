@@ -176,6 +176,22 @@ mod tests {
     use crate::yara_scan::YaraEngine;
     use std::io::Write;
 
+    /// Guards every test that mutates `feed_sync_state` rows for real
+    /// configured sources (`malwarebazaar`, `threatfox`). Rust runs `#[test]`
+    /// functions concurrently by default, and two such tests racing on the
+    /// same primary key is a real, reproduced bug: on a fresh database (no
+    /// prior row for a source), one test's capture-then-restore cleanup
+    /// deletes that source's row to put it back the way it found it, which
+    /// can land mid-flight through a sibling test that also depends on that
+    /// row being present. Reproduced locally by clearing `malwarebazaar`'s
+    /// row and looping `cargo test`, which flaked exactly like CI did on
+    /// `307ae09`. A lock scoped to this module only (not a process-wide
+    /// `--test-threads=1`) keeps the rest of the suite parallel.
+    fn feed_sync_state_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
     /// End-to-end smoke test of the click-a-file pipeline: hash, YARA scan,
     /// DB persistence of the hit, and provenance query all in one path.
     /// Requires a live Postgres reachable at DATABASE_URL (see
@@ -237,6 +253,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn intel_freshness_reflects_feed_sync_state() {
+        let _guard = feed_sync_state_lock().lock().await;
         let database_url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgres://nsic:nsic@localhost:5432/nsic".to_string());
         let pool = crate::db::connect_and_migrate(&database_url)
@@ -354,6 +371,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn intel_freshness_includes_a_never_synced_configured_source() {
+        let _guard = feed_sync_state_lock().lock().await;
         let database_url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgres://nsic:nsic@localhost:5432/nsic".to_string());
         let pool = crate::db::connect_and_migrate(&database_url)
