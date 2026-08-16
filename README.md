@@ -1,13 +1,27 @@
 # 4NSIC
 
-DFIR triage and threat hunting tool. An analyst-facing correlation layer that
-sits alongside existing EDR, not a replacement for it.
+DFIR triage and threat hunting tool -- codenamed **Apollo**, the first
+committed product of the Chronos Corp portfolio thesis. See
+[`docs/apollo-constitution.md`](docs/apollo-constitution.md) for the
+product-level source of truth on what Apollo is, what it isn't, and what's
+still genuinely open (and
+[`docs/chronos-constitution.md`](docs/chronos-constitution.md) for the
+company-level thesis it sits under); this README covers the technical
+state of the repo, kept consistent with those documents rather than
+repeating them. "4NSIC" is this repo's working name and shows up in the
+crate names (`nsic-core`/`nsic-agent`/`nsic-console`); "Apollo" is the
+product name.
 
-Core idea: a file manager where selecting a file surfaces everything known
-about it (IOC verdicts, campaign attribution, related CVEs, detection
-provenance). EDR tells you a file is bad. 4NSIC tells you which campaign it
-belongs to, which CVE it relates to, and what else on the host clusters
-with it.
+**Apollo's non-negotiable product promise:** selecting a file should
+progressively answer what it is, what it's for, whether it's expected here,
+and whether it's related to known IOCs, CVEs, APTs, campaigns, malware, or
+other risk-based threats. Selecting one of those relationships should let
+an analyst hunt the chosen recursive scope for associated evidence, then
+see what the combined evidence means. File &rarr; understand &rarr; relate
+&rarr; pivot &rarr; hunt &rarr; explain. An analyst-facing correlation
+layer that sits alongside existing EDR, not a replacement for it -- EDR
+tells you a file is bad, Apollo tells you which campaign it belongs to,
+which CVE it relates to, and what else on the host clusters with it.
 
 ## Current phase: Phase 0, with Phase 1 scaffolding underway
 
@@ -27,7 +41,13 @@ What works today:
 - Verdict engine: hashes the file (cached by path + size + mtime), checks a
   local bloom filter of known-bad hashes, runs a local YARA pass, and checks
   path-pattern and contextual signals. Every match is returned with its
-  tier, source, and confidence; nothing collapses to a boolean.
+  tier, source, and confidence; nothing collapses to a boolean. Every
+  verdict also carries per-source intel freshness (`last_successful_sync_at`
+  for each configured feed), so an empty result is distinguishable from "no
+  intel source has synced recently enough to trust this" -- an absence of
+  matches against an 11-day-stale feed is not the same fact as an absence
+  of matches against a feed that synced 18 minutes ago, and the UI now
+  shows the difference instead of only hedging about it in prose.
 - Intel graph in Postgres: Indicator / Report / CVE / Actor / Detection
   nodes with source, confidence, and first/last-seen on the edges, so the
   same hash arriving from multiple feeds with different confidence is
@@ -35,8 +55,29 @@ What works today:
 - Feed ingestion: MalwareBazaar and ThreatFox recent submissions, folded
   into the graph with provenance back to the source report.
 
-What's stubbed or deliberately not built yet:
+What's stubbed or deliberately not built yet, in build order (see
+[`docs/apollo-constitution.md`](docs/apollo-constitution.md#12-current-product-build-doctrine)
+for the full sequencing rationale):
 
+- **File Intelligence Model (PR #18).** The verdict engine answers "is
+  this file threat-relevant," never "what is this file, in general, and
+  what's it for" (a legitimate system binary vs. an unknown one). Nothing
+  here yet -- no identity/authenticity/product-context/purpose/
+  expectedness object exists. See Open &middot; 1 and &middot; 2 in the
+  Apollo Constitution.
+- **Threat Relationship Model (PR #19).** CVE/IOC/APT/campaign/malware/
+  risk associations are not yet structured, actionable objects with an
+  explicit strength vocabulary (direct/strong/contextual/weak) -- see
+  Open &middot; 3 in the Apollo Constitution.
+- **Recursive Hunt Engine (PR #20) -- the other half of Apollo's core
+  product promise.** Today's verdict engine only goes one direction: file
+  in, correlation out. There is no command that goes the other way --
+  pick a CVE/IOC/APT relationship a file surfaced, and scan the chosen
+  directory scope recursively for every other file associated with it.
+  `fs_browse.rs` lists one directory level at a time; nothing walks a
+  tree looking for matches. Blocked on PR #18/#19 existing first, per
+  the Apollo Constitution's build doctrine -- not something to build
+  ahead of the file/relationship models it depends on.
 - Fuzzy hashing (imphash / TLSH / ssdeep). The indicator kind and query
   path exist; nothing computes these values yet, so tier 2 (fuzzy match)
   never fires in Phase 0.
@@ -226,14 +267,23 @@ Redistributable: abuse.ch feeds, CISA KEV, NVD, MISP communities.
 competing product). Nothing in this repo integrates VirusTotal. Confirm
 redistribution rights before architecting around any new feed.
 
-## CVE hunting: hunt packs (Phase 2, not yet built)
+## CVE hunting: hunt packs (PR #21, not yet built)
 
-There is no authoritative CVE-to-IOC feed; that mapping has to be curated,
-and it is the product's actual moat. A hunt pack will be a per-CVE bundle
-(YARA rules, Sigma rules, file path and name patterns, registry keys,
-version checks), every element carrying provenance to the advisory or
-report it came from, ingested through an analyst review queue and never
-auto-published. Seed corpus: the CISA KEV list.
+There is no authoritative CVE-to-IOC feed; that mapping has to be curated.
+Curated relationship knowledge is a durable moat, but hunt packs
+themselves are machinery, not the product -- see
+[`docs/apollo-constitution.md`](docs/apollo-constitution.md#7-recursive-hunting-and-hunt-packs).
+What Apollo actually sells is the file &rarr; understand &rarr; relate
+&rarr; pivot &rarr; hunt &rarr; explain loop; a hunt pack is one mechanism
+that feeds the pivot/hunt steps by turning a threat concept into an
+executable hunt. A hunt pack will be a per-CVE bundle (YARA rules, Sigma
+rules, file path and name patterns, registry keys, version checks), every
+element carrying provenance to the advisory or report it came from,
+ingested through an analyst review queue and never auto-published. Seed
+corpus: the CISA KEV list. Sequenced as PR #21, after the File Intelligence
+Model, Threat Relationship Model, and Recursive Hunt Engine it depends on
+-- a hunt pack needs a hunt engine to prove itself against, not the other
+way around.
 
 ## Build order
 
@@ -242,28 +292,65 @@ Do not jump ahead; each phase de-risks the next.
 - **Phase 0 (current):** this repo. Single-machine desktop app proving the
   file-manager-with-verdicts UX. Success criteria: an IR analyst uses it on
   a real case and wants it again.
-- **Phase 1 (in progress):** Agent plus console. File-to-IOC across a
-  fleet. Sample retrieval. Landed so far: `crates/nsic-core` (shared
+- **Phase 1 (fleet substrate, frozen for now):** Agent plus console.
+  File-to-IOC across a fleet. Sample retrieval. `crates/nsic-core` (shared
   hashing, YARA scanning, and intel-graph types, extracted out of
   `src-tauri`), `crates/agent` (a CLI that can hash a file, run a local
   YARA scan, enroll/heartbeat against a console, report scan matches as
-  sightings, and fulfill an operator's sample-retrieval requests),
-  `crates/console` (an HTTP service, `/api/v1`, recording
-  enrollment/heartbeats/sightings/sample requests in the same Postgres
-  intel graph, reading sightings and sample-request status back out by
-  host or by hash, and downloading a retrieved sample's actual content
-  either by request or by hash). Enrollment requires a console-operator
-  bootstrap secret; each enrolled host gets its own credential for
-  authenticated heartbeats, sighting submission, and sample-request
-  polling/fulfillment; a third, separate console-operator credential
-  gates reading sightings and sample data back out and creating sample
-  requests. No fleet UI yet -- see
+  sightings and per-invocation scan coverage, and fulfill an operator's
+  sample-retrieval requests), `crates/console` (an HTTP service and
+  server-rendered fleet UI, `/api/v1`, recording
+  enrollment/heartbeats/sightings/sample requests/scan coverage in the
+  same Postgres intel graph; per-agent credentials with operator-driven
+  rotation and revocation; reading sightings, sample-request status, and
+  fleet-wide host/sensor-health state back out; downloading a retrieved
+  sample's actual content). See
   [`docs/phase1-design.md`](docs/phase1-design.md) for exactly what's
-  covered and what's deliberately deferred.
-- **Phase 2:** CVE hunt packs, KEV first.
-- **Phase 3:** Folder correlation scoring. Must come after Phase 1 because
-  the scoring model cannot be tuned without real telemetry; building it
-  early ships a false-positive generator.
+  covered and what's deliberately deferred. This is enough infrastructure
+  to prove the agent architecture works; further fleet-administration
+  expansion (scheduling, richer deployment management, and the like) is
+  deliberately paused here rather than continued out of momentum -- see
+  the roadmap correction below.
+- **Roadmap correction (current focus, superseded by
+  [`docs/apollo-constitution.md`](docs/apollo-constitution.md#12-current-product-build-doctrine)
+  -- read that first if this bullet and that document ever disagree):**
+  an external review of the codebase pointed out that Phase 1 is the
+  harder commercial sell -- "please deploy another endpoint agent" --
+  while nothing on the intelligence/hunting path had been built yet.
+  Endpoint fleet management is real, useful infrastructure, but it isn't
+  the wedge. Two earlier passes at this correction each over-rotated:
+  the first toward hunt packs specifically (corrected -- hunt packs are
+  machinery, not the product); the second toward "agentless-first"
+  specifically, which the Apollo Constitution demotes from a decided
+  strategy to an open question -- external EDR/SIEM integration may
+  reduce adoption friction later, but it should not redefine Apollo's
+  actual CORE wedge, which is the *local, single-machine* filesystem
+  experience. Apollo Sensor (the existing agent) is a PROVEN FOUNDATION
+  backend, not a rejected one; EDR/SIEM connectors are just an OPEN/LATER
+  alternative backend, decided by customer evidence, not by assumption.
+  Current build sequence, in order: intel freshness surfaced on every
+  verdict (PR #17, done -- see "What works today" above), a File
+  Intelligence Model (PR #18 -- what a file is actually *for*, not just
+  its hash/reputation), a Threat Relationship Model (PR #19 -- CVE/IOC/
+  APT/campaign/malware/risk associations as structured, actionable
+  objects with an explicit strength vocabulary), a Recursive Hunt Engine
+  (PR #20 -- the actual missing pivot: today's verdict engine only goes
+  file-in, correlation-out, never indicator-in, matching-files-out), a
+  first real KEV-seeded Hunt Pack to prove the engine (PR #21), then Hunt
+  Scope Expansion from subtree to drive/host, still entirely local (PR
+  #22). Remote/fleet/external-execution backends (an adapter boundary,
+  agentless hunt execution, evidence-graph normalization across sources)
+  are explicitly **Later**, undecided in shape, and deliberately not
+  sequenced as near-term numbered work -- they scale the same hunt model
+  only after the local product thesis is proven, per Expansion Gate 7.
+  The endpoint agent remains infrastructure either way, not the
+  definition of Apollo -- the intel graph, provenance model, verdict
+  engine, and console APIs all survive this sequencing change unchanged.
+- **Phase 2:** CVE hunt packs, KEV first -- see the roadmap correction
+  above for sequencing relative to the core interaction loop.
+- **Phase 3:** Folder correlation scoring. Must come after real hunt/fleet
+  telemetry exists because the scoring model cannot be tuned without it;
+  building it early ships a false-positive generator.
 - **Phase 4:** Change history and timeline, from the USN Journal, $MFT
   ($STANDARD_INFO vs $FILE_NAME to detect timestomping), VSS, Prefetch, and
   Amcache. This is timeline reconstruction with gaps, not true versioning;

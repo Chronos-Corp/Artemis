@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT source, last_synced_at FROM feed_sync_state ORDER BY source",
+  "query": "SELECT source, last_synced_at FROM feed_sync_state",
   "describe": {
     "columns": [
       {
@@ -22,5 +22,5 @@
       true
     ]
   },
-  "hash": "15728de5cef89ec9168cc862f5b5e4f1f24c459bf8029c7105a2392aa8ef3228"
+  "hash": "56588f5c1b8c3fd28237209405b4fa11d29a0699719d88af1be7cb4c708e754e"
 }

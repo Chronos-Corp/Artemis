@@ -8,7 +8,7 @@ import type {
   DbStatus,
   FeedSyncResult,
   FileEntry,
-  SyncState,
+  IntelSourceFreshness,
   Verdict,
   YaraStatus,
 } from "./types";
@@ -27,7 +27,7 @@ function App() {
 
   const [dbStatus, setDbStatus] = useState<DbStatus | null>(null);
   const [yaraStatus, setYaraStatus] = useState<YaraStatus | null>(null);
-  const [syncStates, setSyncStates] = useState<SyncState[]>([]);
+  const [syncStates, setSyncStates] = useState<IntelSourceFreshness[]>([]);
   const [syncing, setSyncing] = useState(false);
   const [lastSyncResults, setLastSyncResults] = useState<FeedSyncResult[] | null>(null);
 
@@ -35,7 +35,7 @@ function App() {
     const [db, yara, sync] = await Promise.all([
       invoke<DbStatus>("db_status"),
       invoke<YaraStatus>("yara_status"),
-      invoke<SyncState[]>("feed_sync_status").catch(() => []),
+      invoke<IntelSourceFreshness[]>("feed_sync_status").catch(() => []),
     ]);
     setDbStatus(db);
     setYaraStatus(yara);

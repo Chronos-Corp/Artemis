@@ -8,7 +8,7 @@ use crate::db::indicators as db;
 use crate::ingest::parse_abusech_time;
 use crate::models::{IndicatorKind, SyncSummary};
 
-const SOURCE: &str = "threatfox";
+pub(crate) const SOURCE: &str = "threatfox";
 const API_URL: &str = "https://threatfox-api.abuse.ch/api/v1/";
 
 #[derive(Debug, Deserialize)]

@@ -220,12 +220,61 @@ body {
   color: #777;
 }
 
-.verdict-clean {
+.verdict-no-match {
   font-size: 0.85rem;
   color: #146c3f;
   background: #d9f2e3;
   padding: 0.6rem 0.75rem;
   border-radius: 6px;
+}
+
+.intel-coverage {
+  font-size: 0.8rem;
+  margin-bottom: 1rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+  background: #f3f3f3;
+}
+
+.intel-coverage-empty {
+  font-size: 0.85rem;
+  color: #666;
+  background: #f3f3f3;
+  padding: 0.6rem 0.75rem;
+  border-radius: 6px;
+  margin-bottom: 1rem;
+}
+
+.intel-coverage-label {
+  font-weight: 600;
+  color: #555;
+  margin-bottom: 0.25rem;
+}
+
+.intel-coverage ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.intel-source-icon {
+  display: inline-block;
+  width: 1rem;
+}
+
+.intel-source-ok {
+  color: #146c3f;
+}
+
+.intel-source-warn {
+  color: #8a5a00;
+}
+
+.intel-source-err {
+  color: #9c2b2b;
 }
 
 .provenance-list {
@@ -380,9 +429,30 @@ button:disabled {
     color: #999;
   }
 
-  .verdict-clean {
+  .verdict-no-match {
     background: #1e3d2b;
     color: #7fd8a4;
+  }
+
+  .intel-coverage,
+  .intel-coverage-empty {
+    background: #262626;
+  }
+
+  .intel-coverage-label {
+    color: #aaa;
+  }
+
+  .intel-source-ok {
+    color: #7fd8a4;
+  }
+
+  .intel-source-warn {
+    color: #e3b96a;
+  }
+
+  .intel-source-err {
+    color: #e39a9a;
   }
 
   .provenance-entry {

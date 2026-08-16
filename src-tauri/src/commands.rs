@@ -109,7 +109,7 @@ pub fn db_status(state: State<'_, AppState>) -> DbStatus {
 #[tauri::command]
 pub async fn feed_sync_status(
     state: State<'_, AppState>,
-) -> Result<Vec<crate::db::indicators::SyncState>, String> {
+) -> Result<Vec<crate::models::IntelSourceFreshness>, String> {
     let pool = state.pool.as_ref().ok_or_else(db_unavailable)?;
     crate::db::indicators::all_sync_states(pool)
         .await

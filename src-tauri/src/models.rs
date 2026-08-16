@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 /// so the Phase 1 agent/console can share the same intel-graph vocabulary
 /// without depending on the desktop app. Re-exported here so existing
 /// `crate::models::X` call sites in this crate are unaffected.
-pub use nsic_core::models::{DetectionKind, IndicatorKind, ProvenanceEntry, Verdict, VerdictTier};
+pub use nsic_core::models::{
+    DetectionKind, IndicatorKind, IntelSourceFreshness, ProvenanceEntry, Verdict, VerdictTier,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEntry {

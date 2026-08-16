@@ -43,11 +43,17 @@ export interface ProvenanceEntry {
   cve_ids: string[];
 }
 
+export interface IntelSourceFreshness {
+  source: string;
+  last_successful_sync_at: string | null;
+}
+
 export interface Verdict {
   path: string;
   sha256: string;
   md5: string;
   entries: ProvenanceEntry[];
+  intel_freshness: IntelSourceFreshness[];
 }
 
 export interface SyncSummary {
@@ -72,9 +78,4 @@ export interface YaraStatus {
 
 export interface DbStatus {
   connected: boolean;
-}
-
-export interface SyncState {
-  source: string;
-  last_synced_at: string | null;
 }
