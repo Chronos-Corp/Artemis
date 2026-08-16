@@ -37,6 +37,20 @@ pub async fn get_verdict(state: State<'_, AppState>, path: String) -> Result<Ver
     .map_err(|e| e.to_string())
 }
 
+/// FILE/UNDERSTAND-stage intelligence, independent of `get_verdict`'s
+/// RELATE-stage (threat-intel graph) lookup -- see `file_intel`'s module
+/// doc comment. Does not take `state` at all, deliberately: this command
+/// works even when `state.pool` is `None` (database unreachable), since
+/// it never touches Postgres.
+#[tauri::command]
+pub async fn get_file_intelligence(
+    path: String,
+) -> Result<crate::file_intel::FileIntelligence, String> {
+    crate::file_intel::resolve(std::path::Path::new(&path))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[derive(Debug, Serialize)]
 pub struct FeedSyncResult {
     pub source: String,

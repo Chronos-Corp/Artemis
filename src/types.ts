@@ -76,6 +76,62 @@ export interface YaraStatus {
   rule_count: number;
 }
 
+// ---------------------------------------------------------------------
+// File Intelligence Model (Apollo Constitution §5) -- the FILE/UNDERSTAND
+// stages, independent of `Verdict`'s RELATE-stage threat-intel lookup.
+// ---------------------------------------------------------------------
+
+export interface FileIdentity {
+  file_type: string;
+  extension: string | null;
+  is_hidden: boolean;
+  is_executable: boolean;
+  created: string | null;
+  modified: string | null;
+  accessed: string | null;
+}
+
+export type AuthenticityStatus = "verified" | "modified" | "unpackaged" | "unknown";
+
+export interface FileAuthenticity {
+  status: AuthenticityStatus;
+  detail: string | null;
+}
+
+export interface ProductContext {
+  package: string | null;
+  version: string | null;
+  vendor: string | null;
+}
+
+export type PurposeSource = "package_catalog" | "unknown";
+
+export interface FilePurpose {
+  summary: string;
+  source: PurposeSource;
+}
+
+export type ExpectednessStatus = "expected" | "unexpected" | "unknown";
+
+export interface FileExpectedness {
+  status: ExpectednessStatus;
+  reasons: string[];
+}
+
+export interface LocalContext {
+  sibling_count: number;
+  similarly_named_siblings: string[];
+}
+
+export interface FileIntelligence {
+  identity: FileIdentity;
+  authenticity: FileAuthenticity;
+  product_context: ProductContext;
+  purpose: FilePurpose;
+  expectedness: FileExpectedness;
+  local_context: LocalContext;
+}
+
 export interface DbStatus {
   connected: boolean;
 }
