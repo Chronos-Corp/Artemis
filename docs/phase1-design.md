@@ -88,7 +88,14 @@ sequence, and why it's ordered this way:
     ruleset fingerprint, match count) to the console unconditionally,
     not only on a match, and the fleet UI surfaces it as a "never
     scanned" / "0 rules loaded" / healthy badge per host.
-13. **Later, not started:** plugin/scripting support (see "What's
+13. **PR #15 — scan staleness alerting.** The follow-on gap PR #14 itself
+    named: the fleet UI showed *when* a host last scanned but never
+    flagged an old one as needing attention, so an operator still had to
+    notice every timestamp themselves. `HostView::scan_stale`, computed
+    at read time against a configurable threshold
+    (`NSIC_SCAN_STALENESS_HOURS`, default 24h), adds a fourth badge state
+    -- "stale" -- to the three PR #14 introduced.
+14. **Later, not started:** plugin/scripting support (see "What's
     deliberately not here yet" below for the near-term answer already
     available without building anything new).
 
@@ -1394,6 +1401,69 @@ Full workspace suite after this round: **147 tests** (145 from the
 original PR, plus the two new regression tests above), run twice for
 rerun-safety.
 
+### PR #15: scan staleness alerting
+
+The follow-on gap PR #14 itself named in its own "what's deliberately not
+here yet" list: the fleet UI showed *when* a host last scanned, but never
+flagged a host whose last scan was old (a week ago, a month ago) as
+needing attention -- an operator had to notice the timestamp themselves.
+
+**Computed at read time, not a new column.** `HostView::scan_stale`
+(`nsic_core::proto`) is `true` when `last_scan_at` is older than
+`AppState::scan_staleness_threshold`, computed fresh against `Utc::now()`
+inside `host::host_view_from_row` on every `fetch_all_hosts`/`fetch_host`
+call -- no migration, no schema change. A snapshot column would have gone
+stale itself the moment enough wall-clock time passed without a write to
+refresh it, which would defeat the entire point of a staleness signal;
+recomputing on read is the only version of this that stays honest without
+a background job. `false` when `last_scan_at` is `None`: "never scanned"
+is already its own, worse condition, not a special case of "stale."
+
+**Threshold is configurable, with a documented-as-arbitrary default.**
+`NSIC_SCAN_STALENESS_HOURS` (default `DEFAULT_SCAN_STALENESS_HOURS` = 24,
+`crates/console/src/main.rs`), parsed and validated (rejects negative
+values, fails fast at startup) the same way the bootstrap/operator
+secrets and TLS paths already are. 24 hours is a sane ceiling for a fleet
+scanned roughly daily via cron or a scheduled task, not derived from any
+real workload -- the same "arbitrary but explicit" posture
+`MAX_SAMPLE_SIZE_BYTES` already takes elsewhere in this codebase.
+
+**A fourth badge state, not a new page.** `ui::scan_status_badge` (shared
+by the fleet directory and host detail page, per PR #14) now renders one
+of four states instead of three: "never scanned" and "0 rules loaded"
+still take priority when they apply -- each names a strictly worse, more
+specific problem than "ran recently enough with rules loaded, just a
+while ago" -- followed by "stale (last scan `<time>`, N rules)" in a new
+`badge-warn` style (already defined in this file's CSS, previously used
+only for a mismatched sample-request status), and finally the existing
+healthy badge.
+
+**Surfaced in the JSON API too, not just the UI.** `scan_stale` is a
+plain field on `HostView`, so `GET /api/v1/hosts` and
+`GET /api/v1/hosts/{host_id}` carry it directly -- a monitoring script
+polling the fleet doesn't need to separately know the console's
+configured threshold to answer "which hosts need attention," the console
+already did that arithmetic.
+
+**Verified against a live Postgres and the real binary.** 5 new tests (3
+in `host.rs`/`main.rs` covering a fresh scan reading as not-stale, an
+old one reading as stale, and the config validation function; 2 in
+`ui.rs` covering the new badge's HTML and that it doesn't fire on a
+recent scan) -- full workspace suite now **152 tests**, run twice for
+rerun-safety. Both new regression tests (the staleness computation and
+the badge rendering) were confirmed as real detectors the same way as
+every fix so far this session: reverted `scan_stale`'s computation to a
+hardcoded `false`, reran, watched both tests fail, restored the fix,
+watched them pass again. Live-verified against the real `nsic-console`
+binary with `NSIC_SCAN_STALENESS_HOURS=1`: enrolled a host (never
+scanned, `scan_stale: false`), submitted a scan report timestamped two
+hours in the past (`scan_stale: true`, fleet UI and host detail page both
+showed `badge-warn` "stale (last scan ..., 7 rules)"), then submitted a
+fresh report (`scan_stale: false` again, badge back to healthy). Also
+confirmed a negative `NSIC_SCAN_STALENESS_HOURS` fails the console at
+startup with a clear error rather than starting with a nonsensical
+threshold.
+
 ## What's deliberately not here yet
 
 - **Scan coverage is per-invocation, not continuous.** PR #14 makes a
@@ -1403,11 +1473,13 @@ rerun-safety.
   the last invocation this host was run for succeed," not "is this host
   being scanned on any kind of cadence." That needs the agent to stop
   being one-shot first (see below).
-- **No staleness alerting on scan coverage.** The fleet UI shows *when*
-  a host last scanned, but doesn't flag a host whose last scan is old
-  (a week ago, a month ago) as needing attention -- an operator has to
-  notice the timestamp themselves. Straightforward to add once there's a
-  concrete policy for what "stale" means for this product.
+- **Staleness alerting has a fixed, global policy, not a per-host or
+  per-fleet-segment one.** PR #15 added `NSIC_SCAN_STALENESS_HOURS`, but
+  it's one threshold for every host in the fleet. A deployment mixing
+  hosts scanned hourly with ones scanned weekly by design would need a
+  per-host or per-group override to avoid false "stale" alerts on the
+  slower-cadence hosts; not built since Phase 1 has no such mixed fleet to
+  motivate the extra complexity yet.
 - **Ruleset fingerprint is not yet path-separator-portable.** The
   canonical manifest in `YaraEngine::load` includes each rule file's
   relative path as raw text. On Windows that path uses `\`, on Unix `/`,
@@ -1583,7 +1655,10 @@ all `NULL` together until the host's agent reports its first scan;
 overwritten -- not accumulated -- on every subsequent report whose
 `scanned_at` is strictly newer than what's already stored, so a stale
 or out-of-order report can't regress the snapshot; see PR #14 above).
-Additive to the Phase 0
+`HostView::scan_stale` (PR #15 above) is *not* a column here -- it's
+computed at read time from `last_scan_at` against the console's
+configured staleness threshold, so it can't itself go stale between
+writes. Additive to the Phase 0
 schema in `0001_init.sql` / `0002_verdict_indexes.sql`, not a redesign of
 it.
 
@@ -1644,6 +1719,7 @@ docker compose up -d                       # Postgres, same as Phase 0
 export DATABASE_URL=postgres://nsic:nsic@localhost:5432/nsic
 export NSIC_ENROLLMENT_SECRET=dev-secret   # pick anything for local testing
 export NSIC_OPERATOR_SECRET=dev-operator-secret  # ditto -- gates the read endpoints below
+export NSIC_SCAN_STALENESS_HOURS=24        # optional, this is the default -- see PR #15 below
 
 cargo run -p console --bin nsic-console &  # listens on 127.0.0.1:8787
 
@@ -1673,13 +1749,15 @@ curl -H "Authorization: Bearer $NSIC_OPERATOR_SECRET" \
 #     "agent_version": "...", "enrolled_at": "...", "last_heartbeat_at": "...",
 #     "last_scan_at": "...", "last_scan_received_at": "...",
 #     "last_scan_rule_count": 1, "last_scan_ruleset_fingerprint": "...",
-#     "last_scan_matched_count": 0}], "truncated": false}
+#     "last_scan_matched_count": 0, "scan_stale": false}], "truncated": false}
 curl -H "Authorization: Bearer $NSIC_OPERATOR_SECRET" \
   http://localhost:8787/api/v1/hosts/<uuid>
 # -> {"id": "...", "hostname": "...", ...}  -- same shape, one host
 # -> last_scan_at is null until the agent's first scan-coverage report;
 #    the fleet UI's "/hosts" and "/hosts/<uuid>" pages render this as a
-#    "never scanned" / "0 rules loaded" / healthy badge, see PR #14 above
+#    "never scanned" / "0 rules loaded" / "stale" / healthy badge, see
+#    PR #14 and PR #15 above. scan_stale is computed fresh on every
+#    request against NSIC_SCAN_STALENESS_HOURS, not stored.
 
 curl -H "Authorization: Bearer $NSIC_OPERATOR_SECRET" \
   http://localhost:8787/api/v1/hosts/<uuid>/sightings

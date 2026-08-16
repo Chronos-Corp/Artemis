@@ -197,7 +197,9 @@ pub async fn list_hosts(
 ) -> Result<Json<HostListResponse>, (StatusCode, String)> {
     authenticate_operator(&state.operator_secret, &headers)?;
 
-    let (hosts, truncated) = fetch_all_hosts(&state.pool).await.map_err(internal_error)?;
+    let (hosts, truncated) = fetch_all_hosts(&state.pool, state.scan_staleness_threshold)
+        .await
+        .map_err(internal_error)?;
     Ok(Json(HostListResponse { hosts, truncated }))
 }
 
@@ -212,7 +214,7 @@ pub async fn get_host(
 ) -> Result<Json<HostView>, (StatusCode, String)> {
     authenticate_operator(&state.operator_secret, &headers)?;
 
-    let host = fetch_host(&state.pool, host_id)
+    let host = fetch_host(&state.pool, host_id, state.scan_staleness_threshold)
         .await
         .map_err(internal_error)?;
     host.map(Json)
@@ -222,8 +224,16 @@ pub async fn get_host(
 /// Shared by `list_hosts` (JSON API) and the fleet UI's host directory
 /// page (`crates/console/src/ui.rs`), so both render from one query
 /// instead of the SQL drifting between a JSON response and an HTML page
-/// that happen to want the same rows.
-pub(crate) async fn fetch_all_hosts(pool: &PgPool) -> sqlx::Result<(Vec<HostView>, bool)> {
+/// that happen to want the same rows. `staleness_threshold` is the
+/// caller's `AppState::scan_staleness_threshold`, threaded through here
+/// (rather than read from a global) so `host_view_from_row` can compute
+/// `HostView::scan_stale` against it without reaching back into config
+/// itself -- same "explicit over implicit" reasoning as passing `pool`
+/// instead of a global connection.
+pub(crate) async fn fetch_all_hosts(
+    pool: &PgPool,
+    staleness_threshold: chrono::Duration,
+) -> sqlx::Result<(Vec<HostView>, bool)> {
     let mut rows = sqlx::query(
         "SELECT id, hostname, os, agent_version, enrolled_at, last_heartbeat_at, \
                 last_scan_at, last_scan_received_at, last_scan_rule_count, \
@@ -236,13 +246,19 @@ pub(crate) async fn fetch_all_hosts(pool: &PgPool) -> sqlx::Result<(Vec<HostView
 
     let truncated = truncate_to_limit(&mut rows, HOST_LIST_LIMIT as usize);
     Ok((
-        rows.into_iter().map(host_view_from_row).collect(),
+        rows.into_iter()
+            .map(|row| host_view_from_row(row, staleness_threshold))
+            .collect(),
         truncated,
     ))
 }
 
 /// Shared by `get_host` (JSON API) and the fleet UI's host detail page.
-pub(crate) async fn fetch_host(pool: &PgPool, host_id: Uuid) -> sqlx::Result<Option<HostView>> {
+pub(crate) async fn fetch_host(
+    pool: &PgPool,
+    host_id: Uuid,
+    staleness_threshold: chrono::Duration,
+) -> sqlx::Result<Option<HostView>> {
     let row = sqlx::query(
         "SELECT id, hostname, os, agent_version, enrolled_at, last_heartbeat_at, \
                 last_scan_at, last_scan_received_at, last_scan_rule_count, \
@@ -252,10 +268,21 @@ pub(crate) async fn fetch_host(pool: &PgPool, host_id: Uuid) -> sqlx::Result<Opt
     .bind(host_id)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(host_view_from_row))
+    Ok(row.map(|row| host_view_from_row(row, staleness_threshold)))
 }
 
-fn host_view_from_row(row: sqlx::postgres::PgRow) -> HostView {
+/// `scan_stale` is computed here, against `Utc::now()`, rather than
+/// stored on the row -- see `HostView::scan_stale`'s doc comment for why
+/// a snapshot column would defeat the point of a staleness signal. `false`
+/// when `last_scan_at` is `None`: a host that's never scanned is already
+/// flagged by that on its own, a strictly worse condition than "scanned,
+/// but a while ago."
+fn host_view_from_row(
+    row: sqlx::postgres::PgRow,
+    staleness_threshold: chrono::Duration,
+) -> HostView {
+    let last_scan_at: Option<chrono::DateTime<Utc>> = row.get("last_scan_at");
+    let scan_stale = last_scan_at.is_some_and(|t| Utc::now() - t > staleness_threshold);
     HostView {
         id: row.get("id"),
         hostname: row.get("hostname"),
@@ -263,11 +290,12 @@ fn host_view_from_row(row: sqlx::postgres::PgRow) -> HostView {
         agent_version: row.get("agent_version"),
         enrolled_at: row.get("enrolled_at"),
         last_heartbeat_at: row.get("last_heartbeat_at"),
-        last_scan_at: row.get("last_scan_at"),
+        last_scan_at,
         last_scan_received_at: row.get("last_scan_received_at"),
         last_scan_rule_count: row.get("last_scan_rule_count"),
         last_scan_ruleset_fingerprint: row.get("last_scan_ruleset_fingerprint"),
         last_scan_matched_count: row.get("last_scan_matched_count"),
+        scan_stale,
     }
 }
 
@@ -402,6 +430,7 @@ mod tests {
             bootstrap_secret: BOOTSTRAP_SECRET.to_string(),
             operator_secret: OPERATOR_SECRET.to_string(),
             csrf_token: CSRF_TOKEN.to_string(),
+            scan_staleness_threshold: chrono::Duration::hours(24),
         }
     }
 
@@ -1347,11 +1376,51 @@ mod tests {
         assert_eq!(host.last_scan_ruleset_fingerprint, Some(fingerprint));
         assert_eq!(host.last_scan_matched_count, Some(0));
         assert!(host.last_scan_at.is_some());
+        assert!(
+            !host.scan_stale,
+            "a just-reported scan must not read as stale"
+        );
     }
 
-    /// A host that's never reported a scan must show `None` for all four
-    /// coverage fields together -- the "never scanned" state
-    /// `ui::scan_status_badge` keys off of.
+    /// `scan_stale` is time-based, computed against
+    /// `AppState::scan_staleness_threshold` (24h in `test_state`) at read
+    /// time -- a scan reported well outside that window is flagged, even
+    /// though it's still the host's most recent (and only) report.
+    #[tokio::test]
+    #[ignore]
+    async fn a_scan_report_older_than_the_staleness_threshold_is_flagged_stale() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+        let scanned_at = Utc::now() - chrono::Duration::hours(48);
+
+        let response = app
+            .clone()
+            .oneshot(scan_report_request(
+                enrolled.host_id,
+                Some(&enrolled.credential),
+                5,
+                &valid_fingerprint("d"),
+                0,
+                scanned_at,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(get_host_request(enrolled.host_id, Some(OPERATOR_SECRET)))
+            .await
+            .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let host: nsic_core::proto::HostView = serde_json::from_slice(&bytes).unwrap();
+        assert!(host.scan_stale);
+    }
+
+    /// A host that's never reported a scan must show `None` for every
+    /// scan-coverage field together, and `scan_stale` must read `false`,
+    /// not `true` -- the "never scanned" state `ui::scan_status_badge`
+    /// keys off of is a distinct, worse condition than "stale," not a
+    /// special case of it.
     #[tokio::test]
     #[ignore]
     async fn a_host_with_no_scan_report_has_no_coverage_fields() {
@@ -1368,6 +1437,10 @@ mod tests {
         assert!(host.last_scan_rule_count.is_none());
         assert!(host.last_scan_ruleset_fingerprint.is_none());
         assert!(host.last_scan_matched_count.is_none());
+        assert!(
+            !host.scan_stale,
+            "never-scanned is its own, worse condition than stale -- must not double-flag"
+        );
     }
 
     /// A later scan report overwrites the earlier one's coverage fields

@@ -105,6 +105,15 @@ pub struct HostView {
     pub last_scan_rule_count: Option<i32>,
     pub last_scan_ruleset_fingerprint: Option<String>,
     pub last_scan_matched_count: Option<i32>,
+    /// Whether `last_scan_at` is older than the console's configured
+    /// staleness threshold (`NSIC_SCAN_STALENESS_HOURS`, default 24h) --
+    /// `false` when the host has never scanned at all, since "never
+    /// scanned" is already its own, worse condition callers can detect
+    /// from `last_scan_at` being `None`. Computed fresh against the
+    /// console's clock on every read, not stored: a snapshot column would
+    /// go stale itself the moment enough wall-clock time passed without a
+    /// write to refresh it, defeating the point of a staleness signal.
+    pub scan_stale: bool,
 }
 
 /// Response for `GET /api/v1/hosts`, the fleet directory. Was a

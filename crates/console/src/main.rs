@@ -26,6 +26,10 @@
 //! credential. The fleet UI (`crate::ui`) gates on that same operator
 //! credential too, presented as HTTP Basic instead of Bearer -- see
 //! `auth::authenticate_operator_ui`.
+//!
+//! `NSIC_SCAN_STALENESS_HOURS` (default `DEFAULT_SCAN_STALENESS_HOURS`)
+//! controls when `HostView::scan_stale` flags a host's most recent scan
+//! report as too old to trust -- see that constant's doc comment.
 
 mod auth;
 mod host;
@@ -51,7 +55,20 @@ pub(crate) struct AppState {
     /// startup. See `auth::generate_csrf_token`'s doc comment for why a
     /// single unrotated value is sufficient here.
     csrf_token: String,
+    /// How old `last_scan_at` has to be before `HostView::scan_stale`
+    /// flags it -- see `DEFAULT_SCAN_STALENESS_HOURS`'s doc comment.
+    scan_staleness_threshold: chrono::Duration,
 }
+
+/// Default for `NSIC_SCAN_STALENESS_HOURS`: a sane, documented-as-
+/// arbitrary ceiling for a fleet scanned roughly daily (e.g. via cron or
+/// a scheduled task running `nsic-agent scan`), not derived from any real
+/// workload -- the same "arbitrary but explicit" posture
+/// `nsic_core::proto::MAX_SAMPLE_SIZE_BYTES` already takes. Deferred since
+/// PR #14 pending exactly this: "a concrete policy for what 'stale' means
+/// for this product" (docs/phase1-design.md). Overridable per-deployment
+/// for a different scanning cadence.
+const DEFAULT_SCAN_STALENESS_HOURS: i64 = 24;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -93,6 +110,17 @@ async fn main() -> anyhow::Result<()> {
     let tls_key_path = std::env::var("NSIC_TLS_KEY_PATH").ok();
     let tls_paths = validate_tls_configuration(tls_cert_path, tls_key_path)?;
 
+    let scan_staleness_hours = match std::env::var("NSIC_SCAN_STALENESS_HOURS") {
+        Ok(v) => v.parse().with_context(|| {
+            format!(
+                "NSIC_SCAN_STALENESS_HOURS must be a non-negative integer number of hours, \
+                 got {v:?}"
+            )
+        })?,
+        Err(_) => DEFAULT_SCAN_STALENESS_HOURS,
+    };
+    let scan_staleness_threshold = validate_scan_staleness_hours(scan_staleness_hours)?;
+
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://nsic:nsic@localhost:5432/nsic".to_string());
     let pool = nsic_core::db::connect_and_migrate(&database_url).await?;
@@ -103,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
         bootstrap_secret,
         operator_secret,
         csrf_token: auth::generate_csrf_token(),
+        scan_staleness_threshold,
     });
 
     // Loopback-only by default regardless of TLS: network-wide exposure
@@ -193,6 +222,19 @@ fn validate_secret_configuration(
         );
     }
     Ok(())
+}
+
+/// Rejects a negative `NSIC_SCAN_STALENESS_HOURS` -- "negative hours
+/// until stale" has no coherent meaning, unlike 0 (a valid, if aggressive,
+/// choice: everything but a scan from this exact instant reads as stale).
+/// Fails fast at startup for the same reason the secret and TLS
+/// configuration checks do, rather than only surfacing as a confusing
+/// `chrono::Duration` deep in a request handler.
+fn validate_scan_staleness_hours(hours: i64) -> anyhow::Result<chrono::Duration> {
+    if hours < 0 {
+        anyhow::bail!("NSIC_SCAN_STALENESS_HOURS must not be negative, got {hours}");
+    }
+    Ok(chrono::Duration::hours(hours))
 }
 
 fn build_router(state: AppState) -> Router {
@@ -292,7 +334,9 @@ fn build_router(state: AppState) -> Router {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_secret_configuration, validate_tls_configuration};
+    use super::{
+        validate_scan_staleness_hours, validate_secret_configuration, validate_tls_configuration,
+    };
 
     #[test]
     fn accepts_distinct_non_empty_secrets() {
@@ -338,5 +382,26 @@ mod tests {
     #[test]
     fn rejects_key_path_without_cert_path() {
         assert!(validate_tls_configuration(None, Some("key.pem".to_string())).is_err());
+    }
+
+    #[test]
+    fn accepts_a_non_negative_scan_staleness_hours() {
+        assert_eq!(
+            validate_scan_staleness_hours(24).unwrap(),
+            chrono::Duration::hours(24)
+        );
+    }
+
+    #[test]
+    fn accepts_zero_scan_staleness_hours() {
+        assert_eq!(
+            validate_scan_staleness_hours(0).unwrap(),
+            chrono::Duration::hours(0)
+        );
+    }
+
+    #[test]
+    fn rejects_negative_scan_staleness_hours() {
+        assert!(validate_scan_staleness_hours(-1).is_err());
     }
 }
