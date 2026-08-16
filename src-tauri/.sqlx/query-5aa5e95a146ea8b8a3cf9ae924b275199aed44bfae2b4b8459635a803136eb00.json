@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT last_synced_at, last_cursor FROM feed_sync_state WHERE source = 'threatfox'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "last_synced_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 1,
+        "name": "last_cursor",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "5aa5e95a146ea8b8a3cf9ae924b275199aed44bfae2b4b8459635a803136eb00"
+}

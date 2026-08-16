@@ -283,15 +283,16 @@ mod tests {
     /// successfully synced must still appear in `intel_freshness` --
     /// with `last_successful_sync_at: None` -- rather than being silently
     /// absent because it has no `feed_sync_state` row to select. Exercises
-    /// the exact partial-success case: one configured source has synced,
-    /// the other has not.
+    /// the exact partial-success case: one configured source has a
+    /// successful sync state (asserted `Some`, not just "present" -- a
+    /// follow-up review caught that the first version of this test only
+    /// checked presence), the other has none (asserted `None`).
     ///
-    /// Deliberately doesn't assert anything about `malwarebazaar`'s value
-    /// here (only that its entry is present) so this test can't race
-    /// against `intel_freshness_reflects_feed_sync_state`, which also
-    /// writes to that row -- both tests only need `threatfox` to be
-    /// absent from `feed_sync_state`, which nothing else in this suite
-    /// touches.
+    /// Restores whatever `threatfox`'s prior state was (row present or
+    /// absent) once the assertions are done -- a follow-up review noted
+    /// that unconditionally deleting a real feed's row as a test side
+    /// effect would permanently wipe a developer's local sync history on
+    /// this sandbox's persistent, shared local Postgres instance.
     #[tokio::test]
     #[ignore]
     async fn intel_freshness_includes_a_never_synced_configured_source() {
@@ -301,6 +302,16 @@ mod tests {
             .await
             .expect("connect to test database");
 
+        let prior_threatfox_state = sqlx::query!(
+            "SELECT last_synced_at, last_cursor FROM feed_sync_state WHERE source = 'threatfox'"
+        )
+        .fetch_optional(&pool)
+        .await
+        .expect("read existing threatfox state");
+
+        crate::db::indicators::set_sync_cursor(&pool, "malwarebazaar", Some("cursor"))
+            .await
+            .expect("seed malwarebazaar sync state");
         sqlx::query("DELETE FROM feed_sync_state WHERE source = 'threatfox'")
             .execute(&pool)
             .await
@@ -322,13 +333,19 @@ mod tests {
             .await
             .expect("resolve verdict");
 
+        let malwarebazaar = verdict
+            .intel_freshness
+            .iter()
+            .find(|f| f.source == "malwarebazaar")
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected malwarebazaar in intel_freshness, got: {:?}",
+                    verdict.intel_freshness
+                )
+            });
         assert!(
-            verdict
-                .intel_freshness
-                .iter()
-                .any(|f| f.source == "malwarebazaar"),
-            "expected malwarebazaar to still be present regardless of its own sync state, got: {:?}",
-            verdict.intel_freshness
+            malwarebazaar.last_successful_sync_at.is_some(),
+            "malwarebazaar was just seeded with a successful sync -- must report Some(...)"
         );
 
         let threatfox = verdict
@@ -345,6 +362,18 @@ mod tests {
             threatfox.last_successful_sync_at.is_none(),
             "a configured source with no feed_sync_state row must report None, not be missing"
         );
+
+        if let Some(prior) = prior_threatfox_state {
+            sqlx::query(
+                "INSERT INTO feed_sync_state (source, last_synced_at, last_cursor) \
+                 VALUES ('threatfox', $1, $2)",
+            )
+            .bind(prior.last_synced_at)
+            .bind(prior.last_cursor)
+            .execute(&pool)
+            .await
+            .expect("restore prior threatfox sync state");
+        }
     }
 
     fn tempfile_eicar() -> tempfile::NamedTempFile {
