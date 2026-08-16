@@ -260,6 +260,8 @@ mod tests {
             .await
             .expect("connect to test database");
 
+        let prior_malwarebazaar_state = capture_sync_state(&pool, "malwarebazaar").await;
+
         crate::db::indicators::set_sync_cursor(&pool, "malwarebazaar", Some("cursor"))
             .await
             .expect("seed feed_sync_state");
@@ -294,6 +296,8 @@ mod tests {
             freshness.last_successful_sync_at.is_some(),
             "a source with a feed_sync_state row must report Some(...), not None"
         );
+
+        restore_sync_state(&pool, "malwarebazaar", prior_malwarebazaar_state).await;
     }
 
     /// A previously read `feed_sync_state` row, captured so it can be put
