@@ -179,7 +179,9 @@ pub async fn resolve(path: &Path) -> Result<FileIntelligence> {
 
     let file_type = sniff_path(path).await?;
     let symlink_meta = tokio::fs::symlink_metadata(path).await.ok();
-    let is_symlink = symlink_meta.is_some_and(|m| m.file_type().is_symlink());
+    let is_symlink = symlink_meta
+        .as_ref()
+        .is_some_and(|m| m.file_type().is_symlink());
     let symlink_target = if is_symlink {
         tokio::fs::read_link(path)
             .await
@@ -188,7 +190,14 @@ pub async fn resolve(path: &Path) -> Result<FileIntelligence> {
     } else {
         None
     };
-    let identity = build_identity(path, &meta, file_type, is_symlink, symlink_target);
+    let identity = build_identity(
+        path,
+        &meta,
+        symlink_meta.as_ref(),
+        file_type,
+        is_symlink,
+        symlink_target,
+    );
 
     let path_owned = path.to_path_buf();
     let (authenticity, product_context) = tokio::task::spawn_blocking(move || {
@@ -222,6 +231,7 @@ pub async fn resolve(path: &Path) -> Result<FileIntelligence> {
 fn build_identity(
     path: &Path,
     meta: &std::fs::Metadata,
+    symlink_meta: Option<&std::fs::Metadata>,
     file_type: String,
     is_symlink: bool,
     symlink_target: Option<String>,
@@ -232,6 +242,11 @@ fn build_identity(
         .and_then(|n| n.to_str())
         .is_some_and(|n| n.starts_with('.'));
 
+    // `is_executable` intentionally still comes from `meta` (which follows
+    // the symlink) even for a symlink -- whether running the selected path
+    // executes something is a fact about the resolved target, and a
+    // symlink's own permission bits are meaningless on Linux (always shown
+    // as rwxrwxrwx regardless of the target's real mode).
     #[cfg(unix)]
     let is_executable = {
         use std::os::unix::fs::PermissionsExt;
@@ -242,6 +257,19 @@ fn build_identity(
         .as_deref()
         .is_some_and(|e| matches!(e, "exe" | "bat" | "cmd" | "com" | "ps1" | "msi"));
 
+    // Identity timestamps must describe the *selected* artifact, not
+    // whatever it happens to point at. A follow-up review caught this
+    // live: `meta` (which follows the final symlink) made a symlink
+    // created moments ago report its target's timestamps -- a symlink to
+    // a year-2000-mtime file looked "modified" in 2000, not today, which
+    // is exactly the kind of identity/history misstatement that matters
+    // for incident-response context.
+    let timestamps = if is_symlink {
+        symlink_meta.unwrap_or(meta)
+    } else {
+        meta
+    };
+
     FileIdentity {
         file_type,
         extension,
@@ -249,9 +277,9 @@ fn build_identity(
         is_executable,
         is_symlink,
         symlink_target,
-        created: meta.created().ok().map(Into::into),
-        modified: meta.modified().ok().map(Into::into),
-        accessed: meta.accessed().ok().map(Into::into),
+        created: timestamps.created().ok().map(Into::into),
+        modified: timestamps.modified().ok().map(Into::into),
+        accessed: timestamps.accessed().ok().map(Into::into),
     }
 }
 
@@ -467,18 +495,35 @@ fn dpkg_lookup(path: &Path, is_symlink: bool) -> Option<(FileAuthenticity, Produ
 /// Parses `dpkg -S <path>` output: lines of `package[:arch]: /abs/path`,
 /// possibly several when multiple packages divert the same path. Takes the
 /// first, which is what dpkg itself treats as authoritative.
-fn parse_dpkg_search_output(stdout: &str, _path: &str) -> Option<String> {
-    let line = stdout.lines().next()?;
-    // "pkgname[:arch]: /absolute/path" -- split on ": " (colon-space), not
-    // a bare colon, since a multi-arch package's own name already contains
-    // one colon (e.g. "libc6:amd64") before the real separator.
-    let (pkg, _) = line.split_once(": ")?;
-    let pkg = pkg.trim();
-    if pkg.is_empty() {
-        None
-    } else {
-        Some(pkg.to_string())
+/// `dpkg -S` performs its own glob-style pattern matching on the queried
+/// string -- `*`, `?`, `[`, and `\` are all pattern metacharacters to it,
+/// and all are legal characters in a real filename. Confirmed live: a
+/// literal query of `/usr/bin/*` returns dozens of unrelated real
+/// packages, not "not found." Without an exact-path check, a selected
+/// file whose name happens to contain one of those characters could match
+/// a *different* installed file's manifest entry, and Apollo would
+/// attribute that other file's package/version/description as this one's
+/// Product Context and Purpose -- a real misattribution, not just a
+/// missed match. `path` is the literal path that was queried; only a line
+/// whose reported path is byte-for-byte identical to it is accepted.
+fn parse_dpkg_search_output(stdout: &str, path: &str) -> Option<String> {
+    for line in stdout.lines() {
+        // "pkgname[:arch]: /absolute/path" -- split on ": " (colon-space),
+        // not a bare colon, since a multi-arch package's own name already
+        // contains one colon (e.g. "libc6:amd64") before the real
+        // separator.
+        let Some((pkg, reported_path)) = line.split_once(": ") else {
+            continue;
+        };
+        if reported_path.trim() != path {
+            continue;
+        }
+        let pkg = pkg.trim();
+        if !pkg.is_empty() {
+            return Some(pkg.to_string());
+        }
     }
+    None
 }
 
 /// Parses `dpkg-query -W -f='${Version}\t${Maintainer}\n' <pkg>` output.
@@ -798,7 +843,18 @@ fn derive_expectedness(
             local.similarly_named_siblings.join(", ")
         ));
     }
-    if identity.is_hidden && identity.is_executable {
+    // Same reasoning as the masquerading check above, and for the same
+    // reason a follow-up review gave: `Verified` here doesn't just mean
+    // "these bytes happen to match some checksum somewhere" -- it means
+    // `dpkg -S` says the *exact selected path* is package-owned, and that
+    // exact path's recorded checksum matches. If a package legitimately
+    // ships an executable dotfile at that exact path, hiddenness alone
+    // must not override that direct package/path evidence, any more than
+    // a same-directory name collision should.
+    if authenticity.status != AuthenticityStatus::Verified
+        && identity.is_hidden
+        && identity.is_executable
+    {
         unexpected_reasons.push("Hidden executable file.".to_string());
     }
 
@@ -968,6 +1024,32 @@ mod tests {
         assert_eq!(
             parse_dpkg_search_output(stdout, "/usr/lib/x86_64-linux-gnu/libc.so.6"),
             Some("libc6:amd64".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_a_returned_path_that_does_not_exactly_match_the_query() {
+        // The review's merge-blocking finding: `dpkg -S` does its own
+        // glob-style matching on `*`/`?`/`[`/`\`, all legal filename
+        // characters, so a real selected path containing one of those
+        // could cause dpkg to match and return an entirely different
+        // installed file. Confirmed live: `dpkg -S /usr/bin/*` returns
+        // dozens of unrelated real packages, not "not found." This
+        // simulates exactly that: the query looked like a path containing
+        // a wildcard, dpkg pattern-matched it against a real but
+        // different file, and the parser must not accept that match.
+        let stdout = "coreutils: /usr/bin/ls\n";
+        assert_eq!(parse_dpkg_search_output(stdout, "/usr/bin/*"), None);
+    }
+
+    #[test]
+    fn accepts_the_first_exact_match_among_multiple_lines() {
+        // A pattern query can return several lines; only the one whose
+        // reported path exactly equals the query is acceptable.
+        let stdout = "pkg-a: /usr/bin/aaa\npkg-b: /usr/bin/target\npkg-c: /usr/bin/ccc\n";
+        assert_eq!(
+            parse_dpkg_search_output(stdout, "/usr/bin/target"),
+            Some("pkg-b".to_string())
         );
     }
 
@@ -1194,18 +1276,20 @@ mod tests {
     }
 
     #[test]
-    fn expectedness_hidden_executable_still_flagged_even_when_verified() {
-        // Unlike masquerading-by-name, a hidden+executable placement
-        // anomaly is independent of content integrity -- a Verified
-        // checksum says the *bytes* are correct, not that the *location*
-        // is normal, so this reason is deliberately not suppressed.
+    fn expectedness_hidden_executable_does_not_override_verified() {
+        // A follow-up review corrected this: `Verified` here means
+        // `dpkg -S` says the *exact selected path* is package-owned and
+        // its checksum matches -- if a package legitimately ships an
+        // executable dotfile at that exact path, hiddenness alone must
+        // not override that direct evidence, matching how a same-
+        // directory name collision is already treated above.
         let authenticity = FileAuthenticity {
             status: AuthenticityStatus::Verified,
             detail: None,
         };
         let local = local_context(Vec::new());
         let result = derive_expectedness(&identity(true, true), &authenticity, &local);
-        assert_eq!(result.status, ExpectednessStatus::Unexpected);
+        assert_eq!(result.status, ExpectednessStatus::Expected);
     }
 
     #[test]
@@ -1359,6 +1443,77 @@ mod tests {
             AuthenticityStatus::Unpackaged,
             "a symlink must not inherit its target's package identity"
         );
+        assert!(intel.product_context.package.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_new_symlink_to_an_old_file_reports_its_own_recent_timestamp() {
+        // The review's merge-blocking finding, reproduced live: creates a
+        // symlink *today* pointing at a target file whose mtime is
+        // deliberately set to year 2000. Before the fix, `resolve()`'s
+        // `meta` (which follows the symlink) meant the freshly-created
+        // symlink's `modified` field reported year 2000 -- its target's
+        // age, not its own. For incident-response context ("was this
+        // artifact just planted here?") that's a material misstatement.
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let old_target = dir.path().join("old-target.txt");
+        std::fs::write(&old_target, b"old content").unwrap();
+        let status = std::process::Command::new("touch")
+            .arg("-d")
+            .arg("2000-01-01")
+            .arg(&old_target)
+            .status()
+            .expect("run touch");
+        assert!(
+            status.success(),
+            "touch -d must succeed to set up this test"
+        );
+
+        let link = dir.path().join("freshly-created-link");
+        std::os::unix::fs::symlink(&old_target, &link).unwrap();
+
+        let intel = resolve(&link).await.expect("resolve file intelligence");
+
+        let modified = intel
+            .identity
+            .modified
+            .expect("a freshly created symlink must have a modified timestamp");
+        let age = chrono::Utc::now().signed_duration_since(modified);
+        assert!(
+            age.num_minutes() < 5,
+            "expected the symlink's own recent creation time, got a timestamp {age} old \
+             (i.e. inherited from the year-2000 target): {modified}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pathname_with_dpkg_pattern_characters_resolves_without_crashing_or_hanging() {
+        // NOT a reproduction of the misattribution bug itself -- that's
+        // covered by the pure unit tests above
+        // (`rejects_a_returned_path_that_does_not_exactly_match_the_query`,
+        // confirmed via revert-and-reproduce as a real detector). A
+        // temp-dir path can't actually reproduce the misattribution live:
+        // `dpkg -S`'s glob matching only ever matches paths dpkg actually
+        // tracks, and nothing under a freshly created tempdir is tracked,
+        // so a query like `<tempdir>/note*.txt` structurally cannot
+        // collide with a real package file regardless of whether the
+        // exact-match fix is present -- confirmed by running this exact
+        // test against the pre-fix parser and observing it still passed.
+        // Constructing genuine live collision would require creating
+        // files under a real package directory (e.g. /usr/bin), which
+        // this suite deliberately does not do to real system state. What
+        // this test actually verifies: a pattern-character filename is a
+        // legal, unremarkable input that must resolve cleanly to
+        // Unpackaged, not error, hang, or crash.
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let weird_name = dir.path().join("note*.txt");
+        std::fs::write(&weird_name, b"not a package file").unwrap();
+
+        let intel = resolve(&weird_name)
+            .await
+            .expect("resolve file intelligence for a pattern-char filename");
+
+        assert_eq!(intel.authenticity.status, AuthenticityStatus::Unpackaged);
         assert!(intel.product_context.package.is_none());
     }
 
