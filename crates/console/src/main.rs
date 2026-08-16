@@ -230,11 +230,20 @@ fn validate_secret_configuration(
 /// Fails fast at startup for the same reason the secret and TLS
 /// configuration checks do, rather than only surfacing as a confusing
 /// `chrono::Duration` deep in a request handler.
+///
+/// Uses `chrono::Duration::try_hours`, not `chrono::Duration::hours` --
+/// the latter panics rather than erroring once the requested duration
+/// overflows `TimeDelta`'s internal millisecond representation, which a
+/// syntactically valid (non-negative) but enormous value like `i64::MAX`
+/// reaches easily. `hours` is parsed from `NSIC_SCAN_STALENESS_HOURS` as
+/// an arbitrary `i64` with no upper bound of its own, so nothing upstream
+/// of this function already rules that value out.
 fn validate_scan_staleness_hours(hours: i64) -> anyhow::Result<chrono::Duration> {
     if hours < 0 {
         anyhow::bail!("NSIC_SCAN_STALENESS_HOURS must not be negative, got {hours}");
     }
-    Ok(chrono::Duration::hours(hours))
+    chrono::Duration::try_hours(hours)
+        .with_context(|| format!("NSIC_SCAN_STALENESS_HOURS is too large to represent: {hours}"))
 }
 
 fn build_router(state: AppState) -> Router {
@@ -403,5 +412,16 @@ mod tests {
     #[test]
     fn rejects_negative_scan_staleness_hours() {
         assert!(validate_scan_staleness_hours(-1).is_err());
+    }
+
+    /// A syntactically valid (non-negative) but enormous
+    /// `NSIC_SCAN_STALENESS_HOURS` must produce a clean startup error,
+    /// not panic -- `chrono::Duration::hours` (the panicking constructor)
+    /// overflows `TimeDelta`'s internal millisecond representation well
+    /// before `i64::MAX` hours, and nothing upstream of this function
+    /// rules that value out.
+    #[test]
+    fn rejects_an_overflowing_scan_staleness_hours_instead_of_panicking() {
+        assert!(validate_scan_staleness_hours(i64::MAX).is_err());
     }
 }

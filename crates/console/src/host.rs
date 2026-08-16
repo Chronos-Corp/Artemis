@@ -245,9 +245,14 @@ pub(crate) async fn fetch_all_hosts(
     .await?;
 
     let truncated = truncate_to_limit(&mut rows, HOST_LIST_LIMIT as usize);
+    // One `now`, not one per row: two hosts with the same `last_scan_at`
+    // sitting right on `staleness_threshold` must get the same
+    // `scan_stale` answer in the same response, not one determined by
+    // which row happened to be mapped a few microseconds later.
+    let now = Utc::now();
     Ok((
         rows.into_iter()
-            .map(|row| host_view_from_row(row, staleness_threshold))
+            .map(|row| host_view_from_row(row, now, staleness_threshold))
             .collect(),
         truncated,
     ))
@@ -268,21 +273,24 @@ pub(crate) async fn fetch_host(
     .bind(host_id)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|row| host_view_from_row(row, staleness_threshold)))
+    Ok(row.map(|row| host_view_from_row(row, Utc::now(), staleness_threshold)))
 }
 
-/// `scan_stale` is computed here, against `Utc::now()`, rather than
-/// stored on the row -- see `HostView::scan_stale`'s doc comment for why
-/// a snapshot column would defeat the point of a staleness signal. `false`
-/// when `last_scan_at` is `None`: a host that's never scanned is already
-/// flagged by that on its own, a strictly worse condition than "scanned,
-/// but a while ago."
+/// `scan_stale` is computed here against `now` -- the caller's single
+/// `Utc::now()` snapshot for the whole read, not a fresh clock read per
+/// row, so a multi-host response stays internally consistent (see
+/// `fetch_all_hosts`) -- rather than stored on the row; see
+/// `HostView::scan_stale`'s doc comment for why a snapshot column would
+/// defeat the point of a staleness signal. `false` when `last_scan_at` is
+/// `None`: a host that's never scanned is already flagged by that on its
+/// own, a strictly worse condition than "scanned, but a while ago."
 fn host_view_from_row(
     row: sqlx::postgres::PgRow,
+    now: chrono::DateTime<Utc>,
     staleness_threshold: chrono::Duration,
 ) -> HostView {
     let last_scan_at: Option<chrono::DateTime<Utc>> = row.get("last_scan_at");
-    let scan_stale = last_scan_at.is_some_and(|t| Utc::now() - t > staleness_threshold);
+    let scan_stale = last_scan_at.is_some_and(|t| now - t > staleness_threshold);
     HostView {
         id: row.get("id"),
         hostname: row.get("hostname"),

@@ -1464,6 +1464,68 @@ confirmed a negative `NSIC_SCAN_STALENESS_HOURS` fails the console at
 startup with a clear error rather than starting with a nonsensical
 threshold.
 
+### PR #15 review round: checked duration construction, one clock read per fleet response
+
+Review on PR #16 (opened for this feature) found one real, blocking bug
+plus one non-blocking suggestion strong enough to fold in immediately.
+
+**Bug: a syntactically valid but huge `NSIC_SCAN_STALENESS_HOURS` panicked
+the console instead of failing cleanly.** `validate_scan_staleness_hours`
+rejected negative values but then called `chrono::Duration::hours`, the
+*panicking* constructor -- it aborts rather than erroring once the
+requested duration overflows `TimeDelta`'s internal millisecond
+representation, which a non-negative value like `i64::MAX` reaches easily
+(the field is parsed from the env var as an arbitrary `i64` with no upper
+bound of its own). Reproduced live first: starting the console with
+`NSIC_SCAN_STALENESS_HOURS=9223372036854775807` panicked instead of
+producing the clear startup configuration error every other misconfigured
+value already gets. Fixed by switching to `chrono::Duration::try_hours`
+(the checked constructor) and converting its `None` into an `anyhow`
+context error, matching every other fail-fast config check in `main.rs`.
+Verified with a new test,
+`rejects_an_overflowing_scan_staleness_hours_instead_of_panicking`,
+confirmed as a real regression detector by reverting to the panicking
+constructor, watching the test fail (panic, not a clean `Err`), and
+restoring the fix. Live-reverified afterward: the same
+`NSIC_SCAN_STALENESS_HOURS=9223372036854775807` now exits with
+`Error: NSIC_SCAN_STALENESS_HOURS is too large to represent: ...` and no
+panic.
+
+**Non-blocking suggestion, folded in: one `Utc::now()` per fleet
+response, not one per row.** `host_view_from_row` originally called
+`Utc::now()` independently for every host row `fetch_all_hosts` mapped
+(up to `HOST_LIST_LIMIT` = 1000 per response) -- two hosts with the same
+`last_scan_at` sitting right on the configured threshold could get
+different `scan_stale` answers in the same API response purely because
+they were mapped a few microseconds apart, most visible with a small
+threshold. `fetch_all_hosts`/`fetch_host` now each capture a single `now`
+and thread it into every `host_view_from_row` call for that response, so
+a directory listing is an internally consistent snapshot rather than a
+loosely-related sequence of clock reads.
+
+The review also examined and confirmed correct the choice to base
+`scan_stale` on the agent-claimed `last_scan_at` rather than the
+server-controlled `last_scan_received_at`: staleness is about how old the
+underlying scan actually was, so a delayed delivery of a week-old scan
+report should still read as stale, not look fresh merely because the
+console happened to receive it just now.
+
+Full workspace suite after this round: **153 tests** (152 from the
+original PR, plus the one new panic-regression test above -- the
+`now`-threading fix added no test of its own, since it changes *when*
+the clock is read, not what any existing test observes).
+
+Also worth noting, unrelated to the review itself: this round surfaced
+that the local dev Postgres instance backing this whole session's testing
+had accumulated 1,486 `host` rows -- past `HOST_LIST_LIMIT` (1000) -- and
+a test run hit a real, if environmental, flake because of it: a freshly
+enrolled host with a hostname sorting past the truncation cutoff simply
+didn't appear on the `/hosts` page `fetch_all_hosts` returned, so
+`extract_host_row`'s `.expect("host's row present in page")` panicked.
+Not a product bug -- resolved by resetting the local dev database, the
+same "shared, persistent local Postgres" root cause this file has
+documented as a source of test flakiness since PR #14.
+
 ## What's deliberately not here yet
 
 - **Scan coverage is per-invocation, not continuous.** PR #14 makes a
