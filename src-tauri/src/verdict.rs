@@ -221,12 +221,19 @@ mod tests {
     }
 
     /// `intel_freshness` must reflect `feed_sync_state`, not just exist as
-    /// an empty placeholder -- seeds a uniquely named source (so this test
-    /// can't collide with real feed data or another test run sharing this
-    /// sandbox's persistent local Postgres instance) and confirms `resolve`
-    /// surfaces it. This is the actual fix: previously an empty `entries`
+    /// an empty placeholder -- seeds a real configured source
+    /// (`malwarebazaar`) and confirms `resolve` surfaces it as
+    /// `Some(...)`. This is the actual fix: previously an empty `entries`
     /// carried no signal at all about whether the intel behind it was
     /// current.
+    ///
+    /// Seeds a real configured source rather than a uniquely named fake
+    /// one deliberately: `all_sync_states` (see `db::indicators`) now
+    /// derives its result from `ingest::CONFIGURED_SOURCES`, not from
+    /// whatever happens to be in `feed_sync_state`, so a fake source name
+    /// would no longer appear in `intel_freshness` at all -- an earlier
+    /// version of this test used a random UUID-suffixed name for exactly
+    /// the isolation reason a fake source can't provide anymore.
     #[tokio::test]
     #[ignore]
     async fn intel_freshness_reflects_feed_sync_state() {
@@ -236,8 +243,7 @@ mod tests {
             .await
             .expect("connect to test database");
 
-        let source = format!("test-source-{}", uuid::Uuid::new_v4());
-        crate::db::indicators::set_sync_cursor(&pool, &source, Some("cursor"))
+        crate::db::indicators::set_sync_cursor(&pool, "malwarebazaar", Some("cursor"))
             .await
             .expect("seed feed_sync_state");
 
@@ -260,16 +266,84 @@ mod tests {
         let freshness = verdict
             .intel_freshness
             .iter()
-            .find(|f| f.source == source)
+            .find(|f| f.source == "malwarebazaar")
             .unwrap_or_else(|| {
                 panic!(
-                    "expected seeded source {source} in intel_freshness, got: {:?}",
+                    "expected malwarebazaar in intel_freshness, got: {:?}",
                     verdict.intel_freshness
                 )
             });
         assert!(
             freshness.last_successful_sync_at.is_some(),
             "a source with a feed_sync_state row must report Some(...), not None"
+        );
+    }
+
+    /// The review-caught bug: a configured feed that has *never*
+    /// successfully synced must still appear in `intel_freshness` --
+    /// with `last_successful_sync_at: None` -- rather than being silently
+    /// absent because it has no `feed_sync_state` row to select. Exercises
+    /// the exact partial-success case: one configured source has synced,
+    /// the other has not.
+    ///
+    /// Deliberately doesn't assert anything about `malwarebazaar`'s value
+    /// here (only that its entry is present) so this test can't race
+    /// against `intel_freshness_reflects_feed_sync_state`, which also
+    /// writes to that row -- both tests only need `threatfox` to be
+    /// absent from `feed_sync_state`, which nothing else in this suite
+    /// touches.
+    #[tokio::test]
+    #[ignore]
+    async fn intel_freshness_includes_a_never_synced_configured_source() {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://nsic:nsic@localhost:5432/nsic".to_string());
+        let pool = crate::db::connect_and_migrate(&database_url)
+            .await
+            .expect("connect to test database");
+
+        sqlx::query("DELETE FROM feed_sync_state WHERE source = 'threatfox'")
+            .execute(&pool)
+            .await
+            .expect("clear threatfox sync state");
+
+        let rules_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("yara-rules");
+        let yara = Arc::new(YaraEngine::load(&rules_dir).expect("load yara rules"));
+        let bloom = BloomState::empty();
+        let recent_yara_hits = RecentYaraHits::new();
+
+        let mut tmp = tempfile::NamedTempFile::new().expect("create temp file");
+        tmp.write_all(b"irrelevant content, still not eicar").unwrap();
+        tmp.flush().unwrap();
+
+        let verdict = resolve(&pool, &bloom, &yara, &recent_yara_hits, tmp.path())
+            .await
+            .expect("resolve verdict");
+
+        assert!(
+            verdict
+                .intel_freshness
+                .iter()
+                .any(|f| f.source == "malwarebazaar"),
+            "expected malwarebazaar to still be present regardless of its own sync state, got: {:?}",
+            verdict.intel_freshness
+        );
+
+        let threatfox = verdict
+            .intel_freshness
+            .iter()
+            .find(|f| f.source == "threatfox")
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected threatfox in intel_freshness even though it has never synced, got: {:?}",
+                    verdict.intel_freshness
+                )
+            });
+        assert!(
+            threatfox.last_successful_sync_at.is_none(),
+            "a configured source with no feed_sync_state row must report None, not be missing"
         );
     }
 

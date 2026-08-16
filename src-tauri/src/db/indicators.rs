@@ -234,22 +234,44 @@ pub async fn upsert_detection_detects_indicator(
     Ok(())
 }
 
-/// Last-successful-sync timestamps for every feed that has ever completed a
-/// sync, used both to show "last synced" status in the global status bar
-/// (independent of any one file lookup) and, via `verdict::resolve`, to
-/// tell an analyst whether an empty verdict reflects current intelligence
-/// or a feed that's gone quiet. A feed's row only exists once
-/// `set_sync_cursor` has been called for it, which `ingest::*::sync` only
-/// reaches after a full successful sync commits -- a source that has only
-/// ever failed has no row here at all, not a stale one.
+/// Last-successful-sync timestamps for every *configured* feed, used both
+/// to show "last synced" status in the global status bar (independent of
+/// any one file lookup) and, via `verdict::resolve`, to tell an analyst
+/// whether an empty verdict reflects current intelligence or a feed
+/// that's gone quiet.
+///
+/// `crate::ingest::CONFIGURED_SOURCES`, not `feed_sync_state`, is the
+/// source of truth for which feeds exist: that table only gains a row for
+/// a source once `set_sync_cursor` has been called for it, which
+/// `ingest::*::sync` only reaches after a full successful sync commits --
+/// a source that has *never* succeeded (a bad API key from day one, every
+/// attempt network-failing) has no row there at all. Querying
+/// `feed_sync_state` alone, as an earlier version of this function did,
+/// would silently drop that feed from the result entirely instead of
+/// reporting it as never-synced -- exactly the ambiguity `intel_freshness`
+/// exists to eliminate. Left-joining the configured list onto whatever
+/// rows do exist (in application code, since the registry lives there,
+/// not in Postgres) guarantees exactly one entry per configured feed,
+/// `None` for one with no successful sync yet.
 pub async fn all_sync_states(pool: &PgPool) -> Result<Vec<IntelSourceFreshness>> {
-    let rows = sqlx::query_as!(
-        IntelSourceFreshness,
-        r#"SELECT source, last_synced_at AS "last_successful_sync_at" FROM feed_sync_state ORDER BY source"#
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(rows)
+    let rows = sqlx::query!("SELECT source, last_synced_at FROM feed_sync_state")
+        .fetch_all(pool)
+        .await?;
+
+    let mut synced: std::collections::HashMap<String, DateTime<Utc>> = rows
+        .into_iter()
+        .filter_map(|r| r.last_synced_at.map(|t| (r.source, t)))
+        .collect();
+
+    let mut result: Vec<IntelSourceFreshness> = crate::ingest::CONFIGURED_SOURCES
+        .iter()
+        .map(|&source| IntelSourceFreshness {
+            last_successful_sync_at: synced.remove(source),
+            source: source.to_string(),
+        })
+        .collect();
+    result.sort_by(|a, b| a.source.cmp(&b.source));
+    Ok(result)
 }
 
 #[allow(dead_code)]

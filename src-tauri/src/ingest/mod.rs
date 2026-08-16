@@ -16,6 +16,16 @@ pub(crate) fn parse_abusech_time(s: Option<&str>) -> Option<DateTime<Utc>> {
         .map(|naive| naive.and_utc())
 }
 
+/// The configured feed set -- the source of truth for "which feeds does
+/// Apollo know about," independent of `feed_sync_state`, which only gains
+/// a row for a source once it has completed at least one successful sync
+/// (see `db::indicators::set_sync_cursor`). A feed that has never
+/// succeeded has no row there at all, so anything reading feed coverage
+/// (`db::indicators::all_sync_states`) must start from this list, not from
+/// the sync-state table, or a never-synced feed goes silently missing
+/// instead of showing up as never-synced.
+pub(crate) const CONFIGURED_SOURCES: &[&str] = &[malwarebazaar::SOURCE, threatfox::SOURCE];
+
 /// Runs every configured feed sync and returns a (source, result) pair per
 /// feed. The source label travels with its own result instead of being
 /// reconstructed positionally against a separately maintained list, so
@@ -25,8 +35,8 @@ pub(crate) fn parse_abusech_time(s: Option<&str>) -> Option<DateTime<Utc>> {
 /// to the analyst, not hidden.
 pub async fn run_all(pool: &PgPool, api_key: &str) -> Vec<(&'static str, Result<SyncSummary>)> {
     vec![
-        ("malwarebazaar", malwarebazaar::sync(pool, api_key).await),
-        ("threatfox", threatfox::sync(pool, api_key).await),
+        (malwarebazaar::SOURCE, malwarebazaar::sync(pool, api_key).await),
+        (threatfox::SOURCE, threatfox::sync(pool, api_key).await),
     ]
 }
 

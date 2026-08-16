@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT source, last_synced_at AS \"last_successful_sync_at\" FROM feed_sync_state ORDER BY source",
+  "query": "SELECT source, last_synced_at FROM feed_sync_state",
   "describe": {
     "columns": [
       {
@@ -10,7 +10,7 @@
       },
       {
         "ordinal": 1,
-        "name": "last_successful_sync_at",
+        "name": "last_synced_at",
         "type_info": "Timestamptz"
       }
     ],
@@ -22,5 +22,5 @@
       true
     ]
   },
-  "hash": "13f3dab20a7506d647bda8e7ba01d91725ac37d7b4960d21bcd47669a7b4bce8"
+  "hash": "56588f5c1b8c3fd28237209405b4fa11d29a0699719d88af1be7cb4c708e754e"
 }
