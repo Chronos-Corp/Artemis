@@ -1,11 +1,22 @@
 # 4NSIC
 
-DFIR triage and threat hunting tool. An analyst-facing correlation layer that
-sits alongside existing EDR, not a replacement for it.
+DFIR triage and threat hunting tool -- codenamed **Apollo**, the first
+committed product of the Chronos Corp portfolio thesis. See
+[`docs/chronos-constitution.md`](docs/chronos-constitution.md) for the
+founder-level source of truth on what Apollo is, what it isn't, and what's
+still genuinely open; this README covers the technical state of the repo,
+kept consistent with that document rather than repeating it. "4NSIC" is
+this repo's working name and shows up in the crate names
+(`nsic-core`/`nsic-agent`/`nsic-console`); "Apollo" is the product name.
 
-Core idea: a file manager where selecting a file surfaces everything known
-about it (IOC verdicts, campaign attribution, related CVEs, detection
-provenance). EDR tells you a file is bad. 4NSIC tells you which campaign it
+**Apollo's non-negotiable product promise:** selecting a file should
+progressively answer what it is, what it's for, whether it's expected here,
+and whether it's related to known IOCs, CVEs, APTs, campaigns, malware, or
+other risk-based threats. Selecting one of those relationships should let
+an analyst hunt the chosen recursive scope for associated evidence. File
+&rarr; understand &rarr; relate &rarr; pivot &rarr; hunt. An analyst-facing
+correlation layer that sits alongside existing EDR, not a replacement for
+it -- EDR tells you a file is bad, Apollo tells you which campaign it
 belongs to, which CVE it relates to, and what else on the host clusters
 with it.
 
@@ -43,6 +54,19 @@ What works today:
 
 What's stubbed or deliberately not built yet:
 
+- **The recursive relationship-to-directory pivot -- the other half of
+  Apollo's core product promise.** Today's verdict engine only goes one
+  direction: file in, correlation out. There is no command that goes the
+  other way -- pick a CVE/IOC/APT relationship a file surfaced, and scan
+  the chosen directory scope recursively for every other file associated
+  with it. `fs_browse.rs` lists one directory level at a time; nothing
+  walks a tree looking for matches. This is the current top priority, not
+  a someday item -- see
+  [`docs/chronos-constitution.md`](docs/chronos-constitution.md#7-apollo-the-first-proof-of-chronos).
+- **File-purpose intelligence.** The verdict engine answers "is this file
+  threat-relevant," never "what is this file, in general" (a legitimate
+  system binary vs. an unknown one, what it's normally for). Nothing here
+  yet; see Open &middot; 3 in the Constitution.
 - Fuzzy hashing (imphash / TLSH / ssdeep). The indicator kind and query
   path exist; nothing computes these values yet, so tier 2 (fuzzy match)
   never fires in Phase 0.
@@ -234,12 +258,18 @@ redistribution rights before architecting around any new feed.
 
 ## CVE hunting: hunt packs (Phase 2, not yet built)
 
-There is no authoritative CVE-to-IOC feed; that mapping has to be curated,
-and it is the product's actual moat. A hunt pack will be a per-CVE bundle
-(YARA rules, Sigma rules, file path and name patterns, registry keys,
-version checks), every element carrying provenance to the advisory or
-report it came from, ingested through an analyst review queue and never
-auto-published. Seed corpus: the CISA KEV list.
+There is no authoritative CVE-to-IOC feed; that mapping has to be curated.
+Curated relationship knowledge is a durable moat, but hunt packs
+themselves are machinery, not the product -- see
+[`docs/chronos-constitution.md`](docs/chronos-constitution.md#7-apollo-the-first-proof-of-chronos).
+What Apollo actually sells is the file &rarr; understand &rarr; relate
+&rarr; pivot &rarr; hunt loop; a hunt pack is one mechanism that feeds the
+pivot/hunt steps by turning a threat concept into an executable hunt. A
+hunt pack will be a per-CVE bundle (YARA rules, Sigma rules, file path and
+name patterns, registry keys, version checks), every element carrying
+provenance to the advisory or report it came from, ingested through an
+analyst review queue and never auto-published. Seed corpus: the CISA KEV
+list.
 
 ## Build order
 
@@ -267,27 +297,38 @@ Do not jump ahead; each phase de-risks the next.
   expansion (scheduling, richer deployment management, and the like) is
   deliberately paused here rather than continued out of momentum -- see
   the roadmap correction below.
-- **Roadmap correction (current focus):** an external review of the
+- **Roadmap correction (current focus, superseded by
+  [`docs/chronos-constitution.md`](docs/chronos-constitution.md) --
+  read that first if the two ever disagree):** an external review of the
   codebase pointed out that Phase 1 is the harder commercial sell --
-  "please deploy another endpoint agent" -- while this README's own hunt
-  pack description (above) already identifies the CVE-to-IOC mapping as
-  the product's actual moat, and nothing on that path had been built yet.
-  Endpoint fleet management is real, useful infrastructure, but it isn't
-  the wedge. Rather than keep building fleet features, the intelligence/
-  hunt-pack plane is promoted to the immediate next work, sequenced as:
-  intel freshness surfaced on every verdict (done -- see "What works
-  today" above), a hunt pack manifest format (YARA + Sigma + path/registry
-  signals + provenance, not a new rule language -- see "Locked
-  architecture decisions"), a first real KEV-seeded hunt pack, an adapter
-  boundary for running hunt packs against evidence from existing
-  security tools (not just this repo's own agent), first agentless hunt
-  execution, and normalizing those findings into the same evidence graph
-  everything else here already writes to. The endpoint agent becomes one
-  evidence source among several, not the prerequisite for using Apollo at
-  all -- the intel graph, provenance model, verdict engine, and console
-  APIs all survive this sequencing change unchanged.
+  "please deploy another endpoint agent" -- while nothing on the
+  intelligence/hunt-pack path had been built yet. Endpoint fleet
+  management is real, useful infrastructure, but it isn't the wedge.
+  The first pass at this correction over-rotated toward hunt packs
+  specifically; the Constitution's read is sharper: hunt packs are
+  machinery, Apollo's actual product promise is the file &rarr;
+  understand &rarr; relate &rarr; pivot &rarr; hunt loop itself, and
+  that loop's "pivot into a recursive hunt for associated evidence"
+  step doesn't exist yet at all -- today's verdict engine only goes
+  file-in, correlation-out, never indicator-in, matching-files-out.
+  Current sequencing: intel freshness surfaced on every verdict (done --
+  see "What works today" above), file-purpose intelligence (what a file
+  is actually *for*, not just its hash/reputation -- Open &middot; 3 in
+  the Constitution), the recursive relationship-to-directory-scan pivot
+  itself (working against the hash/YARA/path-pattern primitives already
+  in the verdict engine, not blocked on a hunt-pack format existing
+  first), then a hunt pack manifest format to make that pivot richer per
+  CVE (YARA + Sigma + path/registry signals + provenance, not a new rule
+  language -- see "Locked architecture decisions"), a first real
+  KEV-seeded pack, an adapter boundary for evidence from existing
+  security tools, first agentless hunt execution, and normalizing
+  findings into the same evidence graph everything else here already
+  writes to. The endpoint agent becomes one evidence source among
+  several, not the prerequisite for using Apollo at all -- the intel
+  graph, provenance model, verdict engine, and console APIs all survive
+  this sequencing change unchanged.
 - **Phase 2:** CVE hunt packs, KEV first -- see the roadmap correction
-  above for why this moved up.
+  above for sequencing relative to the core interaction loop.
 - **Phase 3:** Folder correlation scoring. Must come after real hunt/fleet
   telemetry exists because the scoring model cannot be tuned without it;
   building it early ships a false-positive generator.
