@@ -64,7 +64,7 @@ pub async fn resolve(
     // is the local-miss-skips-the-round-trip path the agent model depends
     // on for instant clicks at fleet scale.
     let bloom_hit = bloom.contains(&hash.sha256).await || bloom.contains(&hash.md5).await;
-    let mut malware_family_relationships = Vec::new();
+    let mut dedicated_relationships = Vec::new();
     if bloom_hit {
         let sha_rows = db::hash_matches(pool, IndicatorKind::Sha256, &hash.sha256).await?;
         entries.extend(db::hash_matches_to_provenance(
@@ -77,14 +77,18 @@ pub async fn resolve(
             VerdictTier::ExactHash,
         ));
 
-        // Malware-family attribution can only exist for a hash the bloom
-        // filter already knows about: `indicator_attributed_to_malware_family`
-        // foreign-keys onto the same `indicator` row `all_known_bad_hashes`
-        // (the bloom filter's own source) is built from. A bloom miss
-        // therefore provably means no family edge exists either, so this
-        // stays inside the same skip-the-round-trip path as the hash
-        // matches above rather than always running.
-        malware_family_relationships = db::malware_family_matches(pool, &hash.sha256).await?;
+        // Malware-family attribution and CVE relationships can only exist
+        // for a hash the bloom filter already knows about: both edge
+        // tables foreign-key onto the same `indicator` row
+        // `all_known_bad_hashes` (the bloom filter's own source) is built
+        // from. A bloom miss therefore provably means neither kind of edge
+        // exists either, so both stay inside the same skip-the-round-trip
+        // path as the hash matches above rather than always running.
+        // Checked against both hash kinds -- ThreatFox can source an MD5
+        // indicator with its own family/CVE edges, and checking sha256
+        // alone would silently omit them.
+        dedicated_relationships = db::malware_family_matches(pool, &hash.sha256, &hash.md5).await?;
+        dedicated_relationships.extend(db::cve_matches(pool, &hash.sha256, &hash.md5).await?);
     }
 
     // Tier 3: YARA is orthogonal to known-bad hash status, always runs.
@@ -131,12 +135,13 @@ pub async fn resolve(
 
     // The RELATE-stage structured relationship view (Apollo Constitution
     // §6): most kinds are pure-derived from the provenance entries already
-    // gathered above, but malware-family attribution has its own edge
-    // table (populated by ingestion, not derivable from provenance alone)
-    // so it needs its own query, fetched above alongside the other hash
+    // gathered above, but malware-family attribution and CVE relationships
+    // each have their own edge tables with their own provenance (populated
+    // by ingestion, not derivable from provenance entries alone) so they
+    // need their own queries, fetched above alongside the other hash
     // lookups.
     let mut threat_relationships = derive_relationships(&entries);
-    threat_relationships.extend(malware_family_relationships);
+    threat_relationships.extend(dedicated_relationships);
 
     Ok(Verdict {
         path: path_str,
@@ -310,15 +315,27 @@ mod tests {
             crate::db::indicators::upsert_indicator(&pool, IndicatorKind::Sha256, &hash.sha256)
                 .await
                 .expect("seed indicator");
+        let now = Utc::now();
+        let (report_id, _) = crate::db::indicators::upsert_report(
+            &pool,
+            "test-source",
+            Some(&unique_marker.to_string()),
+            Some("Test report"),
+            None,
+            Some(now),
+            &serde_json::json!({}),
+        )
+        .await
+        .expect("seed report");
         let family_name = format!("TestFamily-{unique_marker}");
         let (family_id, _) = crate::db::indicators::upsert_malware_family(&pool, &family_name)
             .await
             .expect("seed malware family");
-        let now = Utc::now();
         crate::db::indicators::upsert_indicator_attributed_to_malware_family(
             &pool,
             indicator_id,
             family_id,
+            report_id,
             "test-source",
             90,
             now,
@@ -348,7 +365,464 @@ mod tests {
                 )
             });
         assert_eq!(relationship.target, family_name);
-        assert_eq!(relationship.strength, crate::models::derive_strength(90));
+        // Strength is a literal Direct for family attribution -- a
+        // single-hop, explicitly sourced assertion -- not derived from
+        // confidence (see RelationshipStrength's doc comment for why
+        // those are kept separate).
+        assert_eq!(
+            relationship.strength,
+            crate::models::RelationshipStrength::Direct
+        );
+        assert_eq!(relationship.report_id, Some(report_id));
+    }
+
+    /// Review finding 4A: `malware_family_matches` originally hardcoded
+    /// `i.kind = 'sha256'`, silently omitting family attribution edges
+    /// sourced from an MD5-only indicator -- something ThreatFox actually
+    /// does (`md5_hash` IOC type). Seeds the attribution edge against the
+    /// *MD5* indicator only and inserts the bloom filter under the file's
+    /// MD5 (not its sha256), so this can only pass if the query genuinely
+    /// checks both hash kinds rather than sha256 alone.
+    #[tokio::test]
+    #[ignore]
+    async fn md5_sourced_family_attribution_surfaces_as_a_threat_relationship() {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://nsic:nsic@localhost:5432/nsic".to_string());
+        let pool = crate::db::connect_and_migrate(&database_url)
+            .await
+            .expect("connect to test database");
+
+        let rules_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("yara-rules");
+        let yara = Arc::new(YaraEngine::load(&rules_dir).expect("load yara rules"));
+        let bloom = BloomState::empty();
+        let recent_yara_hits = RecentYaraHits::new();
+
+        let mut tmp = tempfile::NamedTempFile::new().expect("create temp file");
+        let unique_marker = uuid::Uuid::new_v4();
+        tmp.write_all(format!("md5 family test content {unique_marker}").as_bytes())
+            .unwrap();
+        tmp.flush().unwrap();
+
+        let hash = crate::hashing::hash_file_cached(&pool, tmp.path())
+            .await
+            .expect("hash temp file");
+
+        let (indicator_id, _) =
+            crate::db::indicators::upsert_indicator(&pool, IndicatorKind::Md5, &hash.md5)
+                .await
+                .expect("seed md5 indicator");
+        let now = Utc::now();
+        let (report_id, _) = crate::db::indicators::upsert_report(
+            &pool,
+            "test-source",
+            Some(&unique_marker.to_string()),
+            Some("Test report"),
+            None,
+            Some(now),
+            &serde_json::json!({}),
+        )
+        .await
+        .expect("seed report");
+        let family_name = format!("Md5TestFamily-{unique_marker}");
+        let (family_id, _) = crate::db::indicators::upsert_malware_family(&pool, &family_name)
+            .await
+            .expect("seed malware family");
+        crate::db::indicators::upsert_indicator_attributed_to_malware_family(
+            &pool,
+            indicator_id,
+            family_id,
+            report_id,
+            "test-source",
+            90,
+            now,
+            now,
+        )
+        .await
+        .expect("seed attribution edge");
+
+        // Deliberately the MD5, not the sha256 -- proves the bloom gate and
+        // the query both actually check MD5, not just sha256.
+        bloom.insert(&hash.md5).await;
+
+        let verdict = resolve(&pool, &bloom, &yara, &recent_yara_hits, tmp.path())
+            .await
+            .expect("resolve verdict");
+
+        let relationship = verdict
+            .threat_relationships
+            .iter()
+            .find(|r| r.kind == crate::models::RelationshipKind::MalwareFamily)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a MalwareFamily relationship sourced from the MD5 indicator, got: {:?}",
+                    verdict.threat_relationships
+                )
+            });
+        assert_eq!(relationship.target, family_name);
+    }
+
+    /// Review finding 4B: the original `malware_family_matches` query
+    /// reconstructed the supporting report by joining
+    /// `indicator_observed_in_report` back on `(indicator_id, source)`
+    /// alone, instead of trusting the `report_id` already stored on the
+    /// attribution edge. That reconstruction is unsound whenever one source
+    /// has filed *two* reports observing the same indicator: it could
+    /// attribute the family to whichever report the join happened to pick,
+    /// including one that never asserted the family at all. This test
+    /// creates exactly that shape -- one indicator, two same-source
+    /// reports, and a family attribution edge that names only one of them
+    /// -- and asserts the surfaced relationship points at the *correct*
+    /// report, with no duplicate relationship pointing at the other.
+    #[tokio::test]
+    #[ignore]
+    async fn malware_family_attribution_does_not_cross_attribute_across_same_source_reports() {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://nsic:nsic@localhost:5432/nsic".to_string());
+        let pool = crate::db::connect_and_migrate(&database_url)
+            .await
+            .expect("connect to test database");
+
+        let rules_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("yara-rules");
+        let yara = Arc::new(YaraEngine::load(&rules_dir).expect("load yara rules"));
+        let bloom = BloomState::empty();
+        let recent_yara_hits = RecentYaraHits::new();
+
+        let mut tmp = tempfile::NamedTempFile::new().expect("create temp file");
+        let unique_marker = uuid::Uuid::new_v4();
+        tmp.write_all(format!("cross attribution test content {unique_marker}").as_bytes())
+            .unwrap();
+        tmp.flush().unwrap();
+
+        let hash = crate::hashing::hash_file_cached(&pool, tmp.path())
+            .await
+            .expect("hash temp file");
+
+        let (indicator_id, _) =
+            crate::db::indicators::upsert_indicator(&pool, IndicatorKind::Sha256, &hash.sha256)
+                .await
+                .expect("seed indicator");
+        let now = Utc::now();
+
+        // Two reports from the *same* source, both observing this
+        // indicator -- exactly the shape that broke the old
+        // `(indicator_id, source)` reconstruction join.
+        let (report_a_id, _) = crate::db::indicators::upsert_report(
+            &pool,
+            "test-source",
+            Some(&format!("A-{unique_marker}")),
+            Some("Report A -- does not assert the family"),
+            None,
+            Some(now),
+            &serde_json::json!({}),
+        )
+        .await
+        .expect("seed report A");
+        let (report_b_id, _) = crate::db::indicators::upsert_report(
+            &pool,
+            "test-source",
+            Some(&format!("B-{unique_marker}")),
+            Some("Report B -- asserts the family"),
+            None,
+            Some(now),
+            &serde_json::json!({}),
+        )
+        .await
+        .expect("seed report B");
+        crate::db::indicators::upsert_indicator_observed_in_report(
+            &pool,
+            indicator_id,
+            report_a_id,
+            "test-source",
+            50,
+            now,
+            now,
+        )
+        .await
+        .expect("seed indicator observed in report A");
+        crate::db::indicators::upsert_indicator_observed_in_report(
+            &pool,
+            indicator_id,
+            report_b_id,
+            "test-source",
+            50,
+            now,
+            now,
+        )
+        .await
+        .expect("seed indicator observed in report B");
+
+        let family_name = format!("CrossAttributionFamily-{unique_marker}");
+        let (family_id, _) = crate::db::indicators::upsert_malware_family(&pool, &family_name)
+            .await
+            .expect("seed malware family");
+        // Only report B's edge names the family.
+        crate::db::indicators::upsert_indicator_attributed_to_malware_family(
+            &pool,
+            indicator_id,
+            family_id,
+            report_b_id,
+            "test-source",
+            90,
+            now,
+            now,
+        )
+        .await
+        .expect("seed attribution edge for report B only");
+
+        bloom.insert(&hash.sha256).await;
+
+        let verdict = resolve(&pool, &bloom, &yara, &recent_yara_hits, tmp.path())
+            .await
+            .expect("resolve verdict");
+
+        let matches: Vec<_> = verdict
+            .threat_relationships
+            .iter()
+            .filter(|r| r.kind == crate::models::RelationshipKind::MalwareFamily)
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one MalwareFamily relationship (no cross-attribution or \
+             duplication across the two same-source reports), got: {:?}",
+            matches
+        );
+        assert_eq!(
+            matches[0].report_id,
+            Some(report_b_id),
+            "the relationship must point at report B, the only report whose edge actually \
+             asserts the family -- not report A, which merely observed the same indicator \
+             from the same source"
+        );
+    }
+
+    /// Review finding 3: CVE relationships must carry the CVE-specific
+    /// edge's own provenance (`report_references_cve` / `detection_covers_cve`),
+    /// never the parent edge's (`indicator_observed_in_report` /
+    /// `detection_detects_indicator`). Both parent and CVE edges below are
+    /// deliberately seeded with different source names, confidences, and
+    /// timestamps so a flattening bug (copying the parent edge's
+    /// provenance, as the pre-review code did for the now-removed
+    /// `cve_ids` loop) cannot pass by coincidence.
+    #[tokio::test]
+    #[ignore]
+    async fn cve_relationship_carries_its_own_edge_provenance_not_the_parent_edges() {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://nsic:nsic@localhost:5432/nsic".to_string());
+        let pool = crate::db::connect_and_migrate(&database_url)
+            .await
+            .expect("connect to test database");
+
+        let rules_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("yara-rules");
+        let yara = Arc::new(YaraEngine::load(&rules_dir).expect("load yara rules"));
+        let bloom = BloomState::empty();
+        let recent_yara_hits = RecentYaraHits::new();
+
+        // Truncated to microsecond precision: Postgres TIMESTAMPTZ stores
+        // microseconds, but `Utc::now()` carries nanoseconds, so comparing
+        // an as-constructed value against one round-tripped through the
+        // database would spuriously fail on the truncated nanosecond tail.
+        use chrono::SubsecRound;
+        let parent_first_seen = (Utc::now() - chrono::Duration::days(30)).trunc_subsecs(6);
+        let parent_last_seen = (Utc::now() - chrono::Duration::days(29)).trunc_subsecs(6);
+        let cve_first_seen = (Utc::now() - chrono::Duration::days(2)).trunc_subsecs(6);
+        let cve_last_seen = (Utc::now() - chrono::Duration::days(1)).trunc_subsecs(6);
+
+        // --- Two-hop path: indicator --observed_in--> report --references--> cve ---
+        let mut tmp_report = tempfile::NamedTempFile::new().expect("create temp file");
+        let marker_report = uuid::Uuid::new_v4();
+        tmp_report
+            .write_all(format!("cve via report test content {marker_report}").as_bytes())
+            .unwrap();
+        tmp_report.flush().unwrap();
+        let hash_report = crate::hashing::hash_file_cached(&pool, tmp_report.path())
+            .await
+            .expect("hash temp file");
+
+        let (indicator_report_id, _) = crate::db::indicators::upsert_indicator(
+            &pool,
+            IndicatorKind::Sha256,
+            &hash_report.sha256,
+        )
+        .await
+        .expect("seed indicator");
+        let (report_id, _) = crate::db::indicators::upsert_report(
+            &pool,
+            "test-source",
+            Some(&marker_report.to_string()),
+            Some("Test report"),
+            None,
+            Some(parent_first_seen),
+            &serde_json::json!({}),
+        )
+        .await
+        .expect("seed report");
+        crate::db::indicators::upsert_indicator_observed_in_report(
+            &pool,
+            indicator_report_id,
+            report_id,
+            "parent-edge-source",
+            20,
+            parent_first_seen,
+            parent_last_seen,
+        )
+        .await
+        .expect("seed indicator observed in report");
+
+        let cve_via_report_id = format!("CVE-TEST-{}", marker_report.simple());
+        crate::db::indicators::upsert_cve(&pool, &cve_via_report_id, None, None, None)
+            .await
+            .expect("seed cve");
+        crate::db::indicators::upsert_report_references_cve(
+            &pool,
+            report_id,
+            &cve_via_report_id,
+            "cve-edge-source",
+            77,
+            cve_first_seen,
+            cve_last_seen,
+        )
+        .await
+        .expect("seed report references cve");
+
+        bloom.insert(&hash_report.sha256).await;
+        let verdict_report = resolve(&pool, &bloom, &yara, &recent_yara_hits, tmp_report.path())
+            .await
+            .expect("resolve verdict for report path");
+
+        let via_report = verdict_report
+            .threat_relationships
+            .iter()
+            .find(|r| {
+                r.kind == crate::models::RelationshipKind::Cve && r.target == cve_via_report_id
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a Cve relationship for {cve_via_report_id}, got: {:?}",
+                    verdict_report.threat_relationships
+                )
+            });
+        assert_eq!(
+            via_report.source, "cve-edge-source",
+            "must carry report_references_cve's own source, not indicator_observed_in_report's"
+        );
+        assert_eq!(
+            via_report.confidence, 77,
+            "must carry report_references_cve's own confidence, not indicator_observed_in_report's"
+        );
+        assert_eq!(via_report.first_seen, cve_first_seen);
+        assert_eq!(via_report.last_seen, cve_last_seen);
+        assert_eq!(
+            via_report.strength,
+            crate::models::RelationshipStrength::Contextual,
+            "report co-occurrence is a two-hop inference, not a direct per-file assertion"
+        );
+
+        // --- One-hop path: detection --detects--> indicator, detection --covers--> cve ---
+        let mut tmp_detection = tempfile::NamedTempFile::new().expect("create temp file");
+        let marker_detection = uuid::Uuid::new_v4();
+        tmp_detection
+            .write_all(format!("cve via detection test content {marker_detection}").as_bytes())
+            .unwrap();
+        tmp_detection.flush().unwrap();
+        let hash_detection = crate::hashing::hash_file_cached(&pool, tmp_detection.path())
+            .await
+            .expect("hash temp file");
+
+        let (indicator_detection_id, _) = crate::db::indicators::upsert_indicator(
+            &pool,
+            IndicatorKind::Sha256,
+            &hash_detection.sha256,
+        )
+        .await
+        .expect("seed indicator");
+        let detection_id = crate::db::indicators::upsert_detection(
+            &pool,
+            DetectionKind::Yara,
+            &format!("TestRule-{marker_detection}"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("seed detection");
+        crate::db::indicators::upsert_detection_detects_indicator(
+            &pool,
+            detection_id,
+            indicator_detection_id,
+            "parent-edge-source",
+            35,
+            parent_first_seen,
+            parent_last_seen,
+        )
+        .await
+        .expect("seed detection detects indicator");
+
+        let cve_via_detection_id = format!("CVE-TEST-{}", marker_detection.simple());
+        crate::db::indicators::upsert_cve(&pool, &cve_via_detection_id, None, None, None)
+            .await
+            .expect("seed cve");
+        crate::db::indicators::upsert_detection_covers_cve(
+            &pool,
+            detection_id,
+            &cve_via_detection_id,
+            "covers-edge-source",
+            88,
+            cve_first_seen,
+            cve_last_seen,
+        )
+        .await
+        .expect("seed detection covers cve");
+
+        bloom.insert(&hash_detection.sha256).await;
+        let verdict_detection = resolve(
+            &pool,
+            &bloom,
+            &yara,
+            &recent_yara_hits,
+            tmp_detection.path(),
+        )
+        .await
+        .expect("resolve verdict for detection path");
+
+        let via_detection = verdict_detection
+            .threat_relationships
+            .iter()
+            .find(|r| {
+                r.kind == crate::models::RelationshipKind::Cve && r.target == cve_via_detection_id
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a Cve relationship for {cve_via_detection_id}, got: {:?}",
+                    verdict_detection.threat_relationships
+                )
+            });
+        assert_eq!(
+            via_detection.source, "covers-edge-source",
+            "must carry detection_covers_cve's own source, not detection_detects_indicator's"
+        );
+        assert_eq!(
+            via_detection.confidence, 88,
+            "must carry detection_covers_cve's own confidence, not detection_detects_indicator's"
+        );
+        assert_eq!(via_detection.first_seen, cve_first_seen);
+        assert_eq!(via_detection.last_seen, cve_last_seen);
+        assert_eq!(
+            via_detection.strength,
+            crate::models::RelationshipStrength::Strong,
+            "a detection matching this exact file is one hop tighter than report \
+             co-occurrence, but covering a CVE is still the detection's own documented \
+             scope, not a per-file assertion, so this must not be Direct"
+        );
     }
 
     /// `intel_freshness` must reflect `feed_sync_state`, not just exist as

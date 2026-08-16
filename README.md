@@ -83,22 +83,42 @@ What works today:
   Every relationship carries an explicit `kind` (IOC / CVE / threat actor /
   campaign / malware family / ATT&amp;CK technique / detection / risk-based)
   and `strength` (direct/strong/contextual/weak -- Open &middot; 3's
-  requested vocabulary, `derive_strength`, a first HYPOTHESIS-level answer
-  banded from confidence values already in real use across the codebase,
-  not a locked one), plus an `explanation` stating what a hunt on it would
-  look for. Most relationships are pure-derived from existing provenance
-  entries (`derive_relationships`); **malware family attribution is newly
-  real data**, not just restructured existing data -- MalwareBazaar's
+  requested vocabulary). `strength` is set as a literal at each construction
+  site based on the *evidence mechanism* -- an exact hash match is `Direct`,
+  a YARA rule firing is a `Detection` (not an `Ioc`) at `Direct`, a
+  two-hop CVE inference through report co-occurrence is `Contextual` -- and
+  is never derived from a source's confidence number, which is an
+  orthogonal dimension (a low-confidence exact match is still `Direct`; a
+  high-confidence filename-only match is still `Weak`). Most relationships
+  are pure-derived from existing provenance entries
+  (`derive_relationships`), and only for tiers that are genuine
+  indicator-table lookups (`ExactHash`/`FuzzyHash`/`PathPattern`); a YARA
+  hit produces a `Detection` relationship only, and a contextual filename
+  match produces a `RiskBased` relationship only, since neither ever
+  touched the indicator table. **Malware family attribution is newly real
+  data**, not just restructured existing data -- MalwareBazaar's
   `signature` and ThreatFox's `malware_printable` fields were previously
   only used as report title text, now upserted as their own graph node and
   edge (`malware_family` / `indicator_attributed_to_malware_family`,
-  migration `0009`). CVE/threat-actor/campaign relationship kinds are
-  structurally supported (the graph tables already existed) but correctly
-  surface no data yet, since no ingestion populates them until later
-  hunt-pack work; ATT&amp;CK technique has no data source at all yet and is
-  declared in the vocabulary without a code path, the same precedent
-  `DetectionKind::Sigma` already sets for detection content this codebase
-  doesn't ingest either.
+  migration `0009`), checked against both sha256 and md5 indicators, with
+  the supporting report's ID stored directly on the edge rather than
+  reconstructed later -- reconstructing it via a join back to
+  `indicator_observed_in_report` on `(indicator_id, source)` alone can
+  cross-attribute or duplicate whenever a source has filed more than one
+  report for the same indicator. CVE relationships are read from their own
+  dedicated queries (`db::indicators::cve_matches_via_report` /
+  `cve_matches_via_detection`), each preserving the CVE-specific edge's own
+  `source`/`confidence`/timestamps rather than the parent edge's --
+  `report_references_cve --> Contextual` (a two-hop report co-occurrence
+  inference) and `detection_covers_cve --> Strong` (one hop tighter: the
+  detection matched this exact file, though covering a CVE is still the
+  detection's own documented scope, not a per-file assertion). Threat-actor
+  and campaign relationship kinds are structurally supported (the graph
+  tables already existed) but correctly surface no data yet, since no
+  ingestion populates them until later hunt-pack work; ATT&amp;CK technique
+  has no data source at all yet and is declared in the vocabulary without a
+  code path, the same precedent `DetectionKind::Sigma` already sets for
+  detection content this codebase doesn't ingest either.
 
 What's stubbed or deliberately not built yet, in build order (see
 [`docs/apollo-constitution.md`](docs/apollo-constitution.md#12-current-product-build-doctrine)

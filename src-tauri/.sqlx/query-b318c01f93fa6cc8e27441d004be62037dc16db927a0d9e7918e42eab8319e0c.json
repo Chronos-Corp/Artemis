@@ -1,11 +1,11 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            mf.name AS family_name,\n            iamf.source,\n            iamf.confidence,\n            iamf.first_seen,\n            iamf.last_seen,\n            r.id AS \"report_id?\",\n            r.title AS report_title,\n            r.url AS report_url\n        FROM indicator i\n        JOIN indicator_attributed_to_malware_family iamf ON iamf.indicator_id = i.id\n        JOIN malware_family mf ON mf.id = iamf.malware_family_id\n        LEFT JOIN indicator_observed_in_report iorr\n            ON iorr.indicator_id = i.id AND iorr.source = iamf.source\n        LEFT JOIN report r ON r.id = iorr.report_id\n        WHERE i.kind = 'sha256' AND i.value = $1\n        ",
+  "query": "\n        SELECT\n            rrc.cve_id,\n            rrc.source,\n            rrc.confidence,\n            rrc.first_seen,\n            rrc.last_seen,\n            r.id AS report_id,\n            r.title AS report_title,\n            r.url AS report_url\n        FROM indicator i\n        JOIN indicator_observed_in_report iorr ON iorr.indicator_id = i.id\n        JOIN report r ON r.id = iorr.report_id\n        JOIN report_references_cve rrc ON rrc.report_id = r.id\n        WHERE (i.kind = 'sha256' AND i.value = $1) OR (i.kind = 'md5' AND i.value = $2)\n        ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "family_name",
+        "name": "cve_id",
         "type_info": "Text"
       },
       {
@@ -30,7 +30,7 @@
       },
       {
         "ordinal": 5,
-        "name": "report_id?",
+        "name": "report_id",
         "type_info": "Uuid"
       },
       {
@@ -46,6 +46,7 @@
     ],
     "parameters": {
       "Left": [
+        "Text",
         "Text"
       ]
     },
@@ -60,5 +61,5 @@
       true
     ]
   },
-  "hash": "9054886347a320c86493ed0c9a1583e51f5ed6bf4611c980d2ba25db3099e582"
+  "hash": "b318c01f93fa6cc8e27441d004be62037dc16db927a0d9e7918e42eab8319e0c"
 }

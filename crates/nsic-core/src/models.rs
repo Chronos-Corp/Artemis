@@ -134,10 +134,25 @@ pub enum RelationshipKind {
 /// and weak association, so "related to" cannot flatten into an unbounded
 /// graph of technically-true but operationally-useless connections.
 ///
-/// This is a first concrete implementation of that still-open question
-/// (see `derive_strength`), not a final answer to it -- the Constitution
-/// marks the underlying question open, and this ships something to test
-/// against rather than leaving the vocabulary undefined.
+/// Deliberately derived from the relationship's *evidence mechanism* --
+/// which tier or edge established it, i.e. how directly it connects this
+/// exact file to the target -- never from `confidence`. A first version of
+/// this banded `strength` straight off `confidence`, which a review
+/// correctly rejected: those are orthogonal. `confidence` is how much the
+/// *sourcing feed* trusts its own data; `strength` is what *kind* of
+/// evidence path connects file to concept. A 50%-confidence exact hash
+/// match is still direct evidence (the match itself is unambiguous, only
+/// the source's trust in its own data is middling); a 95%-confidence
+/// filename-only match is still contextual (no amount of source confidence
+/// turns "same filename" into "same file"). Every construction site below
+/// sets `strength` as a literal for exactly this reason -- it is a
+/// property of *which code path* produced the relationship, not a
+/// computed function of any one field on it.
+///
+/// This is a first concrete implementation of Open·3, not a final answer
+/// to it -- the Constitution marks the underlying question open, and this
+/// ships something to test against rather than leaving the vocabulary
+/// undefined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RelationshipStrength {
@@ -172,101 +187,42 @@ pub struct ThreatRelationship {
     pub report_url: Option<String>,
 }
 
-/// Maps a confidence score to a `RelationshipStrength` band. The exact
-/// thresholds are drawn from confidence values already in real use across
-/// this codebase, not arbitrary: MalwareBazaar's curated-feed confidence is
-/// 90 (`ingest::malwarebazaar::CONFIDENCE`), a live local YARA hit is
-/// recorded at 65 (`verdict::record_yara_hit`), and the weakest existing
-/// tier -- filename-only contextual association -- is hardcoded at 25
-/// (`db::indicators::contextual_matches`). The bands are drawn to keep each
-/// of those three real values in the band its own tier already implies
-/// (Direct/Strong/Weak respectively), with `Contextual` filling the gap
-/// between "a real detection fired" and "genuinely weak association."
-///
-/// This is a HYPOTHESIS-level answer to Open·3, not a locked one: the
-/// Constitution's own framing calls for testing analyst precision/recall
-/// expectations against real use before treating any specific banding as
-/// settled.
-pub fn derive_strength(confidence: i16) -> RelationshipStrength {
-    match confidence {
-        85..=100 => RelationshipStrength::Direct,
-        60..=84 => RelationshipStrength::Strong,
-        35..=59 => RelationshipStrength::Contextual,
-        _ => RelationshipStrength::Weak,
-    }
-}
-
 /// Derives the structured relationship view from a verdict's existing
 /// provenance entries -- pure and DB-free, since every fact it needs
-/// (tier, confidence, matched value, CVE IDs, provenance) already lives on
+/// (tier, confidence, matched value, provenance) already lives on
 /// `ProvenanceEntry`. Kept separate from `ThreatRelationship`s that come
-/// from a dedicated relationship query (e.g. malware-family attribution,
-/// which has its own table and isn't derivable from provenance alone) --
+/// from a dedicated relationship query (malware-family attribution, CVE
+/// relationships -- both have their own edge tables with their own
+/// provenance and are not derivable from provenance entries alone) --
 /// callers combine both.
 ///
-/// One `ProvenanceEntry` can become more than one `ThreatRelationship`:
-/// every entry is at least an IOC relationship (the indicator match
-/// itself), a `YaraHit` is additionally a Detection relationship, a
-/// `PathPattern`/`Contextual` entry is additionally a risk-based
-/// relationship (the Constitution's risk-based category names "unusual
-/// location" as an example), and any CVE IDs the entry carries become
-/// their own CVE relationships.
+/// Each tier maps to relationship kinds by evidence *mechanism*, not
+/// uniformly: a review caught a previous version of this function wrapping
+/// every provenance entry in an IOC relationship regardless of tier, which
+/// misrepresented a YARA rule firing (pattern-match evidence, not an
+/// indicator-table lookup) and a filename-only contextual hit (never
+/// touched the indicator table at all) as if they were known indicators.
+/// `ExactHash`/`FuzzyHash`/`PathPattern` are genuine indicator-table
+/// lookups (the Constitution's own IOC examples explicitly include path
+/// indicators), so those three still produce an `Ioc` relationship;
+/// `YaraHit` produces `Detection` only, and `Contextual` produces
+/// `RiskBased` only. CVE IDs are deliberately not read from
+/// `entry.cve_ids` here at all -- see `db::indicators::cve_matches`'s doc
+/// comment for why that data has already lost the provenance a
+/// `ThreatRelationship` needs by the time it reaches a `ProvenanceEntry`.
 pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationship> {
     let mut relationships = Vec::new();
 
     for entry in entries {
-        let strength = derive_strength(entry.confidence);
-
-        let ioc_explanation = match entry.tier {
+        match entry.tier {
             VerdictTier::ExactHash => {
-                "Exact hash match against a known indicator -- find other hosts or paths where \
-                 this same indicator has been observed."
-                    .to_string()
-            }
-            VerdictTier::FuzzyHash => {
-                "Fuzzy hash similarity to a known indicator -- a close but non-exact match worth \
-                 corroborating with other evidence."
-                    .to_string()
-            }
-            VerdictTier::YaraHit => {
-                "Matched a local detection rule -- see the Detection relationship for the rule \
-                 itself."
-                    .to_string()
-            }
-            VerdictTier::PathPattern => {
-                "Path or naming pattern matched a known indicator -- weaker than a content match, \
-                 worth checking alongside other evidence."
-                    .to_string()
-            }
-            VerdictTier::Contextual => {
-                "Filename matches a known sample name with no hash or rule match -- the weakest \
-                 signal here; corroborate before treating this as meaningful."
-                    .to_string()
-            }
-        };
-        relationships.push(ThreatRelationship {
-            kind: RelationshipKind::Ioc,
-            strength,
-            target: entry.matched_value.clone(),
-            explanation: ioc_explanation,
-            source: entry.source.clone(),
-            confidence: entry.confidence,
-            first_seen: entry.first_seen,
-            last_seen: entry.last_seen,
-            report_id: entry.report_id,
-            report_title: entry.report_title.clone(),
-            report_url: entry.report_url.clone(),
-        });
-
-        if entry.tier == VerdictTier::YaraHit {
-            if let Some(detection_name) = &entry.detection_name {
                 relationships.push(ThreatRelationship {
-                    kind: RelationshipKind::Detection,
-                    strength,
-                    target: detection_name.clone(),
+                    kind: RelationshipKind::Ioc,
+                    strength: RelationshipStrength::Direct,
+                    target: entry.matched_value.clone(),
                     explanation:
-                        "A local YARA rule fired against this exact file -- run the rule or trace \
-                         its logic to see exactly what it matched on."
+                        "Exact hash match against a known indicator -- find other hosts or paths \
+                         where this same indicator has been observed."
                             .to_string(),
                     source: entry.source.clone(),
                     confidence: entry.confidence,
@@ -277,47 +233,97 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
                     report_url: entry.report_url.clone(),
                 });
             }
-        }
-
-        if matches!(
-            entry.tier,
-            VerdictTier::PathPattern | VerdictTier::Contextual
-        ) {
-            relationships.push(ThreatRelationship {
-                kind: RelationshipKind::RiskBased,
-                strength,
-                target: entry.matched_value.clone(),
-                explanation:
-                    "Location or naming association only, not a content or hash match -- expand \
-                     the contextual hunt without treating this as direct compromise evidence."
-                        .to_string(),
-                source: entry.source.clone(),
-                confidence: entry.confidence,
-                first_seen: entry.first_seen,
-                last_seen: entry.last_seen,
-                report_id: entry.report_id,
-                report_title: entry.report_title.clone(),
-                report_url: entry.report_url.clone(),
-            });
-        }
-
-        for cve_id in &entry.cve_ids {
-            relationships.push(ThreatRelationship {
-                kind: RelationshipKind::Cve,
-                strength,
-                target: cve_id.clone(),
-                explanation:
-                    "This file is linked to a CVE -- assess exposure and hunt for exploitation \
-                     evidence, not just the vulnerable version's presence."
-                        .to_string(),
-                source: entry.source.clone(),
-                confidence: entry.confidence,
-                first_seen: entry.first_seen,
-                last_seen: entry.last_seen,
-                report_id: entry.report_id,
-                report_title: entry.report_title.clone(),
-                report_url: entry.report_url.clone(),
-            });
+            VerdictTier::FuzzyHash => {
+                relationships.push(ThreatRelationship {
+                    kind: RelationshipKind::Ioc,
+                    strength: RelationshipStrength::Strong,
+                    target: entry.matched_value.clone(),
+                    explanation:
+                        "Fuzzy hash similarity to a known indicator -- a close but non-exact \
+                         match worth corroborating with other evidence."
+                            .to_string(),
+                    source: entry.source.clone(),
+                    confidence: entry.confidence,
+                    first_seen: entry.first_seen,
+                    last_seen: entry.last_seen,
+                    report_id: entry.report_id,
+                    report_title: entry.report_title.clone(),
+                    report_url: entry.report_url.clone(),
+                });
+            }
+            VerdictTier::YaraHit => {
+                if let Some(detection_name) = &entry.detection_name {
+                    relationships.push(ThreatRelationship {
+                        kind: RelationshipKind::Detection,
+                        strength: RelationshipStrength::Direct,
+                        target: detection_name.clone(),
+                        explanation:
+                            "A local YARA rule fired against this exact file -- run the rule or \
+                             trace its logic to see exactly what it matched on."
+                                .to_string(),
+                        source: entry.source.clone(),
+                        confidence: entry.confidence,
+                        first_seen: entry.first_seen,
+                        last_seen: entry.last_seen,
+                        report_id: entry.report_id,
+                        report_title: entry.report_title.clone(),
+                        report_url: entry.report_url.clone(),
+                    });
+                }
+            }
+            VerdictTier::PathPattern => {
+                relationships.push(ThreatRelationship {
+                    kind: RelationshipKind::Ioc,
+                    strength: RelationshipStrength::Contextual,
+                    target: entry.matched_value.clone(),
+                    explanation:
+                        "Path or naming pattern matched a known indicator -- weaker than a \
+                         content match, worth checking alongside other evidence."
+                            .to_string(),
+                    source: entry.source.clone(),
+                    confidence: entry.confidence,
+                    first_seen: entry.first_seen,
+                    last_seen: entry.last_seen,
+                    report_id: entry.report_id,
+                    report_title: entry.report_title.clone(),
+                    report_url: entry.report_url.clone(),
+                });
+                relationships.push(ThreatRelationship {
+                    kind: RelationshipKind::RiskBased,
+                    strength: RelationshipStrength::Contextual,
+                    target: entry.matched_value.clone(),
+                    explanation:
+                        "Location or naming association only, not a content match -- expand the \
+                         contextual hunt without treating this as direct compromise evidence."
+                            .to_string(),
+                    source: entry.source.clone(),
+                    confidence: entry.confidence,
+                    first_seen: entry.first_seen,
+                    last_seen: entry.last_seen,
+                    report_id: entry.report_id,
+                    report_title: entry.report_title.clone(),
+                    report_url: entry.report_url.clone(),
+                });
+            }
+            VerdictTier::Contextual => {
+                relationships.push(ThreatRelationship {
+                    kind: RelationshipKind::RiskBased,
+                    strength: RelationshipStrength::Weak,
+                    target: entry.matched_value.clone(),
+                    explanation:
+                        "Filename matches a known sample name with no hash or rule match -- never \
+                         passed through the indicator table, so this is not itself a known IOC. \
+                         The weakest signal here; corroborate before treating this as meaningful."
+                            .to_string(),
+                    source: entry.source.clone(),
+                    confidence: entry.confidence,
+                    first_seen: entry.first_seen,
+                    last_seen: entry.last_seen,
+                    report_id: entry.report_id,
+                    report_title: entry.report_title.clone(),
+                    report_url: entry.report_url.clone(),
+                });
+            }
         }
     }
 
@@ -345,38 +351,6 @@ mod tests {
         }
     }
 
-    // ---- derive_strength ----
-    //
-    // Thresholds are drawn from real confidence values already in use
-    // elsewhere in this codebase -- see derive_strength's doc comment.
-
-    #[test]
-    fn malwarebazaar_confidence_is_direct() {
-        assert_eq!(derive_strength(90), RelationshipStrength::Direct);
-    }
-
-    #[test]
-    fn yara_hit_confidence_is_strong() {
-        assert_eq!(derive_strength(65), RelationshipStrength::Strong);
-    }
-
-    #[test]
-    fn contextual_confidence_is_weak() {
-        assert_eq!(derive_strength(25), RelationshipStrength::Weak);
-    }
-
-    #[test]
-    fn strength_bands_are_ordered_and_exhaustive() {
-        assert_eq!(derive_strength(0), RelationshipStrength::Weak);
-        assert_eq!(derive_strength(34), RelationshipStrength::Weak);
-        assert_eq!(derive_strength(35), RelationshipStrength::Contextual);
-        assert_eq!(derive_strength(59), RelationshipStrength::Contextual);
-        assert_eq!(derive_strength(60), RelationshipStrength::Strong);
-        assert_eq!(derive_strength(84), RelationshipStrength::Strong);
-        assert_eq!(derive_strength(85), RelationshipStrength::Direct);
-        assert_eq!(derive_strength(100), RelationshipStrength::Direct);
-    }
-
     #[test]
     fn strength_is_totally_ordered_weak_to_direct() {
         assert!(RelationshipStrength::Weak < RelationshipStrength::Contextual);
@@ -385,9 +359,19 @@ mod tests {
     }
 
     // ---- derive_relationships ----
+    //
+    // A review's merge-blocking finding: a previous version of this
+    // function wrapped every provenance entry in an IOC relationship
+    // regardless of tier, which misrepresented a YARA rule firing (pattern
+    // evidence, not an indicator-table lookup) and a filename-only
+    // contextual hit (never touched the indicator table) as if they were
+    // known indicators. The tests below specifically assert the *absence*
+    // of an IOC relationship for those two tiers, not just the presence of
+    // the right one, since that's the exact defect a passing-but-
+    // insufficiently-specific test could hide again.
 
     #[test]
-    fn exact_hash_entry_becomes_an_ioc_relationship() {
+    fn exact_hash_entry_becomes_a_direct_ioc_relationship() {
         let entries = vec![entry(VerdictTier::ExactHash, 90, vec![])];
         let relationships = derive_relationships(&entries);
         assert_eq!(relationships.len(), 1);
@@ -397,61 +381,101 @@ mod tests {
     }
 
     #[test]
-    fn yara_hit_becomes_both_an_ioc_and_a_detection_relationship() {
+    fn fuzzy_hash_entry_becomes_a_strong_ioc_relationship() {
+        let entries = vec![entry(VerdictTier::FuzzyHash, 70, vec![])];
+        let relationships = derive_relationships(&entries);
+        assert_eq!(relationships.len(), 1);
+        assert_eq!(relationships[0].kind, RelationshipKind::Ioc);
+        assert_eq!(relationships[0].strength, RelationshipStrength::Strong);
+    }
+
+    #[test]
+    fn yara_hit_becomes_a_detection_relationship_only_not_an_ioc() {
         let entries = vec![entry(VerdictTier::YaraHit, 65, vec![])];
         let relationships = derive_relationships(&entries);
-        assert_eq!(relationships.len(), 2);
-        assert!(relationships
-            .iter()
-            .any(|r| r.kind == RelationshipKind::Ioc));
-        let detection = relationships
-            .iter()
-            .find(|r| r.kind == RelationshipKind::Detection)
-            .expect("expected a Detection relationship for a YARA hit");
-        assert_eq!(detection.target, "Test_Rule");
-        assert_eq!(detection.strength, RelationshipStrength::Strong);
+        assert_eq!(
+            relationships.len(),
+            1,
+            "a YARA rule firing is pattern-match evidence, not an indicator-table lookup, and \
+             must not also produce an IOC relationship: {relationships:?}"
+        );
+        assert_eq!(relationships[0].kind, RelationshipKind::Detection);
+        assert_eq!(relationships[0].strength, RelationshipStrength::Direct);
+        assert_eq!(relationships[0].target, "Test_Rule");
     }
 
     #[test]
     fn path_pattern_becomes_both_an_ioc_and_a_risk_based_relationship() {
+        // Path indicators are a genuine indicator-table lookup (the
+        // Constitution's own IOC examples explicitly include path
+        // indicators), so PathPattern is the one tier that legitimately
+        // produces both.
         let entries = vec![entry(VerdictTier::PathPattern, 50, vec![])];
         let relationships = derive_relationships(&entries);
         assert_eq!(relationships.len(), 2);
-        assert!(relationships
+        let ioc = relationships
             .iter()
-            .any(|r| r.kind == RelationshipKind::Ioc));
-        assert!(relationships
+            .find(|r| r.kind == RelationshipKind::Ioc)
+            .expect("expected an Ioc relationship for PathPattern");
+        assert_eq!(ioc.strength, RelationshipStrength::Contextual);
+        let risk = relationships
             .iter()
-            .any(|r| r.kind == RelationshipKind::RiskBased));
+            .find(|r| r.kind == RelationshipKind::RiskBased)
+            .expect("expected a RiskBased relationship for PathPattern");
+        assert_eq!(risk.strength, RelationshipStrength::Contextual);
     }
 
     #[test]
-    fn contextual_becomes_both_an_ioc_and_a_risk_based_relationship() {
+    fn contextual_becomes_a_risk_based_relationship_only_not_an_ioc() {
         let entries = vec![entry(VerdictTier::Contextual, 25, vec![])];
         let relationships = derive_relationships(&entries);
-        assert_eq!(relationships.len(), 2);
-        assert!(relationships
-            .iter()
-            .any(|r| r.kind == RelationshipKind::RiskBased
-                && r.strength == RelationshipStrength::Weak));
+        assert_eq!(
+            relationships.len(),
+            1,
+            "a filename-only contextual match never touched the indicator table and must not \
+             also produce an IOC relationship: {relationships:?}"
+        );
+        assert_eq!(relationships[0].kind, RelationshipKind::RiskBased);
+        assert_eq!(relationships[0].strength, RelationshipStrength::Weak);
     }
 
     #[test]
-    fn cve_ids_become_their_own_relationships() {
+    fn strength_does_not_track_confidence() {
+        // The other merge-blocking finding: strength must come from the
+        // evidence mechanism, not the source's confidence number. A
+        // low-confidence exact match is still Direct; a high-confidence
+        // contextual match is still Weak.
+        let low_confidence_exact = vec![entry(VerdictTier::ExactHash, 10, vec![])];
+        assert_eq!(
+            derive_relationships(&low_confidence_exact)[0].strength,
+            RelationshipStrength::Direct
+        );
+
+        let high_confidence_contextual = vec![entry(VerdictTier::Contextual, 99, vec![])];
+        assert_eq!(
+            derive_relationships(&high_confidence_contextual)[0].strength,
+            RelationshipStrength::Weak
+        );
+    }
+
+    #[test]
+    fn cve_ids_on_the_entry_do_not_produce_relationships_here() {
+        // CVE relationships are deliberately not derived from
+        // ProvenanceEntry.cve_ids at all -- that field has already lost
+        // the CVE edge's own provenance by the time it reaches this pure
+        // function (see db::indicators::cve_matches's doc comment, which
+        // is where CVE relationships actually come from, with the real
+        // per-edge source/confidence/timestamps intact).
         let entries = vec![entry(
             VerdictTier::ExactHash,
             90,
-            vec!["CVE-2024-1234".to_string(), "CVE-2024-5678".to_string()],
+            vec!["CVE-2024-1234".to_string()],
         )];
         let relationships = derive_relationships(&entries);
-        // 1 Ioc + 2 Cve
-        assert_eq!(relationships.len(), 3);
-        let cve_targets: Vec<&str> = relationships
+        assert_eq!(relationships.len(), 1);
+        assert!(!relationships
             .iter()
-            .filter(|r| r.kind == RelationshipKind::Cve)
-            .map(|r| r.target.as_str())
-            .collect();
-        assert_eq!(cve_targets, vec!["CVE-2024-1234", "CVE-2024-5678"]);
+            .any(|r| r.kind == RelationshipKind::Cve));
     }
 
     #[test]

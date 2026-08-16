@@ -142,6 +142,7 @@ pub async fn sync(pool: &PgPool, api_key: &str) -> Result<SyncSummary> {
                 &mut *tx,
                 indicator_id,
                 family_id,
+                report_id,
                 SOURCE,
                 ioc.confidence_level,
                 first_seen,

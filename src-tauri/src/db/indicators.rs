@@ -5,8 +5,8 @@ use sqlx::{PgExecutor, PgPool};
 use uuid::Uuid;
 
 use crate::models::{
-    derive_strength, DetectionKind, IndicatorKind, IntelSourceFreshness, ProvenanceEntry,
-    RelationshipKind, ThreatRelationship, VerdictTier,
+    DetectionKind, IndicatorKind, IntelSourceFreshness, ProvenanceEntry, RelationshipKind,
+    RelationshipStrength, ThreatRelationship, VerdictTier,
 };
 
 /// Returns (report_id, was_inserted). was_inserted uses the `xmax = 0` trick
@@ -128,11 +128,18 @@ where
     Ok((rec.id, rec.inserted))
 }
 
+/// `report_id` is part of the edge, not reconstructed later -- a review
+/// caught that joining back to `indicator_observed_in_report` on just
+/// `(indicator_id, source)` could attribute a family to a report that
+/// never actually asserted it, or duplicate it once per matching report,
+/// whenever the same source had filed more than one report for the same
+/// indicator.
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert_indicator_attributed_to_malware_family<'e, E>(
     executor: E,
     indicator_id: Uuid,
     malware_family_id: Uuid,
+    report_id: Uuid,
     source: &str,
     confidence: i16,
     first_seen: DateTime<Utc>,
@@ -144,15 +151,17 @@ where
     sqlx::query!(
         r#"
         INSERT INTO indicator_attributed_to_malware_family
-            (indicator_id, malware_family_id, source, confidence, first_seen, last_seen)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        ON CONFLICT (indicator_id, malware_family_id, source) DO UPDATE SET
+            (indicator_id, malware_family_id, report_id, source, confidence, first_seen, last_seen)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (indicator_id, malware_family_id, report_id) DO UPDATE SET
+            source = EXCLUDED.source,
             confidence = EXCLUDED.confidence,
             first_seen = LEAST(indicator_attributed_to_malware_family.first_seen, EXCLUDED.first_seen),
             last_seen = GREATEST(indicator_attributed_to_malware_family.last_seen, EXCLUDED.last_seen)
         "#,
         indicator_id,
         malware_family_id,
+        report_id,
         source,
         confidence,
         first_seen,
@@ -218,6 +227,43 @@ pub async fn upsert_report_references_cve(
             last_seen = GREATEST(report_references_cve.last_seen, EXCLUDED.last_seen)
         "#,
         report_id,
+        cve_id,
+        source,
+        confidence,
+        first_seen,
+        last_seen,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// CVE-edge writer, unused until Phase 2 hunt-pack ingestion lands -- see
+/// the matching comment on `upsert_cve` above. Exercised today only by
+/// `verdict.rs`'s live regression test proving `cve_matches_via_detection`
+/// preserves this edge's own provenance rather than the parent
+/// `detection_detects_indicator` edge's.
+#[allow(clippy::too_many_arguments, dead_code)]
+pub async fn upsert_detection_covers_cve(
+    pool: &PgPool,
+    detection_id: Uuid,
+    cve_id: &str,
+    source: &str,
+    confidence: i16,
+    first_seen: DateTime<Utc>,
+    last_seen: DateTime<Utc>,
+) -> Result<()> {
+    sqlx::query!(
+        r#"
+        INSERT INTO detection_covers_cve
+            (detection_id, cve_id, source, confidence, first_seen, last_seen)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (detection_id, cve_id, source) DO UPDATE SET
+            confidence = EXCLUDED.confidence,
+            first_seen = LEAST(detection_covers_cve.first_seen, EXCLUDED.first_seen),
+            last_seen = GREATEST(detection_covers_cve.last_seen, EXCLUDED.last_seen)
+        "#,
+        detection_id,
         cve_id,
         source,
         confidence,
@@ -360,11 +406,10 @@ pub async fn set_sync_cursor(pool: &PgPool, source: &str, cursor: Option<&str>) 
 /// All known-bad hash values (sha256 + md5), used to build the local bloom
 /// filter for instant first-pass lookups.
 pub async fn all_known_bad_hashes(pool: &PgPool) -> Result<Vec<String>> {
-    let rows = sqlx::query_scalar!(
-        r#"SELECT value FROM indicator WHERE kind IN ('sha256', 'md5')"#
-    )
-    .fetch_all(pool)
-    .await?;
+    let rows =
+        sqlx::query_scalar!(r#"SELECT value FROM indicator WHERE kind IN ('sha256', 'md5')"#)
+            .fetch_all(pool)
+            .await?;
     Ok(rows)
 }
 
@@ -419,7 +464,10 @@ pub async fn hash_matches(
     Ok(rows)
 }
 
-pub fn hash_matches_to_provenance(rows: Vec<HashMatchRow>, tier: VerdictTier) -> Vec<ProvenanceEntry> {
+pub fn hash_matches_to_provenance(
+    rows: Vec<HashMatchRow>,
+    tier: VerdictTier,
+) -> Vec<ProvenanceEntry> {
     rows.into_iter()
         .map(|r| ProvenanceEntry {
             tier,
@@ -498,21 +546,36 @@ struct MalwareFamilyMatchRow {
     confidence: i16,
     first_seen: DateTime<Utc>,
     last_seen: DateTime<Utc>,
-    report_id: Option<Uuid>,
+    report_id: Uuid,
     report_title: Option<String>,
     report_url: Option<String>,
 }
 
-/// Malware-family attribution for this exact hash, joined to whichever
-/// report the *same* source observed it in (if any) so the relationship
-/// carries the same provenance a hash-match entry would. Not derivable
-/// from `ProvenanceEntry` the way most other relationship kinds are (see
-/// `models::derive_relationships`) -- family attribution has its own edge
-/// table, populated directly by ingestion from MalwareBazaar's `signature`
-/// and ThreatFox's `malware_printable` fields.
+/// Malware-family attribution for this file, checked against both hash
+/// kinds Apollo actually computes for verdict matching -- ThreatFox can
+/// source an MD5 indicator with its own family edge, and checking sha256
+/// alone would silently omit it even though the sha256/md5 pair belongs
+/// to the same scanned file. Not derivable from `ProvenanceEntry` the way
+/// most other relationship kinds are (see `models::derive_relationships`)
+/// -- family attribution has its own edge table, populated directly by
+/// ingestion from MalwareBazaar's `signature` and ThreatFox's
+/// `malware_printable` fields.
+///
+/// Joins directly on the edge's own `report_id` rather than reconstructing
+/// report context via `(indicator_id, source)` -- a review caught that
+/// reconstruction as unsound (see the edge table's migration comment).
+/// `report_id` is `NOT NULL` on the edge, so this is always an inner join;
+/// there is no "family attribution with no report" case in this schema.
+///
+/// Strength is `Direct`, not confidence-derived: a family attribution is
+/// a single-hop, explicitly sourced assertion about this exact indicator,
+/// which is a fact about *how* the relationship was established, not
+/// about how confident the source happens to be in it -- see
+/// `RelationshipStrength`'s doc comment for why those are kept separate.
 pub async fn malware_family_matches(
     pool: &PgPool,
     sha256: &str,
+    md5: &str,
 ) -> Result<Vec<ThreatRelationship>> {
     let rows = sqlx::query_as!(
         MalwareFamilyMatchRow,
@@ -523,18 +586,17 @@ pub async fn malware_family_matches(
             iamf.confidence,
             iamf.first_seen,
             iamf.last_seen,
-            r.id AS "report_id?",
+            r.id AS report_id,
             r.title AS report_title,
             r.url AS report_url
         FROM indicator i
         JOIN indicator_attributed_to_malware_family iamf ON iamf.indicator_id = i.id
         JOIN malware_family mf ON mf.id = iamf.malware_family_id
-        LEFT JOIN indicator_observed_in_report iorr
-            ON iorr.indicator_id = i.id AND iorr.source = iamf.source
-        LEFT JOIN report r ON r.id = iorr.report_id
-        WHERE i.kind = 'sha256' AND i.value = $1
+        JOIN report r ON r.id = iamf.report_id
+        WHERE (i.kind = 'sha256' AND i.value = $1) OR (i.kind = 'md5' AND i.value = $2)
         "#,
         sha256,
+        md5,
     )
     .fetch_all(pool)
     .await?;
@@ -543,7 +605,7 @@ pub async fn malware_family_matches(
         .into_iter()
         .map(|r| ThreatRelationship {
             kind: RelationshipKind::MalwareFamily,
-            strength: derive_strength(r.confidence),
+            strength: RelationshipStrength::Direct,
             target: r.family_name,
             explanation:
                 "This file's hash is attributed to a known malware family -- look for other \
@@ -553,11 +615,159 @@ pub async fn malware_family_matches(
             confidence: r.confidence,
             first_seen: r.first_seen,
             last_seen: r.last_seen,
-            report_id: r.report_id,
+            report_id: Some(r.report_id),
             report_title: r.report_title,
             report_url: r.report_url,
         })
         .collect())
+}
+
+struct CveViaReportRow {
+    cve_id: String,
+    source: String,
+    confidence: i16,
+    first_seen: DateTime<Utc>,
+    last_seen: DateTime<Utc>,
+    report_id: Uuid,
+    report_title: Option<String>,
+    report_url: Option<String>,
+}
+
+/// CVE relationships inferred through report co-occurrence: this file's
+/// indicator was observed in a report, and that *same* report separately
+/// references a CVE. That is two hops of evidence
+/// (`indicator --observed_in--> report --references--> cve`), not one, and
+/// a review caught a previous version of this code flattening it into a
+/// single relationship carrying the *indicator* edge's provenance instead
+/// of the *CVE* edge's own `report_references_cve.source/confidence/
+/// first_seen/last_seen` -- silently making co-occurrence look like a
+/// direct per-file CVE assertion. `strength` is `Contextual` specifically
+/// to keep that two-hop inference honest, distinct from the one-hop
+/// `cve_matches_via_detection` case below.
+async fn cve_matches_via_report(
+    pool: &PgPool,
+    sha256: &str,
+    md5: &str,
+) -> Result<Vec<ThreatRelationship>> {
+    let rows = sqlx::query_as!(
+        CveViaReportRow,
+        r#"
+        SELECT
+            rrc.cve_id,
+            rrc.source,
+            rrc.confidence,
+            rrc.first_seen,
+            rrc.last_seen,
+            r.id AS report_id,
+            r.title AS report_title,
+            r.url AS report_url
+        FROM indicator i
+        JOIN indicator_observed_in_report iorr ON iorr.indicator_id = i.id
+        JOIN report r ON r.id = iorr.report_id
+        JOIN report_references_cve rrc ON rrc.report_id = r.id
+        WHERE (i.kind = 'sha256' AND i.value = $1) OR (i.kind = 'md5' AND i.value = $2)
+        "#,
+        sha256,
+        md5,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| ThreatRelationship {
+            kind: RelationshipKind::Cve,
+            strength: RelationshipStrength::Contextual,
+            target: r.cve_id,
+            explanation:
+                "This file was observed in a report that also references a CVE -- an inferred \
+                 association through report co-occurrence, not a direct per-file CVE assertion. \
+                 Assess exposure and hunt for exploitation evidence before treating this as \
+                 confirmed."
+                    .to_string(),
+            source: r.source,
+            confidence: r.confidence,
+            first_seen: r.first_seen,
+            last_seen: r.last_seen,
+            report_id: Some(r.report_id),
+            report_title: r.report_title,
+            report_url: r.report_url,
+        })
+        .collect())
+}
+
+struct CveViaDetectionRow {
+    cve_id: String,
+    source: String,
+    confidence: i16,
+    first_seen: DateTime<Utc>,
+    last_seen: DateTime<Utc>,
+}
+
+/// CVE relationships from a detection that fired against this *exact*
+/// file and is separately documented to cover a CVE
+/// (`detection --detects--> indicator`, `detection --covers--> cve`).
+/// One hop tighter than the report-co-occurrence path above (the
+/// detection matched this file directly, not merely a report that
+/// happens to mention both), so `strength` is `Strong` rather than
+/// `Contextual` -- still not `Direct`, since covering a CVE is the
+/// detection's own documented scope, not a per-file assertion the way
+/// malware-family attribution is.
+async fn cve_matches_via_detection(pool: &PgPool, sha256: &str) -> Result<Vec<ThreatRelationship>> {
+    let rows = sqlx::query_as!(
+        CveViaDetectionRow,
+        r#"
+        SELECT
+            dcc.cve_id,
+            dcc.source,
+            dcc.confidence,
+            dcc.first_seen,
+            dcc.last_seen
+        FROM indicator i
+        JOIN detection_detects_indicator ddi ON ddi.indicator_id = i.id
+        JOIN detection d ON d.id = ddi.detection_id
+        JOIN detection_covers_cve dcc ON dcc.detection_id = d.id
+        WHERE i.kind = 'sha256' AND i.value = $1 AND d.kind = 'yara'
+        "#,
+        sha256,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| ThreatRelationship {
+            kind: RelationshipKind::Cve,
+            strength: RelationshipStrength::Strong,
+            target: r.cve_id,
+            explanation:
+                "A local detection that matched this exact file is documented to cover this CVE \
+                 -- assess exposure and hunt for exploitation evidence."
+                    .to_string(),
+            source: r.source,
+            confidence: r.confidence,
+            first_seen: r.first_seen,
+            last_seen: r.last_seen,
+            report_id: None,
+            report_title: None,
+            report_url: None,
+        })
+        .collect())
+}
+
+/// Both CVE relationship paths, combined. Kept as two separate queries
+/// rather than one UNION so each keeps its own row shape and its own
+/// `strength` reasoning (see each function's doc comment) instead of
+/// forcing a shared column set that would blur the two-hop/one-hop
+/// distinction back together.
+pub async fn cve_matches(
+    pool: &PgPool,
+    sha256: &str,
+    md5: &str,
+) -> Result<Vec<ThreatRelationship>> {
+    let mut relationships = cve_matches_via_report(pool, sha256, md5).await?;
+    relationships.extend(cve_matches_via_detection(pool, sha256).await?);
+    Ok(relationships)
 }
 
 struct PathPatternRow {
