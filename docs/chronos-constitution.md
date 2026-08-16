@@ -126,6 +126,8 @@ Candidate shared foundations:
 
 ## 7. Apollo: The First Proof of Chronos
 
+*See [`docs/apollo-constitution.md`](apollo-constitution.md) for Apollo's full product-level constitution -- this section is the condensed, company-level view; that document is more current and more precise wherever the two differ in detail.*
+
 > **LOCKED — Apollo is a threat-hunting platform/tool.** Apollo's core is filesystem-first threat hunting on live systems. The analyst begins with a file or directory, understands the artifact, sees its security relationships, and pivots those relationships into recursive hunts for associated evidence.
 
 > *Start with a file. Follow the evidence. Hunt outward.*
