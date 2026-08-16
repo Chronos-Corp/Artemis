@@ -78,6 +78,31 @@ pub struct CredentialRotated {
     pub credential: String,
 }
 
+/// One row of the `host` table, denormalized for read consumers. Never
+/// includes `credential_hash` -- that value authenticates the host, not
+/// something an operator-facing read endpoint has any reason to hand
+/// back, hashed or not.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostView {
+    pub id: Uuid,
+    pub hostname: String,
+    pub os: String,
+    pub agent_version: String,
+    pub enrolled_at: DateTime<Utc>,
+    pub last_heartbeat_at: Option<DateTime<Utc>>,
+}
+
+/// Response for `GET /api/v1/hosts`, the fleet directory. Was a
+/// documented gap through PR #12 ("no way to discover valid host_ids
+/// through the API at all") -- added alongside the fleet UI (PR #13),
+/// which needs exactly this to render a host list, but useful to any
+/// operator-credentialed caller independent of the UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostListResponse {
+    pub hosts: Vec<HostView>,
+    pub truncated: bool,
+}
+
 /// Reports that this host observed a YARA rule match against a file.
 /// Deliberately narrow to what `nsic-agent scan` actually produces today
 /// (a sha256 plus the rule that matched), not a generic multi-indicator-
@@ -197,8 +222,9 @@ pub enum SampleRequestStatus {
 }
 
 /// One row of `sample_request`, denormalized the same way `SightingView`
-/// is -- metadata and status only, never the sample's actual bytes. There
-/// is no endpoint that returns sample content yet (see above).
+/// is -- metadata and status only, never the sample's actual bytes.
+/// Content itself is fetched separately, by request id or by sha256 (see
+/// `crates/console/src/sample.rs`'s download endpoints).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SampleRequestView {
     pub id: Uuid,

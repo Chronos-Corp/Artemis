@@ -1,8 +1,9 @@
 //! Phase 1 fleet console. Accepts agent enrollment, heartbeats, YARA
 //! sighting reports, and sample-retrieval requests, and records them in
 //! the shared Postgres intel graph (the same schema `src-tauri` uses).
-//! See docs/phase1-design.md for what's deliberately not here yet (a
-//! fleet UI, credential rotation, rate limiting).
+//! Also serves a server-rendered fleet UI (`crate::ui`) for the operator
+//! persona. See docs/phase1-design.md for what's deliberately not here
+//! yet (plugin/scripting support, rate limiting).
 //!
 //! TLS is opt-in via `NSIC_TLS_CERT_PATH`/`NSIC_TLS_KEY_PATH` (both or
 //! neither -- see `main`). Plain HTTP remains the default so existing
@@ -22,13 +23,16 @@
 //! credential. An agent's per-agent credential authenticates that one
 //! host's own writes -- it must not also authenticate reading or
 //! directing the rest of the fleet, hence the separate operator
-//! credential.
+//! credential. The fleet UI (`crate::ui`) gates on that same operator
+//! credential too, presented as HTTP Basic instead of Bearer -- see
+//! `auth::authenticate_operator_ui`.
 
 mod auth;
 mod host;
 mod pagination;
 mod sample;
 mod sighting;
+mod ui;
 mod validate;
 
 use anyhow::Context;
@@ -205,6 +209,8 @@ fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/api/v1/agents/enroll", post(host::enroll))
         .route("/api/v1/agents/{host_id}/heartbeat", post(host::heartbeat))
+        .route("/api/v1/hosts", get(host::list_hosts))
+        .route("/api/v1/hosts/{host_id}", get(host::get_host))
         .route(
             "/api/v1/hosts/{host_id}/credential/rotate",
             post(host::rotate_credential),
@@ -244,6 +250,25 @@ fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/agents/{host_id}/sample-requests/{request_id}/failure",
             post(sample::fail_sample_request),
+        )
+        .route("/", get(ui::host_directory))
+        .route("/hosts", get(ui::host_directory))
+        .route("/hosts/{host_id}", get(ui::host_detail))
+        .route(
+            "/hosts/{host_id}/sample-requests",
+            post(ui::create_sample_request_action),
+        )
+        .route(
+            "/hosts/{host_id}/sample-requests/{request_id}/content",
+            get(ui::download_sample),
+        )
+        .route(
+            "/hosts/{host_id}/credential/rotate",
+            post(ui::rotate_credential_action),
+        )
+        .route(
+            "/hosts/{host_id}/credential/revoke",
+            post(ui::revoke_credential_action),
         )
         .with_state(state)
         .merge(sample_content_route)

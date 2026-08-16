@@ -6,14 +6,23 @@ use axum::Json;
 use chrono::Utc;
 use nsic_core::proto::{
     CredentialRotated, EnrollRequest, EnrollResponse, HeartbeatRequest, HeartbeatResponse,
+    HostListResponse, HostView,
 };
+use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::auth::{
     authenticate_host, authenticate_operator, bearer_token, generate_credential, hash_credential,
     internal_error, secrets_match,
 };
+use crate::pagination::truncate_to_limit;
 use crate::AppState;
+
+/// Row cap for `list_hosts`, same reasoning and truncated-flag pattern as
+/// `sighting.rs`'s `SIGHTING_LIST_LIMIT`. A fleet numbering in the low
+/// thousands is still a small page; real pagination is deferred for the
+/// same "not a problem yet" reason as the other list endpoints.
+const HOST_LIST_LIMIT: i64 = 1000;
 
 /// Stored in `host.credential_hash` for a host whose credential has been
 /// explicitly revoked. Not a real SHA-256 hex digest (`hash_credential`
@@ -26,7 +35,7 @@ use crate::AppState;
 /// `rotate_credential` doesn't care which sentinel (if any) is currently
 /// stored, so it recovers a legacy host in place exactly the same way it
 /// recovers a revoked one; see that function's doc comment.
-const REVOKED_CREDENTIAL_SENTINEL: &str = "revoked-requires-credential-rotation";
+pub(crate) const REVOKED_CREDENTIAL_SENTINEL: &str = "revoked-requires-credential-rotation";
 
 /// A response header set on every response that hands back a raw
 /// credential (`enroll`, `rotate_credential`): the value is shown exactly
@@ -105,6 +114,82 @@ pub async fn heartbeat(
     Ok(Json(HeartbeatResponse { received_at: now }))
 }
 
+/// Lists every enrolled host -- the fleet directory that's been a
+/// documented gap since PR #7 ("no way to discover valid host_ids
+/// through the API at all"). Operator-credential only, same as every
+/// other fleet-wide read. Ordered by hostname so the list is stable and
+/// legible rather than insertion-ordered.
+pub async fn list_hosts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<HostListResponse>, (StatusCode, String)> {
+    authenticate_operator(&state.operator_secret, &headers)?;
+
+    let (hosts, truncated) = fetch_all_hosts(&state.pool).await.map_err(internal_error)?;
+    Ok(Json(HostListResponse { hosts, truncated }))
+}
+
+/// Looks up a single host by id. Operator-credential only. `404` for an
+/// unknown id, the same "operator already privileged, nothing to hide"
+/// reasoning `create_sample_request` and `set_host_credential` already
+/// apply to their own unknown-`host_id` cases.
+pub async fn get_host(
+    State(state): State<AppState>,
+    Path(host_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<HostView>, (StatusCode, String)> {
+    authenticate_operator(&state.operator_secret, &headers)?;
+
+    let host = fetch_host(&state.pool, host_id)
+        .await
+        .map_err(internal_error)?;
+    host.map(Json)
+        .ok_or((StatusCode::NOT_FOUND, "unknown host_id".to_string()))
+}
+
+/// Shared by `list_hosts` (JSON API) and the fleet UI's host directory
+/// page (`crates/console/src/ui.rs`), so both render from one query
+/// instead of the SQL drifting between a JSON response and an HTML page
+/// that happen to want the same rows.
+pub(crate) async fn fetch_all_hosts(pool: &PgPool) -> sqlx::Result<(Vec<HostView>, bool)> {
+    let mut rows = sqlx::query(
+        "SELECT id, hostname, os, agent_version, enrolled_at, last_heartbeat_at \
+         FROM host ORDER BY hostname, id LIMIT $1",
+    )
+    .bind(HOST_LIST_LIMIT + 1)
+    .fetch_all(pool)
+    .await?;
+
+    let truncated = truncate_to_limit(&mut rows, HOST_LIST_LIMIT as usize);
+    Ok((
+        rows.into_iter().map(host_view_from_row).collect(),
+        truncated,
+    ))
+}
+
+/// Shared by `get_host` (JSON API) and the fleet UI's host detail page.
+pub(crate) async fn fetch_host(pool: &PgPool, host_id: Uuid) -> sqlx::Result<Option<HostView>> {
+    let row = sqlx::query(
+        "SELECT id, hostname, os, agent_version, enrolled_at, last_heartbeat_at \
+         FROM host WHERE id = $1",
+    )
+    .bind(host_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(host_view_from_row))
+}
+
+fn host_view_from_row(row: sqlx::postgres::PgRow) -> HostView {
+    HostView {
+        id: row.get("id"),
+        hostname: row.get("hostname"),
+        os: row.get("os"),
+        agent_version: row.get("agent_version"),
+        enrolled_at: row.get("enrolled_at"),
+        last_heartbeat_at: row.get("last_heartbeat_at"),
+    }
+}
+
 /// Mints a fresh per-agent credential for an already-enrolled host and
 /// stores only its hash, the same shown-once contract `enroll` uses --
 /// overwriting `credential_hash` means whatever credential the host was
@@ -181,7 +266,7 @@ pub async fn revoke_credential(
 /// already applies to its own unknown-`host_id` case, unlike the
 /// deliberately existence-hiding 401s on agent-facing endpoints like
 /// `heartbeat`.
-async fn set_host_credential(
+pub(crate) async fn set_host_credential(
     state: &AppState,
     host_id: Uuid,
     new_credential_hash: &str,
@@ -861,5 +946,116 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+    }
+
+    fn list_hosts_request(bearer: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder().method("GET").uri("/api/v1/hosts");
+        if let Some(token) = bearer {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    fn get_host_request(host_id: uuid::Uuid, bearer: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/hosts/{host_id}"));
+        if let Some(token) = bearer {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn list_hosts_rejects_missing_operator_credential() {
+        let app = crate::build_router(test_state().await);
+        let response = app.oneshot(list_hosts_request(None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn list_hosts_rejects_per_agent_credential() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+        let response = app
+            .oneshot(list_hosts_request(Some(&enrolled.credential)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The fleet directory: a host enrolled in this test must actually
+    /// show up, with every field matching what enrollment reported --
+    /// this is the endpoint that's been a documented gap since PR #7
+    /// ("no way to discover valid host_ids through the API"), so the
+    /// happy path is worth checking field-by-field rather than just
+    /// asserting a non-empty list.
+    #[tokio::test]
+    #[ignore]
+    async fn list_hosts_returns_enrolled_hosts() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+
+        let response = app
+            .oneshot(list_hosts_request(Some(OPERATOR_SECRET)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let listed: nsic_core::proto::HostListResponse = serde_json::from_slice(&bytes).unwrap();
+
+        let found = listed
+            .hosts
+            .iter()
+            .find(|h| h.id == enrolled.host_id)
+            .expect("newly enrolled host appears in the fleet directory");
+        assert_eq!(found.hostname, "test-host");
+        assert_eq!(found.os, "linux");
+        assert_eq!(found.agent_version, "0.1.0-test");
+        assert!(found.last_heartbeat_at.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn get_host_rejects_missing_operator_credential() {
+        let app = crate::build_router(test_state().await);
+        let response = app
+            .oneshot(get_host_request(uuid::Uuid::new_v4(), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn get_host_returns_404_for_unknown_host_id() {
+        let app = crate::build_router(test_state().await);
+        let response = app
+            .oneshot(get_host_request(
+                uuid::Uuid::new_v4(),
+                Some(OPERATOR_SECRET),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn get_host_returns_the_matching_host() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+
+        let response = app
+            .oneshot(get_host_request(enrolled.host_id, Some(OPERATOR_SECRET)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let host: nsic_core::proto::HostView = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(host.id, enrolled.host_id);
+        assert_eq!(host.hostname, "test-host");
     }
 }

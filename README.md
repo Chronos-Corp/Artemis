@@ -190,8 +190,12 @@ The console can optionally serve HTTPS (`NSIC_TLS_CERT_PATH`/
 agent has a matching `--tls-ca-cert`/`NSIC_TLS_CA_CERT` option to trust a
 self-signed or internal-CA console certificate. An operator can also
 rotate or revoke a host's per-agent credential in place, without deleting
-the host and losing its sighting/sample-request history. See
-[`docs/phase1-design.md`](docs/phase1-design.md) for how to run the agent
+the host and losing its sighting/sample-request history. The console
+also serves a browser-facing fleet UI (server-rendered, no separate
+build step) at its root -- browse enrolled hosts, drill into a host's
+sightings and sample requests, request a new sample, and rotate/revoke
+credentials, gated by the same operator credential presented as HTTP
+Basic auth. See [`docs/phase1-design.md`](docs/phase1-design.md) for how to run the agent
 against the console locally (with or without TLS) and what this scaffold
 does and doesn't do yet.
 

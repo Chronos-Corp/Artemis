@@ -9,7 +9,7 @@ use nsic_core::proto::{
     SampleRequestListResponse, SampleRequestStatus, SampleRequestView, MAX_SAMPLE_SIZE_BYTES,
 };
 use sha2::{Digest, Sha256};
-use sqlx::{PgExecutor, Row};
+use sqlx::{PgExecutor, PgPool, Row};
 use uuid::Uuid;
 
 use crate::auth::{authenticate_host, authenticate_operator, internal_error};
@@ -39,29 +39,41 @@ pub async fn create_sample_request(
     Json(req): Json<SampleRequestCreate>,
 ) -> Result<Json<SampleRequestCreated>, (StatusCode, String)> {
     authenticate_operator(&state.operator_secret, &headers)?;
-    validate_sample_request_create(&req)?;
+    let request_id = insert_sample_request(&state.pool, host_id, &req).await?;
+    Ok(Json(SampleRequestCreated { request_id }))
+}
+
+/// Shared by `create_sample_request` (JSON API) and the fleet UI's
+/// "request a sample" form (`crates/console/src/ui.rs`): validates the
+/// request, confirms the host exists, and inserts the `pending` row.
+/// Caller is responsible for authentication -- this only does what's
+/// common to both callers once that's already settled.
+pub(crate) async fn insert_sample_request(
+    pool: &PgPool,
+    host_id: Uuid,
+    req: &SampleRequestCreate,
+) -> Result<Uuid, (StatusCode, String)> {
+    validate_sample_request_create(req)?;
 
     let host_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM host WHERE id = $1)")
         .bind(host_id)
-        .fetch_one(&state.pool)
+        .fetch_one(pool)
         .await
         .map_err(internal_error)?;
     if !host_exists {
         return Err((StatusCode::NOT_FOUND, "unknown host_id".to_string()));
     }
 
-    let request_id: Uuid = sqlx::query_scalar(
+    sqlx::query_scalar(
         "INSERT INTO sample_request (host_id, path, expected_sha256) \
          VALUES ($1, $2, $3) RETURNING id",
     )
     .bind(host_id)
     .bind(&req.path)
     .bind(&req.expected_sha256)
-    .fetch_one(&state.pool)
+    .fetch_one(pool)
     .await
-    .map_err(internal_error)?;
-
-    Ok(Json(SampleRequestCreated { request_id }))
+    .map_err(internal_error)
 }
 
 fn validate_sample_request_create(req: &SampleRequestCreate) -> Result<(), (StatusCode, String)> {
@@ -90,6 +102,21 @@ pub async fn list_sample_requests(
 ) -> Result<Json<SampleRequestListResponse>, (StatusCode, String)> {
     authenticate_operator(&state.operator_secret, &headers)?;
 
+    let (requests, truncated) = fetch_sample_requests(&state.pool, host_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(SampleRequestListResponse {
+        requests,
+        truncated,
+    }))
+}
+
+/// Shared by `list_sample_requests` (JSON API) and the fleet UI's host
+/// detail page (`crates/console/src/ui.rs`).
+pub(crate) async fn fetch_sample_requests(
+    pool: &PgPool,
+    host_id: Uuid,
+) -> sqlx::Result<(Vec<SampleRequestView>, bool)> {
     let mut rows = sqlx::query(
         "SELECT sr.id, sr.host_id, sr.path, sr.expected_sha256, sr.status, \
                 sr.failure_reason, sr.sha256, sb.size_bytes, sr.requested_at, sr.resolved_at \
@@ -101,15 +128,14 @@ pub async fn list_sample_requests(
     )
     .bind(host_id)
     .bind(SAMPLE_REQUEST_LIST_LIMIT + 1)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(internal_error)?;
+    .fetch_all(pool)
+    .await?;
 
     let truncated = truncate_to_limit(&mut rows, SAMPLE_REQUEST_LIST_LIMIT as usize);
-    Ok(Json(SampleRequestListResponse {
-        requests: rows.into_iter().map(sample_request_view_from_row).collect(),
+    Ok((
+        rows.into_iter().map(sample_request_view_from_row).collect(),
         truncated,
-    }))
+    ))
 }
 
 /// Downloads a specific sample request's retrieved content, if it has
@@ -129,6 +155,25 @@ pub async fn download_sample_by_request(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     authenticate_operator(&state.operator_secret, &headers)?;
 
+    let content = fetch_content_by_request(&state.pool, host_id, request_id)
+        .await
+        .map_err(internal_error)?;
+    let Some((sha256, content)) = content else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "no content available for this sample request".to_string(),
+        ));
+    };
+    Ok(sample_content_response(&sha256, content))
+}
+
+/// Shared by `download_sample_by_request` (JSON API) and the fleet UI's
+/// download link (`crates/console/src/ui.rs`).
+pub(crate) async fn fetch_content_by_request(
+    pool: &PgPool,
+    host_id: Uuid,
+    request_id: Uuid,
+) -> sqlx::Result<Option<(String, Vec<u8>)>> {
     let row = sqlx::query(
         "SELECT sb.sha256, sb.content FROM sample_request sr \
          JOIN sample_blob sb ON sb.sha256 = sr.sha256 \
@@ -136,20 +181,14 @@ pub async fn download_sample_by_request(
     )
     .bind(request_id)
     .bind(host_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(internal_error)?;
+    .fetch_optional(pool)
+    .await?;
 
-    let Some(row) = row else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            "no content available for this sample request".to_string(),
-        ));
-    };
-
-    let sha256: String = row.get("sha256");
-    let content: Vec<u8> = row.get("content");
-    Ok(sample_content_response(&sha256, content))
+    Ok(row.map(|row| {
+        let sha256: String = row.get("sha256");
+        let content: Vec<u8> = row.get("content");
+        (sha256, content)
+    }))
 }
 
 /// Downloads sample content directly by hash, independent of any
@@ -194,7 +233,7 @@ pub async fn download_sample_by_sha256(
 /// agent originally reported -- an arbitrary analyst-supplied path could
 /// contain characters that don't belong in a header value, while a
 /// hex-encoded sha256 always does.
-fn sample_content_response(sha256: &str, content: Vec<u8>) -> impl IntoResponse {
+pub(crate) fn sample_content_response(sha256: &str, content: Vec<u8>) -> impl IntoResponse {
     (
         StatusCode::OK,
         [

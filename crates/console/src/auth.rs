@@ -1,5 +1,8 @@
-use axum::http::header::AUTHORIZATION;
+use axum::http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -112,4 +115,57 @@ pub fn authenticate_operator(
         ));
     }
     Ok(())
+}
+
+/// Verifies HTTP Basic credentials carry the console-operator secret as
+/// the password (the username is not checked; there is only one operator
+/// identity -- see docs/phase1-design.md on that gap). Used exclusively
+/// by the fleet UI (`crates/console/src/ui.rs`), never the JSON API,
+/// which stays Bearer-only via `authenticate_operator` -- the same
+/// credential, two different wire representations for two different
+/// audiences: a browser gets a native login prompt for free from Basic
+/// Auth (no login form, no session/cookie machinery to build), while a
+/// script or `curl` keeps using `Authorization: Bearer` as documented
+/// everywhere else in this API.
+///
+/// Returns `None` when authenticated. On failure, returns `Some` of a
+/// full `401` response (not just a status/message pair) carrying
+/// `WWW-Authenticate: Basic`, which is what actually triggers a browser's
+/// native credential prompt -- without that header, the browser has no
+/// reason to ask and would just show a plain error page instead.
+/// `Option<Response>` rather than `Result<(), Response>`: clippy flags a
+/// `Response`-sized `Err` variant (`result_large_err`), and there's no
+/// error value here worth threading through `?` anyway -- every caller
+/// just wants to know "is there a response to return right now instead."
+pub fn authenticate_operator_ui(operator_secret: &str, headers: &HeaderMap) -> Option<Response> {
+    let challenge = || {
+        Some(
+            (
+                StatusCode::UNAUTHORIZED,
+                [(WWW_AUTHENTICATE, "Basic realm=\"nsic-console\"")],
+                "operator credential required",
+            )
+                .into_response(),
+        )
+    };
+
+    let Some(presented_password) = basic_auth_password(headers) else {
+        return challenge();
+    };
+    if !secrets_match(&presented_password, operator_secret) {
+        return challenge();
+    }
+    None
+}
+
+/// Extracts the password portion of an `Authorization: Basic <base64>`
+/// header (`base64("username:password")`), if present and well-formed.
+/// The username is discarded -- there is nothing to check it against.
+fn basic_auth_password(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(AUTHORIZATION)?.to_str().ok()?;
+    let encoded = value.strip_prefix("Basic ")?;
+    let decoded = BASE64.decode(encoded).ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    let (_username, password) = decoded.split_once(':')?;
+    Some(password.to_string())
 }

@@ -4,7 +4,7 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use nsic_core::models::{DetectionKind, IndicatorKind};
 use nsic_core::proto::{SightingListResponse, SightingRequest, SightingResponse, SightingView};
-use sqlx::{PgExecutor, Row};
+use sqlx::{PgExecutor, PgPool, Row};
 use uuid::Uuid;
 
 use crate::auth::{authenticate_host, authenticate_operator, internal_error};
@@ -124,6 +124,23 @@ pub async fn list_host_sightings(
 ) -> Result<Json<SightingListResponse>, (StatusCode, String)> {
     authenticate_operator(&state.operator_secret, &headers)?;
 
+    let (sightings, truncated) = fetch_host_sightings(&state.pool, host_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(SightingListResponse {
+        sightings,
+        truncated,
+    }))
+}
+
+/// Shared by `list_host_sightings` (JSON API) and the fleet UI's host
+/// detail page (`crates/console/src/ui.rs`), so both render from the same
+/// query instead of the SQL drifting between a JSON response and an HTML
+/// page that happen to want the same rows.
+pub(crate) async fn fetch_host_sightings(
+    pool: &PgPool,
+    host_id: Uuid,
+) -> sqlx::Result<(Vec<SightingView>, bool)> {
     // ORDER BY tie-breaks past last_seen with the rest of the primary key
     // (host_id is already fixed by WHERE): last_seen alone is not unique
     // per row, so without a full tie-break the row order -- and therefore
@@ -144,15 +161,14 @@ pub async fn list_host_sightings(
     )
     .bind(host_id)
     .bind(SIGHTING_LIST_LIMIT + 1)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(internal_error)?;
+    .fetch_all(pool)
+    .await?;
 
     let truncated = truncate_to_limit(&mut rows, SIGHTING_LIST_LIMIT as usize);
-    Ok(Json(SightingListResponse {
-        sightings: rows.into_iter().map(sighting_view_from_row).collect(),
+    Ok((
+        rows.into_iter().map(sighting_view_from_row).collect(),
         truncated,
-    }))
+    ))
 }
 
 /// Lists every host that has sighted a given indicator (by sha256), most
