@@ -1226,9 +1226,9 @@ genuinely clean one -- exactly the "no sightings from host H" ==
 make until this landed.
 
 **A snapshot on `host`, not an append-only log.** `0008_scan_coverage.sql`
-adds four nullable columns -- `last_scan_at`, `last_scan_rule_count`,
-`last_scan_ruleset_fingerprint`, `last_scan_matched_count` -- overwritten
-unconditionally on every scan report, the same "most recent state" shape
+adds five nullable columns -- `last_scan_at`, `last_scan_received_at`,
+`last_scan_rule_count`, `last_scan_ruleset_fingerprint`,
+`last_scan_matched_count` -- the same "most recent state" shape
 `last_heartbeat_at` already has, not the accumulating-history shape
 `host_credential_event` uses. The two aren't analogous: a credential
 rotation or revocation is a security-relevant event worth a durable
@@ -1236,7 +1236,9 @@ record of *when it happened*, but a scan report is closer to a
 heartbeat -- "is the sensor alive and loaded with rules right now,"
 where only the latest answer matters. If scan-cadence history over time
 becomes a real need later, that's a distinct feature, not something this
-PR builds ahead of an actual use for it.
+PR builds ahead of an actual use for it. (`last_scan_at` and
+`last_scan_received_at` are updated conditionally, not unconditionally --
+see the review-round writeup below.)
 
 **The agent sends one coverage report per scan invocation,
 unconditionally -- separate from, and in addition to, per-match sighting
@@ -1285,7 +1287,9 @@ zero-matches-still-updates-coverage case, the never-reported-means-all-
 fields-None case, and overwrite-not-accumulate semantics across two
 reports; 4 in `ui.rs` covering the three badge states and that both the
 fleet directory and host detail page surface reported coverage) --
-full workspace suite now **145 tests**, run twice for rerun-safety. Live
+full workspace suite now **145 tests** at the time this PR was opened
+(see the review-round writeup below for two more added after review),
+run twice for rerun-safety. Live
 end to end against the real `nsic-console`/`nsic-agent` binaries:
 enrolled a host, scanned a genuinely benign file with console reporting
 configured, and confirmed the agent printed "reported scan coverage"
@@ -1312,6 +1316,83 @@ but the same root cause (a local dev database that persists across runs,
 not a fresh one per test). Fixed with `extract_host_row`, which scopes
 an assertion to the specific `<tr>` containing the host under test
 rather than the whole page.
+
+### PR #14 review round: independent reporting and monotonic scan snapshots
+
+Review on PR #15 (opened for this feature) found two real correctness bugs
+in the first draft above, plus one non-blocking provenance suggestion
+that was cheap enough to fold in immediately rather than defer.
+
+**Bug: a failed coverage report used to suppress an already-found
+sighting.** `Command::Scan`'s original call site awaited
+`report_scan_coverage(...)?` immediately before `report_sightings(...)?`
+-- an early `?` on the lower-priority telemetry call meant a coverage
+POST failing (a network blip, the console briefly down) would abort
+the function before the higher-priority sighting report was even
+attempted, silently dropping a real detection because of an unrelated
+reporting failure. Fixed with a new `report_scan_results`
+(`crates/agent/src/main.rs`) that attempts both independently and
+propagates the sighting outcome as authoritative, only surfacing the
+coverage failure as a `warning:` printed to stderr:
+```rust
+let coverage_result = report_scan_coverage(...).await;
+if let Err(e) = &coverage_result {
+    eprintln!("warning: failed to report scan coverage: {e:#}");
+}
+let sightings_result = report_sightings(...).await;
+sightings_result?;
+coverage_result?;
+```
+Verified with a new wiremock-based test,
+`a_failed_coverage_report_does_not_prevent_sighting_submission` -- a
+mock console returning `500` for `.../scans` but `200` for
+`.../sightings`, asserting the sighting POST still landed exactly once.
+Confirmed this is a real regression detector, not a vacuous assertion,
+by temporarily reverting `report_scan_results` to the original
+sequential-with-early-`?` logic, rerunning the test (it failed), and
+restoring the fix (it passed again). `wiremock` is new to the agent
+crate's dev-dependencies for this -- the agent previously had zero tests
+of its own console-talking behavior, only live smoke tests.
+
+**Bug: an out-of-order scan report could regress the stored snapshot.**
+`last_scan_at` is agent-claimed (bounds-checked for a 5-minute-future/
+2020-01-01 window, not otherwise trusted), unlike `last_heartbeat_at`,
+which is always the console's own clock and therefore inherently
+monotonic. The original unconditional `UPDATE` treated `last_scan_at`
+the same way, so a delayed retry or a race between overlapping scan
+invocations could deliver an older `scanned_at` after a newer one was
+already recorded, silently regressing the "most recent scan" snapshot an
+operator relies on. Fixed by guarding the `UPDATE` in `host::report_scan`
+with `WHERE id = $6 AND (last_scan_at IS NULL OR $1 > last_scan_at)` --
+a stale report is still authenticated and well-formed, so it still gets
+its usual `200`, but the guard silently declines to let it move the
+snapshot backwards (no `rows_affected` check needed: zero rows from the
+guard not matching is an expected, not an erroneous, outcome, unlike
+`set_host_credential`'s use of `rows_affected` to detect an unknown
+host). Verified with a new test,
+`a_stale_out_of_order_scan_report_does_not_overwrite_a_newer_snapshot`
+(submits a report with `scanned_at = now`, then a second with
+`scanned_at = now - 1h`, and confirms the stored snapshot still reflects
+the first report's values) -- confirmed as a real regression detector the
+same way as the agent-side fix, by reverting the `WHERE` clause's guard
+back to unconditional, rerunning (it failed), and restoring the fix (it
+passed). Live-verified against the real `nsic-console` binary with the
+same forward/backward/forward sequence via `curl`, confirming both that
+a stale report is silently ignored and that a genuinely newer report
+after it still updates the snapshot correctly.
+
+**Provenance suggestion, folded in: `last_scan_received_at`.** Alongside
+the agent-claimed `last_scan_at`, `report_scan` now also stores the
+console's own clock at write time in a new `last_scan_received_at`
+column -- the same "provenance an analyst can compare the claim against"
+role `host_sighted_indicator.received_at` already plays for sightings.
+Not blocking on its own, but directly strengthens the exact out-of-order
+scenario this review round was about, so it went in in the same pass
+rather than as a follow-up.
+
+Full workspace suite after this round: **147 tests** (145 from the
+original PR, plus the two new regression tests above), run twice for
+rerun-safety.
 
 ## What's deliberately not here yet
 
@@ -1496,10 +1577,13 @@ os, agent_version, `credential_hash` (SHA-256 hex of the per-agent
 credential, `NOT NULL` -- or one of two sentinel strings that can never
 match a real hash, marking a pre-credential legacy host or an explicitly
 revoked one; see PR #12 above), enrolled_at, last_heartbeat_at,
-`last_scan_at`/`last_scan_rule_count`/`last_scan_ruleset_fingerprint`/
-`last_scan_matched_count` (all nullable, all `NULL` together until the
-host's agent reports its first scan; overwritten -- not accumulated --
-on every subsequent report; see PR #14 above). Additive to the Phase 0
+`last_scan_at`/`last_scan_received_at`/`last_scan_rule_count`/
+`last_scan_ruleset_fingerprint`/`last_scan_matched_count` (all nullable,
+all `NULL` together until the host's agent reports its first scan;
+overwritten -- not accumulated -- on every subsequent report whose
+`scanned_at` is strictly newer than what's already stored, so a stale
+or out-of-order report can't regress the snapshot; see PR #14 above).
+Additive to the Phase 0
 schema in `0001_init.sql` / `0002_verdict_indexes.sql`, not a redesign of
 it.
 
@@ -1587,9 +1671,9 @@ curl -H "Authorization: Bearer $NSIC_OPERATOR_SECRET" \
   http://localhost:8787/api/v1/hosts
 # -> {"hosts": [{"id": "...", "hostname": "...", "os": "...",
 #     "agent_version": "...", "enrolled_at": "...", "last_heartbeat_at": "...",
-#     "last_scan_at": "...", "last_scan_rule_count": 1,
-#     "last_scan_ruleset_fingerprint": "...", "last_scan_matched_count": 0}],
-#     "truncated": false}
+#     "last_scan_at": "...", "last_scan_received_at": "...",
+#     "last_scan_rule_count": 1, "last_scan_ruleset_fingerprint": "...",
+#     "last_scan_matched_count": 0}], "truncated": false}
 curl -H "Authorization: Bearer $NSIC_OPERATOR_SECRET" \
   http://localhost:8787/api/v1/hosts/<uuid>
 # -> {"id": "...", "hostname": "...", ...}  -- same shape, one host

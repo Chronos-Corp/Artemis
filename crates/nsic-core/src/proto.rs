@@ -97,6 +97,11 @@ pub struct HostView {
     /// from one that scanned recently with rules loaded and simply found
     /// nothing.
     pub last_scan_at: Option<DateTime<Utc>>,
+    /// The console's own clock when `last_scan_at` was recorded -- unlike
+    /// `last_scan_at` itself (agent-claimed, can legitimately arrive out
+    /// of order), this is always monotonic, the same provenance role
+    /// `host_sighted_indicator.received_at` plays for sightings.
+    pub last_scan_received_at: Option<DateTime<Utc>>,
     pub last_scan_rule_count: Option<i32>,
     pub last_scan_ruleset_fingerprint: Option<String>,
     pub last_scan_matched_count: Option<i32>,

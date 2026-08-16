@@ -190,22 +190,13 @@ async fn main() -> Result<()> {
 
             match (console_url, host_id, credential) {
                 (Some(console_url), Some(host_id), Some(credential)) => {
-                    report_scan_coverage(
-                        &console_url,
-                        host_id,
-                        &credential,
-                        engine.rule_count,
-                        &engine.ruleset_fingerprint,
-                        matches.len(),
-                        tls_ca_cert.as_deref(),
-                    )
-                    .await?;
-                    report_sightings(
+                    report_scan_results(
                         &console_url,
                         host_id,
                         &credential,
                         &path,
                         &hash.sha256,
+                        engine.rule_count,
                         &engine.ruleset_fingerprint,
                         &matches,
                         tls_ca_cert.as_deref(),
@@ -327,6 +318,65 @@ fn build_http_client(ca_cert_path: Option<&Path>) -> Result<reqwest::Client> {
         .add_root_certificate(cert)
         .build()
         .context("building HTTP client with custom TLS CA certificate")
+}
+
+/// Attempts both post-scan reports -- scan coverage and, if anything
+/// matched, sightings -- as two independent operations, neither gated on
+/// the other's success. An earlier draft ran them sequentially with `?`
+/// after each, which meant a coverage-reporting failure (a transient
+/// network blip, the console being briefly unreachable, anything) would
+/// exit before `report_sightings` ever ran -- silently dropping a real
+/// detection because a lower-value telemetry ping happened to fail first.
+/// Caught in review: coverage telemetry must never become a prerequisite
+/// for delivering the sightings it exists alongside, not in front of.
+/// Both are always attempted; a coverage failure is logged as a warning
+/// immediately (so it's not silently swallowed) rather than returned
+/// directly, and the sightings outcome -- the more consequential of the
+/// two -- is what determines whether this function itself returns an
+/// error, falling back to the coverage error if sightings succeeded but
+/// coverage didn't, so the process still exits non-zero either way for a
+/// script or cron job to notice.
+#[allow(clippy::too_many_arguments)]
+async fn report_scan_results(
+    console_url: &str,
+    host_id: Uuid,
+    credential: &str,
+    path: &Path,
+    sha256: &str,
+    rule_count: usize,
+    ruleset_fingerprint: &str,
+    matches: &[nsic_core::yara_scan::YaraMatch],
+    tls_ca_cert: Option<&Path>,
+) -> Result<()> {
+    let coverage_result = report_scan_coverage(
+        console_url,
+        host_id,
+        credential,
+        rule_count,
+        ruleset_fingerprint,
+        matches.len(),
+        tls_ca_cert,
+    )
+    .await;
+    if let Err(e) = &coverage_result {
+        eprintln!("warning: failed to report scan coverage: {e:#}");
+    }
+
+    let sightings_result = report_sightings(
+        console_url,
+        host_id,
+        credential,
+        path,
+        sha256,
+        ruleset_fingerprint,
+        matches,
+        tls_ca_cert,
+    )
+    .await;
+
+    sightings_result?;
+    coverage_result?;
+    Ok(())
 }
 
 /// Reports that this scan happened, independent of whether anything
@@ -691,5 +741,71 @@ wpwPXandNWDezRLLas1qzW+wbZzJQldwo29Rdo2z21MkFW4ZW/AU4v84CrCs0CPJ\n\
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(b"this is not a PEM certificate").unwrap();
         assert!(build_http_client(Some(tmp.path())).is_ok());
+    }
+
+    /// The regression this PR's review round exists to fix: a broken
+    /// `/scans` endpoint (the console down, a transient network error,
+    /// anything) must never prevent an already-found detection from being
+    /// reported. Mocks the console with `/scans` returning `500` and
+    /// `/sightings` returning `200`, then confirms via wiremock's request
+    /// verification that `/sightings` was actually called -- not just that
+    /// the function happened to return successfully, which an earlier,
+    /// broken version of this test (checking only the return value) would
+    /// not have caught, since both a real bug and a passing case can
+    /// return `Err` here for unrelated reasons.
+    #[tokio::test]
+    async fn a_failed_coverage_report_does_not_prevent_sighting_submission() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let host_id = uuid::Uuid::new_v4();
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/api/v1/agents/.+/scans$"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/api/v1/agents/.+/sightings$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "indicator_id": uuid::Uuid::new_v4(),
+                "recorded_at": chrono::Utc::now().to_rfc3339(),
+            })))
+            .mount(&server)
+            .await;
+
+        let matches = vec![nsic_core::yara_scan::YaraMatch {
+            rule_name: "Example_EICAR_Test_File".to_string(),
+        }];
+
+        let result = super::report_scan_results(
+            &server.uri(),
+            host_id,
+            "test-credential",
+            Path::new("/tmp/eicar.txt"),
+            &"a".repeat(64),
+            1,
+            &"f".repeat(64),
+            &matches,
+            None,
+        )
+        .await;
+
+        // The coverage failure must still surface as an overall error
+        // (so a wrapping script notices), but that's secondary to the
+        // actual point of this test: the request-count assertions below.
+        assert!(result.is_err());
+
+        let requests = server.received_requests().await.unwrap();
+        let sighting_requests = requests
+            .iter()
+            .filter(|r| r.url.path().ends_with("/sightings"))
+            .count();
+        assert_eq!(
+            sighting_requests, 1,
+            "the sighting must have been reported despite the coverage report failing"
+        );
     }
 }

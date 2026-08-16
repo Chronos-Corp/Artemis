@@ -118,12 +118,29 @@ pub async fn heartbeat(
 /// Records that this host attempted a scan, independent of whether
 /// anything matched -- the sensor-health signal a sighting alone can't
 /// provide (see [`nsic_core::proto::ScanReport`]'s doc comment). Per-agent
-/// credential, same as heartbeat; overwrites the four `last_scan_*`
-/// columns unconditionally, the same plain "most recent snapshot"
-/// semantics `heartbeat` already has for `last_heartbeat_at` -- not the
-/// `GREATEST`-guarded accumulation `host_sighted_indicator` uses, since
-/// there's no first-seen/last-seen range being tracked here, just "when
-/// did this host last check in with this coverage."
+/// credential, same as heartbeat.
+///
+/// Unlike `heartbeat`'s unconditional overwrite of `last_heartbeat_at`
+/// (always the console's own clock, monotonic by construction),
+/// `req.scanned_at` is agent-claimed -- validated only for a
+/// 5-minute-future/2020-01-01 window, not otherwise trusted -- so a
+/// delayed retry or a race between overlapping scan invocations could
+/// legitimately deliver an older `scanned_at` after a newer one was
+/// already recorded. The `UPDATE`'s `WHERE` clause guards against that:
+/// it only replaces the stored snapshot when the incoming `scanned_at` is
+/// strictly newer (or nothing has been recorded yet), so a stale report
+/// can't regress it. That guard means this `UPDATE` can now legitimately
+/// affect zero rows for a well-formed but out-of-order report -- not just
+/// for an unknown host, which `authenticate_host` above already rules
+/// out -- so, unlike `set_host_credential`, there's deliberately no
+/// `rows_affected` check here: zero rows is an expected, silent outcome,
+/// not an error to surface to the agent.
+///
+/// `last_scan_received_at` records the console's own clock at write time,
+/// alongside the agent-claimed `last_scan_at` -- the same provenance
+/// pairing `host_sighted_indicator.received_at` gives sightings, so an
+/// analyst can compare what the agent claimed against when the console
+/// actually heard it.
 pub async fn report_scan(
     State(state): State<AppState>,
     Path(host_id): Path<Uuid>,
@@ -135,11 +152,13 @@ pub async fn report_scan(
 
     let received_at = Utc::now();
     sqlx::query(
-        "UPDATE host SET last_scan_at = $1, last_scan_rule_count = $2, \
-                last_scan_ruleset_fingerprint = $3, last_scan_matched_count = $4 \
-         WHERE id = $5",
+        "UPDATE host SET last_scan_at = $1, last_scan_received_at = $2, \
+                last_scan_rule_count = $3, last_scan_ruleset_fingerprint = $4, \
+                last_scan_matched_count = $5 \
+         WHERE id = $6 AND (last_scan_at IS NULL OR $1 > last_scan_at)",
     )
     .bind(req.scanned_at)
+    .bind(received_at)
     .bind(req.rule_count)
     .bind(&req.ruleset_fingerprint)
     .bind(req.matched_count)
@@ -207,8 +226,8 @@ pub async fn get_host(
 pub(crate) async fn fetch_all_hosts(pool: &PgPool) -> sqlx::Result<(Vec<HostView>, bool)> {
     let mut rows = sqlx::query(
         "SELECT id, hostname, os, agent_version, enrolled_at, last_heartbeat_at, \
-                last_scan_at, last_scan_rule_count, last_scan_ruleset_fingerprint, \
-                last_scan_matched_count \
+                last_scan_at, last_scan_received_at, last_scan_rule_count, \
+                last_scan_ruleset_fingerprint, last_scan_matched_count \
          FROM host ORDER BY hostname, id LIMIT $1",
     )
     .bind(HOST_LIST_LIMIT + 1)
@@ -226,8 +245,8 @@ pub(crate) async fn fetch_all_hosts(pool: &PgPool) -> sqlx::Result<(Vec<HostView
 pub(crate) async fn fetch_host(pool: &PgPool, host_id: Uuid) -> sqlx::Result<Option<HostView>> {
     let row = sqlx::query(
         "SELECT id, hostname, os, agent_version, enrolled_at, last_heartbeat_at, \
-                last_scan_at, last_scan_rule_count, last_scan_ruleset_fingerprint, \
-                last_scan_matched_count \
+                last_scan_at, last_scan_received_at, last_scan_rule_count, \
+                last_scan_ruleset_fingerprint, last_scan_matched_count \
          FROM host WHERE id = $1",
     )
     .bind(host_id)
@@ -245,6 +264,7 @@ fn host_view_from_row(row: sqlx::postgres::PgRow) -> HostView {
         enrolled_at: row.get("enrolled_at"),
         last_heartbeat_at: row.get("last_heartbeat_at"),
         last_scan_at: row.get("last_scan_at"),
+        last_scan_received_at: row.get("last_scan_received_at"),
         last_scan_rule_count: row.get("last_scan_rule_count"),
         last_scan_ruleset_fingerprint: row.get("last_scan_ruleset_fingerprint"),
         last_scan_matched_count: row.get("last_scan_matched_count"),
@@ -1397,5 +1417,71 @@ mod tests {
         assert_eq!(host.last_scan_rule_count, Some(7));
         assert_eq!(host.last_scan_ruleset_fingerprint, Some(second_fingerprint));
         assert_eq!(host.last_scan_matched_count, Some(0));
+    }
+
+    /// A scan report whose `scanned_at` is *older* than what's already
+    /// stored must not regress the snapshot -- the out-of-order case a
+    /// plain unconditional overwrite (like `a_second_scan_report_
+    /// overwrites_the_first` above exercises for the in-order case) can't
+    /// tell apart from a legitimate newer report. Unlike `last_heartbeat_at`
+    /// (always the console's own clock), `scanned_at` is agent-claimed and
+    /// only bounds-checked, not otherwise trusted, so a delayed retry or a
+    /// race between overlapping scan invocations really can deliver an
+    /// older timestamp after a newer one was already recorded.
+    #[tokio::test]
+    #[ignore]
+    async fn a_stale_out_of_order_scan_report_does_not_overwrite_a_newer_snapshot() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+
+        let newer_scanned_at = Utc::now();
+        let newer_fingerprint = valid_fingerprint("aaaa");
+        let response = app
+            .clone()
+            .oneshot(scan_report_request(
+                enrolled.host_id,
+                Some(&enrolled.credential),
+                9,
+                &newer_fingerprint,
+                2,
+                newer_scanned_at,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let older_scanned_at = newer_scanned_at - chrono::Duration::hours(1);
+        let older_fingerprint = valid_fingerprint("bbbb");
+        let response = app
+            .clone()
+            .oneshot(scan_report_request(
+                enrolled.host_id,
+                Some(&enrolled.credential),
+                3,
+                &older_fingerprint,
+                0,
+                older_scanned_at,
+            ))
+            .await
+            .unwrap();
+        // The stale report is still well-formed and authenticated, so the
+        // agent gets its usual 200 -- the guard is silent from the caller's
+        // perspective, the same way a heartbeat never tells an agent
+        // whether it changed anything either.
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(get_host_request(enrolled.host_id, Some(OPERATOR_SECRET)))
+            .await
+            .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let host: nsic_core::proto::HostView = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            host.last_scan_at.unwrap().timestamp_millis(),
+            newer_scanned_at.timestamp_millis()
+        );
+        assert_eq!(host.last_scan_rule_count, Some(9));
+        assert_eq!(host.last_scan_ruleset_fingerprint, Some(newer_fingerprint));
+        assert_eq!(host.last_scan_matched_count, Some(2));
     }
 }
