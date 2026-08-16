@@ -1077,16 +1077,24 @@ anyway (see below).
 
 **A fresh credential is rendered directly, never redirected through a
 URL.** Rotating a host's credential from the UI (`rotate_credential_
-action`) renders the host detail page directly as the POST response
-(`200`, `Cache-Control: no-store`) with the new credential in a banner,
-instead of the more typical redirect-after-POST pattern the other two
-write actions (create sample request, revoke) use. A redirect would need
-to carry the new credential somewhere for the next request to display
-it, and the only place available -- the URL's query string -- is a bad
-place to put a secret: it lands in browser history and can be logged by
-any proxy in front of the console. The accepted cost is the smaller
-problem: refreshing that specific response (F5) prompts the browser to
-ask about resubmitting the form.
+action`) renders a minimal, standalone success page directly as the POST
+response (`200`), with the new credential in a banner, instead of the
+more typical redirect-after-POST pattern the other two write actions
+(create sample request, revoke) use. Not a redirect: a redirect would
+need to carry the new credential somewhere for the next request to
+display it, and the only place available -- the URL's query string -- is
+a bad place to put a secret: it lands in browser history and can be
+logged by any proxy in front of the console. Not the full host detail
+page either -- an earlier draft rendered that directly, which meant three
+more database reads (host metadata, sightings, sample requests) happened
+*after* the credential had already been committed; if any of those three
+failed, the response would be a `500` with the old credential already
+invalidated and the new one never shown, recoverable only by rotating
+again. Caught in review. The success page now needs nothing beyond
+`host_id` and the credential already in hand, so nothing between the
+commit and the response can fail. The accepted remaining cost: refreshing
+that response (F5) prompts the browser to ask about resubmitting the
+form, since it's a direct POST response.
 
 **Two new JSON endpoints, useful independent of the UI.** `GET
 /api/v1/hosts` and `GET /api/v1/hosts/{host_id}` fill a gap flagged since
@@ -1116,38 +1124,83 @@ request performed through the browser goes through the exact same
 validation, transaction, and audit-event logic as the one performed
 through `curl`.
 
-**Not addressed here, logged as a known gap:** no CSRF protection.
-Every POST action (rotate, revoke, create sample request) relies solely
-on the browser's cached Basic Auth credential as proof of authorization
--- the same credential a cookie-based session would have relied on, and
-the same ambient-authority problem either approach has: a malicious
-cross-origin page could induce a browser that's already authenticated to
-this console to submit one of these forms, and the cached credential
-would be attached automatically. A real fix (a CSRF token per form) needs
-somewhere server-side to check that token against, which reopens the
-session-state complexity Basic Auth was specifically chosen to avoid (see
-above). Acceptable for now given Phase 1's single-operator, local/
-internal-network framing; worth revisiting before this is ever exposed
-beyond that.
+**CSRF protection: a single per-process token, not a session.** An
+earlier draft of this PR shipped with no CSRF defense at all, reasoning
+that "loopback-only by default" made it unnecessary -- caught in review
+as wrong: a malicious page can target `http://localhost:8787` (or
+`127.0.0.1`) directly regardless of what network serves the attacker's
+own page, and the browser attaches a cached Basic Auth credential to a
+cross-origin form submission exactly as readily as it would a same-origin
+one. Basic Auth alone is not CSRF protection -- it proves the request
+carries a valid operator credential, not that the operator actually
+intended to submit it. Fixed with `AppState::csrf_token`: one high-entropy
+value (`auth::generate_csrf_token`) generated once at console startup,
+rendered as a hidden field in all three UI POST forms, and checked
+(`auth::verify_csrf`, `ui::require_csrf`) before any of the three
+handlers does anything else. This doesn't require per-user sessions or
+even per-request rotation -- the token's only job is being unreadable to
+a cross-origin attacker, and the Same-Origin Policy already guarantees
+that regardless of whether the token ever changes: an attacker's page can
+*submit* a form to this console, but it cannot *read* this console's
+authenticated HTML to discover what value belongs in the hidden field, so
+it cannot construct a request `verify_csrf` accepts.
 
-**Verified against a live Postgres and the real binaries.** 20 new tests
-(11 in `ui.rs`, 6 host-listing tests in `host.rs`, plus the 2 XSS-
-escaping tests already mentioned) -- full workspace suite now 129 tests,
-run twice for rerun-safety. Live end to end against the real
-`nsic-console`/`nsic-agent` binaries and `curl` in place of a browser: an
-unauthenticated request to `/` returns `401` with a `WWW-Authenticate:
-Basic` header (confirming a real browser would be prompted, not shown a
-bare error); enrolled a host and confirmed it appears on `/hosts`;
-created a sample request through the UI form and confirmed the `303`
-redirect and the pending row on the host page; fulfilled it via
-`nsic-agent fulfill-samples` against a real file and downloaded it back
-through the UI's download link, confirming the bytes are byte-identical
-via `diff`; rotated the credential through the UI and confirmed the old
-credential now gets `401` on a heartbeat while the new one succeeds, with
-`Cache-Control: no-store` present on the response; revoked the credential
-and confirmed lockout; and confirmed `host_credential_event` accumulated
-both events (`rotated`, then `revoked`) in order, the same accumulation
-property PR #12 already established.
+**`Content-Security-Policy` and `X-Frame-Options`, applied as a layer
+over the whole UI sub-router.** `security_headers`
+(`crates/console/src/ui.rs`) sets `default-src 'none'` with no
+`script-src` exception -- since this module ships no client-side
+JavaScript, a CSP that would block any acts as a standing correctness
+check on that claim, not just hardening (`style-src 'unsafe-inline'` is
+the one exception, needed only because `layout` inlines its stylesheet
+rather than serving a separate file). `frame-ancestors 'none'` plus the
+legacy `X-Frame-Options: DENY` stop the authenticated console from being
+embedded in another page's `<iframe>` for a clickjacking attack.
+`Cache-Control: no-store` moved from a single hand-set header on the old
+rotate response to this same layer, so it now covers every fleet UI
+response, not only the one that used to show a raw credential --
+sightings, paths, and downloaded sample bytes are all sensitive enough
+not to belong in a shared or browser cache either.
+
+**The revoke form's inline `onsubmit="return confirm(...)"` was
+removed, not kept alongside a looser CSP.** An earlier draft had this on
+the revoke button for a native "are you sure?" browser dialog -- flagged
+in review as inline JavaScript contradicting this PR's own "zero
+client-side JavaScript" claim, and incompatible with a strict CSP that
+disallows scripts entirely. Removed rather than carved out an exception:
+the CSRF token now also gates this action (an accidental double-submit
+without a deliberate page load can't happen the way a lone confirmation
+dialog was guarding against), and the claim is now literally
+enforced by the CSP, not just true by convention.
+
+**Verified against a live Postgres and the real binaries.** 25 new tests
+(19 in `ui.rs` -- including the two XSS-escaping tests, dedicated
+CSRF-rejection tests for both the create-sample-request and rotate
+actions, and a test confirming the security headers are actually present
+on a response rather than just configured -- plus 6 host-listing tests in
+`host.rs`) -- full workspace suite now **132 tests**, run twice for
+rerun-safety. Live end to end against the real `nsic-console` binary and
+`curl` in place of a browser: an unauthenticated request to `/` returns
+`401` with a `WWW-Authenticate: Basic` header (confirming a real browser
+would be prompted, not shown a bare error); a `GET /hosts` response
+carries `Cache-Control: no-store`, a `Content-Security-Policy` blocking
+scripts, and `X-Frame-Options: DENY`; a forged cross-site-style POST with
+no `csrf_token` field is rejected (`422`, from the form extractor itself)
+and one with a wrong token value is rejected (`403`, from `require_csrf`)
+-- both confirmed to leave the target host's credential untouched; a
+legitimate revoke using the real token extracted from the rendered page
+succeeds (`303`) and the credential is then locked out (`401` on
+heartbeat); a legitimate rotate using the real token renders the new
+credential directly and it authenticates while the old one no longer
+does; and the rendered page contains no `onsubmit`/`confirm(` text
+anywhere, confirming the removed inline handler is actually gone, not
+just removed from one code path. Also re-verified from the prior round:
+enrolled a host and confirmed it appears on `/hosts`; created a sample
+request through the UI form and confirmed the `303` redirect and the
+pending row; fulfilled it via `nsic-agent fulfill-samples` against a real
+file and downloaded it back through the UI's download link,
+byte-identical via `diff`; and confirmed `host_credential_event`
+accumulated both events (`rotated`, then `revoked`) in order, the same
+accumulation property PR #12 already established.
 
 ## What's deliberately not here yet
 
@@ -1280,13 +1333,16 @@ property PR #12 already established.
   no per-user identity or audit trail beyond "the operator, as a whole"
   did this. Same deferred item PR #7 logged for sighting reads, now also
   true of sample requests.
-- **CSRF protection on the fleet UI's write actions.** PR #13's three POST
-  actions (rotate, revoke, create sample request) rely solely on the
-  browser's cached Basic Auth credential as proof of authorization, with
-  no per-form token to check it against -- see PR #13 above for why a
-  real fix needs session-state infrastructure this PR deliberately
-  avoided building. Acceptable for Phase 1's single-operator, local/
-  internal-network framing; not before wider exposure.
+- **The fleet UI's CSRF token is a single per-process value, not
+  per-user or rotatable without a restart.** PR #13's three POST actions
+  are protected by `AppState::csrf_token` (see PR #13 above for why one
+  unrotated value is sufficient against the actual threat it defends
+  against). What it doesn't provide: per-analyst attribution of who took
+  a given action (the same single-shared-operator-identity gap logged
+  above for the read side), or a way to invalidate the token without
+  restarting the console. Neither matters yet for Phase 1's
+  single-operator framing; both would matter for a real multi-analyst
+  deployment.
 - **No indicator-centric pivot view in the fleet UI.** PR #7's
   `GET /api/v1/indicators/{sha256}/sightings` (which hosts have sighted a
   given hash) has no UI page yet -- the fleet UI only pivots the other
@@ -1522,15 +1578,26 @@ and enter `$NSIC_OPERATOR_SECRET` as the password. From there:
   resolved to `fulfilled` or `mismatched`.
 
 The same thing with `curl` standing in for a browser (useful for
-scripting or for confirming the UI is reachable without a GUI):
+scripting or for confirming the UI is reachable without a GUI). GET
+requests need nothing beyond the operator credential; every POST also
+needs the console's CSRF token, which isn't a secret an operator
+configures -- it's generated once at startup and only ever shows up
+embedded as a hidden field in the UI's own rendered forms, so pulling it
+out of the page is the only way to get it (this is the point: an
+attacker's cross-origin page has no way to read it either):
 
 ```bash
 curl -u ":$NSIC_OPERATOR_SECRET" http://localhost:8787/hosts
 curl -u ":$NSIC_OPERATOR_SECRET" http://localhost:8787/hosts/<uuid>
+
+TOKEN=$(curl -s -u ":$NSIC_OPERATOR_SECRET" http://localhost:8787/hosts/<uuid> \
+  | grep -oP 'name="csrf_token" value="\K[a-f0-9]+' | head -1)
+
 curl -u ":$NSIC_OPERATOR_SECRET" -X POST \
-  -d "path=/path/on/the/host&expected_sha256=" \
+  -d "path=/path/on/the/host&expected_sha256=&csrf_token=$TOKEN" \
   http://localhost:8787/hosts/<uuid>/sample-requests
 curl -u ":$NSIC_OPERATOR_SECRET" -X POST \
+  -d "csrf_token=$TOKEN" \
   http://localhost:8787/hosts/<uuid>/credential/rotate
 ```
 

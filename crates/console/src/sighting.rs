@@ -435,6 +435,7 @@ mod tests {
 
     const BOOTSTRAP_SECRET: &str = "test-bootstrap-secret";
     const OPERATOR_SECRET: &str = "test-operator-secret";
+    const CSRF_TOKEN: &str = "test-csrf-token";
 
     // truncate_to_limit itself is unit-tested in pagination.rs, shared by
     // this file and sample.rs.
@@ -457,6 +458,7 @@ mod tests {
             pool,
             bootstrap_secret: BOOTSTRAP_SECRET.to_string(),
             operator_secret: OPERATOR_SECRET.to_string(),
+            csrf_token: CSRF_TOKEN.to_string(),
         }
     }
 

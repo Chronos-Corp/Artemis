@@ -93,8 +93,9 @@ fn validate_sample_request_create(req: &SampleRequestCreate) -> Result<(), (Stat
 
 /// Lists every sample request for a given host, most recently requested
 /// first -- operator-credential only. Metadata and status, never sample
-/// content: there is no endpoint that returns bytes back to an operator
-/// yet (see `nsic_core::proto::SampleRequestView`'s doc comment).
+/// content itself -- that's fetched separately, by request id or by
+/// sha256 (see `download_sample_by_request`/`download_sample_by_sha256`
+/// below).
 pub async fn list_sample_requests(
     State(state): State<AppState>,
     Path(host_id): Path<Uuid>,
@@ -531,6 +532,7 @@ mod tests {
 
     const BOOTSTRAP_SECRET: &str = "test-bootstrap-secret";
     const OPERATOR_SECRET: &str = "test-operator-secret";
+    const CSRF_TOKEN: &str = "test-csrf-token";
 
     fn valid_sha256(seed: &str) -> String {
         format!("{seed:0<64}")
@@ -546,6 +548,7 @@ mod tests {
             pool,
             bootstrap_secret: BOOTSTRAP_SECRET.to_string(),
             operator_secret: OPERATOR_SECRET.to_string(),
+            csrf_token: CSRF_TOKEN.to_string(),
         }
     }
 

@@ -15,11 +15,23 @@
 //! itself and resends it automatically on every request, including plain
 //! `<a href>` navigation and form submissions, which is what lets every
 //! page here avoid client-side JS entirely -- downloads are plain links,
-//! actions are plain forms.
+//! actions are plain forms. Every write action additionally requires a
+//! CSRF token (`auth::verify_csrf`) -- Basic Auth alone is not CSRF
+//! protection, since the browser attaches its cached credential to a
+//! cross-origin form submission exactly as readily as it would to a
+//! same-origin one. `security_headers` (applied as a layer on the UI
+//! router in `main::build_router`) adds `Cache-Control: no-store`,
+//! `Content-Security-Policy`, and `X-Frame-Options: DENY` to every
+//! response from this module -- this UI's pages carry sensitive telemetry
+//! (hostnames, paths, sighting data) and, via the download routes, actual
+//! retrieved sample bytes, none of which belong in a shared cache, and an
+//! authenticated console must not be embeddable in another page's
+//! `<iframe>` for a clickjacking attack.
 
-use axum::extract::{Form, Path, Query, State};
-use axum::http::header::CACHE_CONTROL;
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Form, Path, Query, Request, State};
+use axum::http::header::{CACHE_CONTROL, CONTENT_SECURITY_POLICY, X_FRAME_OPTIONS};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::Next;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 use nsic_core::proto::{SampleRequestCreate, SampleRequestStatus, SampleRequestView, SightingView};
@@ -33,6 +45,34 @@ use crate::sample::{
 };
 use crate::sighting::fetch_host_sightings;
 use crate::AppState;
+
+/// Applied as a middleware layer over every route in this module (see
+/// `main::build_router`). `Cache-Control: no-store` on every fleet UI
+/// response, not only the ones that show a raw credential -- sightings,
+/// paths, and downloaded sample bytes are all sensitive enough not to
+/// belong in a shared or browser cache either. `Content-Security-Policy`
+/// disallows scripts entirely (`default-src 'none'`, no `script-src`
+/// exception) -- this module ships no client-side JavaScript, so a CSP
+/// that would block any is a correctness check on that claim, not just
+/// hardening; `style-src 'unsafe-inline'` is the one exception, needed
+/// because `layout` inlines its stylesheet rather than serving a separate
+/// CSS file. `frame-ancestors 'none'` plus the legacy `X-Frame-Options:
+/// DENY` stop this authenticated console from being embedded in another
+/// page's `<iframe>` for a clickjacking attack.
+pub async fn security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; \
+             base-uri 'none'; form-action 'self'",
+        ),
+    );
+    headers.insert(X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    response
+}
 
 /// The fleet directory: every enrolled host, linked through to its detail
 /// page. Serves both `/` and `/hosts` (see `crate::build_router`) so
@@ -104,18 +144,14 @@ pub async fn host_detail(
     if let Some(challenge) = authenticate_operator_ui(&state.operator_secret, &headers) {
         return challenge;
     }
-    render_host_detail(&state, host_id, flash.flash.as_deref(), None).await
+    render_host_detail(&state, host_id, flash.flash.as_deref()).await
 }
 
-/// Shared by `host_detail` and `rotate_credential_action` (which renders
-/// the same page directly, with a freshly rotated credential banner,
-/// rather than redirecting -- see that handler's doc comment for why).
-async fn render_host_detail(
-    state: &AppState,
-    host_id: Uuid,
-    flash: Option<&str>,
-    new_credential: Option<&str>,
-) -> Response {
+/// Shared by `host_detail` and the redirect targets of the three POST
+/// actions below. Does not handle a freshly rotated credential -- see
+/// `rotate_credential_action`'s doc comment for why that renders a
+/// separate, minimal success page instead of routing through here.
+async fn render_host_detail(state: &AppState, host_id: Uuid, flash: Option<&str>) -> Response {
     let host = match fetch_host(&state.pool, host_id).await {
         Ok(Some(h)) => h,
         Ok(None) => return not_found_page("No such host."),
@@ -130,6 +166,7 @@ async fn render_host_detail(
             Ok(v) => v,
             Err(e) => return db_error_page(e),
         };
+    let csrf_token = state.csrf_token.as_str();
 
     let body = html! {
         h1 { "Host: " (host.hostname) }
@@ -141,13 +178,6 @@ async fn render_host_detail(
             " -- last heartbeat " (format_optional_time(host.last_heartbeat_at))
         }
 
-        @if let Some(credential) = new_credential {
-            div class="banner banner-warning" {
-                p { strong { "New credential (shown once, copy it now):" } }
-                p { code { (credential) } }
-                p { "The console will not show this value again. The host's previous credential no longer works." }
-            }
-        }
         @if flash == Some("revoked") {
             div class="banner" { "Credential revoked. This host cannot authenticate until an operator rotates it a new one." }
         }
@@ -158,9 +188,11 @@ async fn render_host_detail(
         section {
             h2 { "Credential" }
             form method="post" action=(format!("/hosts/{host_id}/credential/rotate")) {
+                input type="hidden" name="csrf_token" value=(csrf_token);
                 button type="submit" { "Rotate credential" }
             }
-            form method="post" action=(format!("/hosts/{host_id}/credential/revoke")) onsubmit="return confirm('Revoke this host\\'s credential? It will not be able to authenticate until rotated again.');" {
+            form method="post" action=(format!("/hosts/{host_id}/credential/revoke")) {
+                input type="hidden" name="csrf_token" value=(csrf_token);
                 button type="submit" class="danger" { "Revoke credential" }
             }
         }
@@ -168,6 +200,7 @@ async fn render_host_detail(
         section {
             h2 { "Request a sample" }
             form method="post" action=(format!("/hosts/{host_id}/sample-requests")) {
+                input type="hidden" name="csrf_token" value=(csrf_token);
                 label { "Path on host" br; input type="text" name="path" required autocomplete="off"; }
                 label { "Expected sha256 (optional)" br; input type="text" name="expected_sha256" autocomplete="off"; }
                 button type="submit" { "Request sample" }
@@ -232,16 +265,7 @@ async fn render_host_detail(
         p { a href="/hosts" { "\u{2190} back to fleet" } }
     };
 
-    let mut response = layout(&format!("Host: {}", host.hostname), body).into_response();
-    if new_credential.is_some() {
-        // Same reasoning as the JSON API's rotate response: a shown-once
-        // secret must not be retained by an intermediate cache or the
-        // browser's own response cache.
-        response
-            .headers_mut()
-            .insert(CACHE_CONTROL, "no-store".parse().unwrap());
-    }
-    response
+    layout(&format!("Host: {}", host.hostname), body).into_response()
 }
 
 fn sample_request_row(host_id: Uuid, req: &SampleRequestView) -> Markup {
@@ -298,6 +322,31 @@ fn status_badge(status: SampleRequestStatus) -> Markup {
 pub struct SampleRequestForm {
     path: String,
     expected_sha256: String,
+    csrf_token: String,
+}
+
+/// Every UI POST form carries this one field alongside whatever else it
+/// needs -- `rotate`/`revoke` need nothing else, so this is their entire
+/// form body.
+#[derive(Deserialize)]
+pub struct CsrfForm {
+    csrf_token: String,
+}
+
+/// `403 Forbidden` for a UI POST whose `csrf_token` field doesn't match
+/// `AppState::csrf_token`. Every UI POST handler calls this immediately
+/// after `authenticate_operator_ui` succeeds -- a valid operator
+/// credential alone is not proof the request was actually initiated by
+/// the operator, since the browser attaches a cached Basic Auth header to
+/// a cross-origin form submission just as automatically as it would a
+/// cookie. See `auth::verify_csrf`'s doc comment for why checking this
+/// token closes that gap.
+fn require_csrf(state: &AppState, form_token: &str) -> Option<Response> {
+    if crate::auth::verify_csrf(&state.csrf_token, form_token) {
+        None
+    } else {
+        Some((StatusCode::FORBIDDEN, "invalid or missing CSRF token").into_response())
+    }
 }
 
 /// Creates a sample request from the host detail page's form, then
@@ -313,6 +362,9 @@ pub async fn create_sample_request_action(
 ) -> Response {
     if let Some(challenge) = authenticate_operator_ui(&state.operator_secret, &headers) {
         return challenge;
+    }
+    if let Some(rejection) = require_csrf(&state, &form.csrf_token) {
+        return rejection;
     }
 
     let expected_sha256 = {
@@ -331,25 +383,32 @@ pub async fn create_sample_request_action(
     }
 }
 
-/// Rotates the host's credential and renders the host detail page
-/// directly (`200`, not a redirect) with the new credential in a banner.
-/// Deliberately not a redirect: a redirect would have to carry the new
-/// credential somewhere for the next request to display it, and the only
-/// place available (the URL's query string) is a bad place to put a
-/// secret -- it lands in browser history and can be logged by any proxy
-/// in front of the console. Rendering it directly in this response body
-/// means it only ever exists in an HTML page marked `Cache-Control:
-/// no-store`, the same page/cache discipline the JSON API's rotate
-/// response already has. The tradeoff: refreshing this specific page
-/// (F5) prompts the browser to ask about resubmitting the form, since
-/// it's the direct response to a POST -- accepted as the smaller problem.
+/// Rotates the host's credential and renders a minimal, standalone
+/// success page directly (`200`) with the new credential -- deliberately
+/// not a redirect, and deliberately not `render_host_detail`. Not a
+/// redirect: a redirect would have to carry the new credential somewhere
+/// for the next request to display it, and the only place available (the
+/// URL's query string) is a bad place to put a secret -- it lands in
+/// browser history and can be logged by any proxy in front of the
+/// console. Not `render_host_detail`: that function does three more
+/// database reads (host metadata, sightings, sample requests) after the
+/// credential has already been committed -- if any of those failed, the
+/// operator would get a `500` after their old credential was already
+/// invalidated and before ever seeing the new one, recoverable only by
+/// rotating again. This page needs nothing beyond what's already in hand
+/// (`host_id`, the new credential), so nothing between the commit and the
+/// response can fail.
 pub async fn rotate_credential_action(
     State(state): State<AppState>,
     Path(host_id): Path<Uuid>,
     headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
 ) -> Response {
     if let Some(challenge) = authenticate_operator_ui(&state.operator_secret, &headers) {
         return challenge;
+    }
+    if let Some(rejection) = require_csrf(&state, &form.csrf_token) {
+        return rejection;
     }
 
     let credential = generate_credential();
@@ -364,7 +423,19 @@ pub async fn rotate_credential_action(
         };
     }
 
-    render_host_detail(&state, host_id, None, Some(&credential)).await
+    layout(
+        "Credential rotated",
+        html! {
+            h1 { "Credential rotated" }
+            div class="banner banner-warning" {
+                p { strong { "New credential (shown once, copy it now):" } }
+                p { code { (credential) } }
+                p { "The console will not show this value again. The host's previous credential no longer works." }
+            }
+            p { a href=(format!("/hosts/{host_id}")) { "\u{2190} back to host" } }
+        },
+    )
+    .into_response()
 }
 
 /// Revokes the host's credential, then redirects back to the host detail
@@ -374,9 +445,13 @@ pub async fn revoke_credential_action(
     State(state): State<AppState>,
     Path(host_id): Path<Uuid>,
     headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
 ) -> Response {
     if let Some(challenge) = authenticate_operator_ui(&state.operator_secret, &headers) {
         return challenge;
+    }
+    if let Some(rejection) = require_csrf(&state, &form.csrf_token) {
+        return rejection;
     }
 
     if let Err((status, message)) =
@@ -516,6 +591,7 @@ mod tests {
 
     const BOOTSTRAP_SECRET: &str = "test-bootstrap-secret";
     const OPERATOR_SECRET: &str = "test-operator-secret";
+    const CSRF_TOKEN: &str = "test-csrf-token";
 
     async fn test_state() -> AppState {
         let database_url = std::env::var("DATABASE_URL")
@@ -527,6 +603,7 @@ mod tests {
             pool,
             bootstrap_secret: BOOTSTRAP_SECRET.to_string(),
             operator_secret: OPERATOR_SECRET.to_string(),
+            csrf_token: CSRF_TOKEN.to_string(),
         }
     }
 
@@ -661,6 +738,31 @@ mod tests {
         assert!(body.contains("fleet-directory-host"));
     }
 
+    /// `security_headers` is applied as a layer on the whole UI
+    /// sub-router (`main::build_router`), not called ad hoc per handler
+    /// -- confirms it actually reaches a plain `GET` response, not just
+    /// the rotate response that used to set `Cache-Control` by hand.
+    #[tokio::test]
+    #[ignore]
+    async fn host_directory_response_carries_security_headers() {
+        let app = crate::build_router(test_state().await);
+        let response = app
+            .oneshot(get("/hosts".to_string(), Some(OPERATOR_SECRET)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+        assert_eq!(response.headers().get("x-frame-options").unwrap(), "DENY");
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("default-src 'none'"));
+        assert!(csp.contains("frame-ancestors 'none'"));
+    }
+
     /// A hostname is agent-supplied and never validated against a
     /// character allowlist (see `host::enroll`) -- if it ever lands in
     /// this page unescaped, a malicious or compromised agent could inject
@@ -789,7 +891,7 @@ mod tests {
             .oneshot(post_form(
                 format!("/hosts/{}/sample-requests", enrolled.host_id),
                 Some(OPERATOR_SECRET),
-                "path=%2Ftmp%2Fmalware.exe&expected_sha256=",
+                &format!("path=%2Ftmp%2Fmalware.exe&expected_sha256=&csrf_token={CSRF_TOKEN}"),
             ))
             .await
             .unwrap();
@@ -821,11 +923,65 @@ mod tests {
             .oneshot(post_form(
                 format!("/hosts/{}/sample-requests", enrolled.host_id),
                 None,
-                "path=%2Ftmp%2Fx&expected_sha256=",
+                &format!("path=%2Ftmp%2Fx&expected_sha256=&csrf_token={CSRF_TOKEN}"),
             ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A valid operator credential alone must not be enough to perform a
+    /// write action -- the request also has to carry the console's CSRF
+    /// token, which a cross-origin attacker cannot read (Same-Origin
+    /// Policy) even though the browser would happily attach a cached
+    /// Basic Auth credential to a cross-origin form submission. Confirms
+    /// the missing- and wrong-token cases are both rejected, and neither
+    /// creates a row.
+    #[tokio::test]
+    #[ignore]
+    async fn create_sample_request_action_rejects_missing_or_wrong_csrf_token() {
+        let state = test_state().await;
+        let pool = state.pool.clone();
+        let app = crate::build_router(state);
+        let enrolled = enroll(&app).await;
+
+        // No `csrf_token` field at all: axum's `Form` extractor rejects
+        // this before the handler (and `require_csrf`) ever runs, since
+        // the field is required on `SampleRequestForm`. A different
+        // status code (422, not 403) than a present-but-wrong token, but
+        // an equally effective rejection -- covered here as a real
+        // request/response pair, not assumed.
+        let response = app
+            .clone()
+            .oneshot(post_form(
+                format!("/hosts/{}/sample-requests", enrolled.host_id),
+                Some(OPERATOR_SECRET),
+                "path=%2Ftmp%2Fx&expected_sha256=",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // Field present, value wrong: this is what actually exercises
+        // `require_csrf`.
+        let response = app
+            .clone()
+            .oneshot(post_form(
+                format!("/hosts/{}/sample-requests", enrolled.host_id),
+                Some(OPERATOR_SECRET),
+                "path=%2Ftmp%2Fx&expected_sha256=&csrf_token=wrong-token",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM sample_request WHERE host_id = $1")
+                .bind(enrolled.host_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0, "neither request should have created a row");
     }
 
     /// Full happy path: rotating from the UI hands back a working
@@ -843,7 +999,7 @@ mod tests {
             .oneshot(post_form(
                 format!("/hosts/{}/credential/rotate", enrolled.host_id),
                 Some(OPERATOR_SECRET),
-                "",
+                &format!("csrf_token={CSRF_TOKEN}"),
             ))
             .await
             .unwrap();
@@ -881,11 +1037,35 @@ mod tests {
             .oneshot(post_form(
                 format!("/hosts/{}/credential/rotate", enrolled.host_id),
                 None,
-                "",
+                &format!("csrf_token={CSRF_TOKEN}"),
             ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn rotate_credential_action_rejects_wrong_csrf_token() {
+        let app = crate::build_router(test_state().await);
+        let enrolled = enroll(&app).await;
+        let response = app
+            .clone()
+            .oneshot(post_form(
+                format!("/hosts/{}/credential/rotate", enrolled.host_id),
+                Some(OPERATOR_SECRET),
+                "csrf_token=wrong-token",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // The credential must not have been rotated: the original one
+        // still works.
+        assert_eq!(
+            heartbeat_status(&app, enrolled.host_id, &enrolled.credential).await,
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]
@@ -899,7 +1079,7 @@ mod tests {
             .oneshot(post_form(
                 format!("/hosts/{}/credential/revoke", enrolled.host_id),
                 Some(OPERATOR_SECRET),
-                "",
+                &format!("csrf_token={CSRF_TOKEN}"),
             ))
             .await
             .unwrap();
@@ -980,7 +1160,7 @@ mod tests {
             .oneshot(post_form(
                 format!("/hosts/{}/sample-requests", enrolled.host_id),
                 Some(OPERATOR_SECRET),
-                "path=%2Ftmp%2Fmalware.exe&expected_sha256=",
+                &format!("path=%2Ftmp%2Fmalware.exe&expected_sha256=&csrf_token={CSRF_TOKEN}"),
             ))
             .await
             .unwrap();

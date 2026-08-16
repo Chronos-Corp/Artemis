@@ -47,6 +47,10 @@ pub(crate) struct AppState {
     pool: PgPool,
     bootstrap_secret: String,
     operator_secret: String,
+    /// The fleet UI's CSRF token -- one per process, generated at
+    /// startup. See `auth::generate_csrf_token`'s doc comment for why a
+    /// single unrotated value is sufficient here.
+    csrf_token: String,
 }
 
 #[tokio::main]
@@ -98,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
         pool,
         bootstrap_secret,
         operator_secret,
+        csrf_token: auth::generate_csrf_token(),
     });
 
     // Loopback-only by default regardless of TLS: network-wide exposure
@@ -206,6 +211,34 @@ fn build_router(state: AppState) -> Router {
         ))
         .with_state(state.clone());
 
+    // The fleet UI gets its own sub-router too, so `ui::security_headers`
+    // (Cache-Control: no-store, CSP, X-Frame-Options -- see that
+    // function's doc comment) applies to every HTML page and download
+    // this module serves without also being layered onto the JSON API,
+    // which has no use for browser-facing headers like CSP.
+    let ui_routes = Router::new()
+        .route("/", get(ui::host_directory))
+        .route("/hosts", get(ui::host_directory))
+        .route("/hosts/{host_id}", get(ui::host_detail))
+        .route(
+            "/hosts/{host_id}/sample-requests",
+            post(ui::create_sample_request_action),
+        )
+        .route(
+            "/hosts/{host_id}/sample-requests/{request_id}/content",
+            get(ui::download_sample),
+        )
+        .route(
+            "/hosts/{host_id}/credential/rotate",
+            post(ui::rotate_credential_action),
+        )
+        .route(
+            "/hosts/{host_id}/credential/revoke",
+            post(ui::revoke_credential_action),
+        )
+        .layer(axum::middleware::from_fn(ui::security_headers))
+        .with_state(state.clone());
+
     Router::new()
         .route("/api/v1/agents/enroll", post(host::enroll))
         .route("/api/v1/agents/{host_id}/heartbeat", post(host::heartbeat))
@@ -251,27 +284,9 @@ fn build_router(state: AppState) -> Router {
             "/api/v1/agents/{host_id}/sample-requests/{request_id}/failure",
             post(sample::fail_sample_request),
         )
-        .route("/", get(ui::host_directory))
-        .route("/hosts", get(ui::host_directory))
-        .route("/hosts/{host_id}", get(ui::host_detail))
-        .route(
-            "/hosts/{host_id}/sample-requests",
-            post(ui::create_sample_request_action),
-        )
-        .route(
-            "/hosts/{host_id}/sample-requests/{request_id}/content",
-            get(ui::download_sample),
-        )
-        .route(
-            "/hosts/{host_id}/credential/rotate",
-            post(ui::rotate_credential_action),
-        )
-        .route(
-            "/hosts/{host_id}/credential/revoke",
-            post(ui::revoke_credential_action),
-        )
         .with_state(state)
         .merge(sample_content_route)
+        .merge(ui_routes)
 }
 
 #[cfg(test)]
