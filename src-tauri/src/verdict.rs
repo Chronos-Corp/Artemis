@@ -279,6 +279,57 @@ mod tests {
         );
     }
 
+    /// A previously read `feed_sync_state` row, captured so it can be put
+    /// back exactly as it was.
+    struct PriorSyncState {
+        last_synced_at: Option<chrono::DateTime<Utc>>,
+        last_cursor: Option<String>,
+    }
+
+    async fn capture_sync_state(pool: &PgPool, source: &str) -> Option<PriorSyncState> {
+        sqlx::query!(
+            "SELECT last_synced_at, last_cursor FROM feed_sync_state WHERE source = $1",
+            source
+        )
+        .fetch_optional(pool)
+        .await
+        .expect("read existing sync state")
+        .map(|r| PriorSyncState {
+            last_synced_at: r.last_synced_at,
+            last_cursor: r.last_cursor,
+        })
+    }
+
+    /// Puts a captured row back exactly as it was (including "there was no
+    /// row"), regardless of whatever the test body did to `source` in the
+    /// meantime.
+    async fn restore_sync_state(pool: &PgPool, source: &str, prior: Option<PriorSyncState>) {
+        match prior {
+            Some(row) => {
+                sqlx::query(
+                    "INSERT INTO feed_sync_state (source, last_synced_at, last_cursor) \
+                     VALUES ($1, $2, $3) \
+                     ON CONFLICT (source) DO UPDATE \
+                     SET last_synced_at = EXCLUDED.last_synced_at, \
+                         last_cursor = EXCLUDED.last_cursor",
+                )
+                .bind(source)
+                .bind(row.last_synced_at)
+                .bind(row.last_cursor)
+                .execute(pool)
+                .await
+                .expect("restore prior sync state");
+            }
+            None => {
+                sqlx::query("DELETE FROM feed_sync_state WHERE source = $1")
+                    .bind(source)
+                    .execute(pool)
+                    .await
+                    .expect("clear seeded sync state");
+            }
+        }
+    }
+
     /// The review-caught bug: a configured feed that has *never*
     /// successfully synced must still appear in `intel_freshness` --
     /// with `last_successful_sync_at: None` -- rather than being silently
@@ -288,11 +339,18 @@ mod tests {
     /// follow-up review caught that the first version of this test only
     /// checked presence), the other has none (asserted `None`).
     ///
-    /// Restores whatever `threatfox`'s prior state was (row present or
-    /// absent) once the assertions are done -- a follow-up review noted
-    /// that unconditionally deleting a real feed's row as a test side
-    /// effect would permanently wipe a developer's local sync history on
-    /// this sandbox's persistent, shared local Postgres instance.
+    /// Restores both `malwarebazaar`'s and `threatfox`'s prior state (row
+    /// present or absent) no matter how the test body ends -- including a
+    /// panicking assertion -- since a second follow-up review noted the
+    /// previous version only restored `threatfox` and only did so on the
+    /// success path, so a panic partway through, or the never-restored
+    /// `malwarebazaar` row, would permanently mutate a developer's local
+    /// sync history on this sandbox's persistent, shared local Postgres
+    /// instance. The test body runs inside `tokio::spawn` so its outcome
+    /// (success or panic) can be observed via the returned `JoinError`
+    /// *before* deciding whether to restore -- restoration always runs,
+    /// and if the body panicked, `resume_unwind` re-raises that same panic
+    /// afterward so the test still fails with its original message.
     #[tokio::test]
     #[ignore]
     async fn intel_freshness_includes_a_never_synced_configured_source() {
@@ -302,12 +360,8 @@ mod tests {
             .await
             .expect("connect to test database");
 
-        let prior_threatfox_state = sqlx::query!(
-            "SELECT last_synced_at, last_cursor FROM feed_sync_state WHERE source = 'threatfox'"
-        )
-        .fetch_optional(&pool)
-        .await
-        .expect("read existing threatfox state");
+        let prior_malwarebazaar_state = capture_sync_state(&pool, "malwarebazaar").await;
+        let prior_threatfox_state = capture_sync_state(&pool, "threatfox").await;
 
         crate::db::indicators::set_sync_cursor(&pool, "malwarebazaar", Some("cursor"))
             .await
@@ -317,62 +371,61 @@ mod tests {
             .await
             .expect("clear threatfox sync state");
 
-        let rules_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("yara-rules");
-        let yara = Arc::new(YaraEngine::load(&rules_dir).expect("load yara rules"));
-        let bloom = BloomState::empty();
-        let recent_yara_hits = RecentYaraHits::new();
+        let body_pool = pool.clone();
+        let outcome = tokio::spawn(async move {
+            let rules_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("yara-rules");
+            let yara = Arc::new(YaraEngine::load(&rules_dir).expect("load yara rules"));
+            let bloom = BloomState::empty();
+            let recent_yara_hits = RecentYaraHits::new();
 
-        let mut tmp = tempfile::NamedTempFile::new().expect("create temp file");
-        tmp.write_all(b"irrelevant content, still not eicar").unwrap();
-        tmp.flush().unwrap();
+            let mut tmp = tempfile::NamedTempFile::new().expect("create temp file");
+            tmp.write_all(b"irrelevant content, still not eicar").unwrap();
+            tmp.flush().unwrap();
 
-        let verdict = resolve(&pool, &bloom, &yara, &recent_yara_hits, tmp.path())
-            .await
-            .expect("resolve verdict");
+            let verdict = resolve(&body_pool, &bloom, &yara, &recent_yara_hits, tmp.path())
+                .await
+                .expect("resolve verdict");
 
-        let malwarebazaar = verdict
-            .intel_freshness
-            .iter()
-            .find(|f| f.source == "malwarebazaar")
-            .unwrap_or_else(|| {
-                panic!(
-                    "expected malwarebazaar in intel_freshness, got: {:?}",
-                    verdict.intel_freshness
-                )
-            });
-        assert!(
-            malwarebazaar.last_successful_sync_at.is_some(),
-            "malwarebazaar was just seeded with a successful sync -- must report Some(...)"
-        );
+            let malwarebazaar = verdict
+                .intel_freshness
+                .iter()
+                .find(|f| f.source == "malwarebazaar")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "expected malwarebazaar in intel_freshness, got: {:?}",
+                        verdict.intel_freshness
+                    )
+                });
+            assert!(
+                malwarebazaar.last_successful_sync_at.is_some(),
+                "malwarebazaar was just seeded with a successful sync -- must report Some(...)"
+            );
 
-        let threatfox = verdict
-            .intel_freshness
-            .iter()
-            .find(|f| f.source == "threatfox")
-            .unwrap_or_else(|| {
-                panic!(
-                    "expected threatfox in intel_freshness even though it has never synced, got: {:?}",
-                    verdict.intel_freshness
-                )
-            });
-        assert!(
-            threatfox.last_successful_sync_at.is_none(),
-            "a configured source with no feed_sync_state row must report None, not be missing"
-        );
+            let threatfox = verdict
+                .intel_freshness
+                .iter()
+                .find(|f| f.source == "threatfox")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "expected threatfox in intel_freshness even though it has never synced, got: {:?}",
+                        verdict.intel_freshness
+                    )
+                });
+            assert!(
+                threatfox.last_successful_sync_at.is_none(),
+                "a configured source with no feed_sync_state row must report None, not be missing"
+            );
+        })
+        .await;
 
-        if let Some(prior) = prior_threatfox_state {
-            sqlx::query(
-                "INSERT INTO feed_sync_state (source, last_synced_at, last_cursor) \
-                 VALUES ('threatfox', $1, $2)",
-            )
-            .bind(prior.last_synced_at)
-            .bind(prior.last_cursor)
-            .execute(&pool)
-            .await
-            .expect("restore prior threatfox sync state");
+        restore_sync_state(&pool, "malwarebazaar", prior_malwarebazaar_state).await;
+        restore_sync_state(&pool, "threatfox", prior_threatfox_state).await;
+
+        if let Err(join_err) = outcome {
+            std::panic::resume_unwind(join_err.into_panic());
         }
     }
 
