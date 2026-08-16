@@ -228,6 +228,75 @@ body {
   border-radius: 6px;
 }
 
+.file-intel {
+  font-size: 0.8rem;
+  margin-bottom: 1rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+  background: #f3f3f3;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.file-intel-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1rem;
+}
+
+.file-intel-label {
+  color: #777;
+  margin-right: 0.25rem;
+}
+
+.file-intel-flag {
+  background: #e3e3e3;
+  border-radius: 4px;
+  padding: 0.05rem 0.4rem;
+  font-size: 0.72rem;
+  color: #555;
+}
+
+.file-intel-purpose {
+  color: #444;
+}
+
+.file-intel-status {
+  padding-top: 0.15rem;
+  border-top: 1px solid #e3e3e3;
+}
+
+.file-intel-status-label {
+  font-weight: 600;
+}
+
+.file-intel-detail {
+  color: #777;
+}
+
+.file-intel-reasons {
+  margin: 0.2rem 0 0;
+  padding-left: 1.1rem;
+  color: #666;
+  font-size: 0.75rem;
+}
+
+.authenticity-ok,
+.expectedness-ok {
+  color: #146c3f;
+}
+
+.authenticity-warn,
+.expectedness-warn {
+  color: #8a5a00;
+}
+
+.authenticity-unknown,
+.expectedness-unknown {
+  color: #555;
+}
+
 .intel-coverage {
   font-size: 0.8rem;
   margin-bottom: 1rem;
@@ -453,6 +522,44 @@ button:disabled {
 
   .intel-source-err {
     color: #e39a9a;
+  }
+
+  .file-intel {
+    background: #262626;
+  }
+
+  .file-intel-label,
+  .file-intel-detail,
+  .file-intel-reasons {
+    color: #999;
+  }
+
+  .file-intel-flag {
+    background: #333;
+    color: #ccc;
+  }
+
+  .file-intel-purpose {
+    color: #ccc;
+  }
+
+  .file-intel-status {
+    border-color: #3a3a3a;
+  }
+
+  .authenticity-ok,
+  .expectedness-ok {
+    color: #7fd8a4;
+  }
+
+  .authenticity-warn,
+  .expectedness-warn {
+    color: #e3b96a;
+  }
+
+  .authenticity-unknown,
+  .expectedness-unknown {
+    color: #aaa;
   }
 
   .provenance-entry {

@@ -1,12 +1,16 @@
-import type { FileEntry, IntelSourceFreshness, Verdict } from "../types";
+import type { FileEntry, FileIntelligence, IntelSourceFreshness, Verdict } from "../types";
 import { TIER_LABELS } from "../types";
 import { formatDate, formatRelativeTime } from "../format";
+import { FileIntelPanel } from "./FileIntelPanel";
 
 interface Props {
   file: FileEntry | null;
   verdict: Verdict | null;
   loading: boolean;
   error: string | null;
+  fileIntel: FileIntelligence | null;
+  fileIntelLoading: boolean;
+  fileIntelError: string | null;
 }
 
 // Documented-as-arbitrary default, matching the Phase 1 console's
@@ -57,7 +61,15 @@ function IntelCoverage({ sources }: { sources: IntelSourceFreshness[] }) {
   );
 }
 
-export function VerdictPanel({ file, verdict, loading, error }: Props) {
+export function VerdictPanel({
+  file,
+  verdict,
+  loading,
+  error,
+  fileIntel,
+  fileIntelLoading,
+  fileIntelError,
+}: Props) {
   if (!file) {
     return (
       <div className="verdict-panel verdict-empty">
@@ -70,6 +82,8 @@ export function VerdictPanel({ file, verdict, loading, error }: Props) {
     <div className="verdict-panel">
       <h2 className="verdict-file-name">{file.name}</h2>
       <div className="verdict-path">{file.path}</div>
+
+      <FileIntelPanel intel={fileIntel} loading={fileIntelLoading} error={fileIntelError} />
 
       {loading && <div className="verdict-status">Hashing and checking indicators...</div>}
       {error && <div className="verdict-status verdict-error">{error}</div>}

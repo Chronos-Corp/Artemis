@@ -1,6 +1,7 @@
 mod bloom;
 mod commands;
 mod db;
+mod file_intel;
 mod fs_browse;
 mod hashing;
 mod ingest;
@@ -96,6 +97,7 @@ pub fn run() {
             commands::default_start_dir,
             commands::list_directory,
             commands::get_verdict,
+            commands::get_file_intelligence,
             commands::sync_feeds,
             commands::yara_status,
             commands::db_status,

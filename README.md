@@ -54,17 +54,33 @@ What works today:
   preserved instead of flattened.
 - Feed ingestion: MalwareBazaar and ThreatFox recent submissions, folded
   into the graph with provenance back to the source report.
+- **File Intelligence Model (PR #18).** Every selected file also gets a
+  File Intelligence Object (`get_file_intelligence`, `src-tauri/src/file_intel.rs`)
+  -- identity (content-sniffed file type, not just extension; hidden/
+  executable/symlink flags; timestamps), authenticity (package-manager
+  checksum verification against the file's install-time record, keyed to
+  the *selected* path -- a symlink never inherits its target's package
+  identity), product context (owning package/version), purpose (the
+  package's real short description when one exists, worded explicitly as
+  package-level rather than claiming Apollo identified this specific
+  file's individual role), expectedness (a rollup with explicit reasons --
+  checksum mismatch always wins; a same-directory masquerading check for
+  near-miss filenames like `svch0st.exe` beside `svchost.exe` is treated
+  as weak contextual evidence that cannot override a Verified checksum,
+  since legitimate tool families like `mount`/`umount` genuinely sit
+  within a small edit distance of each other), and local context. This
+  answers "what is this file and what's it for," independent of
+  `get_verdict`'s "is this file threat-relevant" -- see Apollo
+  Constitution &sect;5. v1 package-manager support is dpkg-only
+  (Debian/Ubuntu); other platforms report authenticity as `unknown`
+  rather than guessing -- see the module doc comment. Deliberately does
+  not touch Postgres at all, so it keeps working even when the intel
+  database is unreachable.
 
 What's stubbed or deliberately not built yet, in build order (see
 [`docs/apollo-constitution.md`](docs/apollo-constitution.md#12-current-product-build-doctrine)
 for the full sequencing rationale):
 
-- **File Intelligence Model (PR #18).** The verdict engine answers "is
-  this file threat-relevant," never "what is this file, in general, and
-  what's it for" (a legitimate system binary vs. an unknown one). Nothing
-  here yet -- no identity/authenticity/product-context/purpose/
-  expectedness object exists. See Open &middot; 1 and &middot; 2 in the
-  Apollo Constitution.
 - **Threat Relationship Model (PR #19).** CVE/IOC/APT/campaign/malware/
   risk associations are not yet structured, actionable objects with an
   explicit strength vocabulary (direct/strong/contextual/weak) -- see
@@ -75,9 +91,9 @@ for the full sequencing rationale):
   pick a CVE/IOC/APT relationship a file surfaced, and scan the chosen
   directory scope recursively for every other file associated with it.
   `fs_browse.rs` lists one directory level at a time; nothing walks a
-  tree looking for matches. Blocked on PR #18/#19 existing first, per
+  tree looking for matches. Blocked on PR #19 existing first, per
   the Apollo Constitution's build doctrine -- not something to build
-  ahead of the file/relationship models it depends on.
+  ahead of the relationship model it depends on.
 - Fuzzy hashing (imphash / TLSH / ssdeep). The indicator kind and query
   path exist; nothing computes these values yet, so tier 2 (fuzzy match)
   never fires in Phase 0.
@@ -330,8 +346,9 @@ Do not jump ahead; each phase de-risks the next.
   alternative backend, decided by customer evidence, not by assumption.
   Current build sequence, in order: intel freshness surfaced on every
   verdict (PR #17, done -- see "What works today" above), a File
-  Intelligence Model (PR #18 -- what a file is actually *for*, not just
-  its hash/reputation), a Threat Relationship Model (PR #19 -- CVE/IOC/
+  Intelligence Model (PR #18, done -- see "What works today" above --
+  what a file is actually *for*, not just its hash/reputation), a
+  Threat Relationship Model (PR #19 -- CVE/IOC/
   APT/campaign/malware/risk associations as structured, actionable
   objects with an explicit strength vocabulary), a Recursive Hunt Engine
   (PR #20 -- the actual missing pivot: today's verdict engine only goes

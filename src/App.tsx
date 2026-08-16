@@ -8,6 +8,7 @@ import type {
   DbStatus,
   FeedSyncResult,
   FileEntry,
+  FileIntelligence,
   IntelSourceFreshness,
   Verdict,
   YaraStatus,
@@ -24,6 +25,10 @@ function App() {
   const [verdict, setVerdict] = useState<Verdict | null>(null);
   const [verdictLoading, setVerdictLoading] = useState(false);
   const [verdictError, setVerdictError] = useState<string | null>(null);
+
+  const [fileIntel, setFileIntel] = useState<FileIntelligence | null>(null);
+  const [fileIntelLoading, setFileIntelLoading] = useState(false);
+  const [fileIntelError, setFileIntelError] = useState<string | null>(null);
 
   const [dbStatus, setDbStatus] = useState<DbStatus | null>(null);
   const [yaraStatus, setYaraStatus] = useState<YaraStatus | null>(null);
@@ -70,22 +75,33 @@ function App() {
       setSelectedFile(null);
       setVerdict(null);
       setVerdictError(null);
+      setFileIntel(null);
+      setFileIntelError(null);
     }
   }, [currentDir, loadDir]);
 
-  async function handleSelectFile(entry: FileEntry) {
+  function handleSelectFile(entry: FileEntry) {
     setSelectedFile(entry);
     setVerdict(null);
     setVerdictError(null);
     setVerdictLoading(true);
-    try {
-      const result = await invoke<Verdict>("get_verdict", { path: entry.path });
-      setVerdict(result);
-    } catch (e) {
-      setVerdictError(String(e));
-    } finally {
-      setVerdictLoading(false);
-    }
+    setFileIntel(null);
+    setFileIntelError(null);
+    setFileIntelLoading(true);
+
+    // Independent requests, independent failure: get_file_intelligence
+    // never touches the database (see its Rust doc comment), so it can
+    // succeed even when get_verdict fails because Postgres is
+    // unreachable, and neither should block or hide the other's result.
+    invoke<Verdict>("get_verdict", { path: entry.path })
+      .then(setVerdict)
+      .catch((e) => setVerdictError(String(e)))
+      .finally(() => setVerdictLoading(false));
+
+    invoke<FileIntelligence>("get_file_intelligence", { path: entry.path })
+      .then(setFileIntel)
+      .catch((e) => setFileIntelError(String(e)))
+      .finally(() => setFileIntelLoading(false));
   }
 
   async function handleSync() {
@@ -157,6 +173,9 @@ function App() {
             verdict={verdict}
             loading={verdictLoading}
             error={verdictError}
+            fileIntel={fileIntel}
+            fileIntelLoading={fileIntelLoading}
+            fileIntelError={fileIntelError}
           />
         </section>
       </main>
