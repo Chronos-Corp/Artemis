@@ -4,7 +4,9 @@ use serde_json::Value as Json;
 use sqlx::{PgExecutor, PgPool};
 use uuid::Uuid;
 
-use crate::models::{DetectionKind, IndicatorKind, ProvenanceEntry, VerdictTier};
+use crate::models::{
+    DetectionKind, IndicatorKind, IntelSourceFreshness, ProvenanceEntry, VerdictTier,
+};
 
 /// Returns (report_id, was_inserted). was_inserted uses the `xmax = 0` trick
 /// so callers can report accurate added-vs-updated counts after a sync.
@@ -232,18 +234,18 @@ pub async fn upsert_detection_detects_indicator(
     Ok(())
 }
 
-#[derive(serde::Serialize)]
-pub struct SyncState {
-    pub source: String,
-    pub last_synced_at: Option<DateTime<Utc>>,
-}
-
-/// Last-synced timestamps for every feed that has ever synced, used to show
-/// "last synced" status in the UI without waiting on a fresh sync.
-pub async fn all_sync_states(pool: &PgPool) -> Result<Vec<SyncState>> {
+/// Last-successful-sync timestamps for every feed that has ever completed a
+/// sync, used both to show "last synced" status in the global status bar
+/// (independent of any one file lookup) and, via `verdict::resolve`, to
+/// tell an analyst whether an empty verdict reflects current intelligence
+/// or a feed that's gone quiet. A feed's row only exists once
+/// `set_sync_cursor` has been called for it, which `ingest::*::sync` only
+/// reaches after a full successful sync commits -- a source that has only
+/// ever failed has no row here at all, not a stale one.
+pub async fn all_sync_states(pool: &PgPool) -> Result<Vec<IntelSourceFreshness>> {
     let rows = sqlx::query_as!(
-        SyncState,
-        "SELECT source, last_synced_at FROM feed_sync_state ORDER BY source"
+        IntelSourceFreshness,
+        r#"SELECT source, last_synced_at AS "last_successful_sync_at" FROM feed_sync_state ORDER BY source"#
     )
     .fetch_all(pool)
     .await?;

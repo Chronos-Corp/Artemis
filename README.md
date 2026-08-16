@@ -27,7 +27,13 @@ What works today:
 - Verdict engine: hashes the file (cached by path + size + mtime), checks a
   local bloom filter of known-bad hashes, runs a local YARA pass, and checks
   path-pattern and contextual signals. Every match is returned with its
-  tier, source, and confidence; nothing collapses to a boolean.
+  tier, source, and confidence; nothing collapses to a boolean. Every
+  verdict also carries per-source intel freshness (`last_successful_sync_at`
+  for each configured feed), so an empty result is distinguishable from "no
+  intel source has synced recently enough to trust this" -- an absence of
+  matches against an 11-day-stale feed is not the same fact as an absence
+  of matches against a feed that synced 18 minutes ago, and the UI now
+  shows the difference instead of only hedging about it in prose.
 - Intel graph in Postgres: Indicator / Report / CVE / Actor / Detection
   nodes with source, confidence, and first/last-seen on the edges, so the
   same hash arriving from multiple feeds with different confidence is
@@ -242,28 +248,49 @@ Do not jump ahead; each phase de-risks the next.
 - **Phase 0 (current):** this repo. Single-machine desktop app proving the
   file-manager-with-verdicts UX. Success criteria: an IR analyst uses it on
   a real case and wants it again.
-- **Phase 1 (in progress):** Agent plus console. File-to-IOC across a
-  fleet. Sample retrieval. Landed so far: `crates/nsic-core` (shared
+- **Phase 1 (fleet substrate, frozen for now):** Agent plus console.
+  File-to-IOC across a fleet. Sample retrieval. `crates/nsic-core` (shared
   hashing, YARA scanning, and intel-graph types, extracted out of
   `src-tauri`), `crates/agent` (a CLI that can hash a file, run a local
   YARA scan, enroll/heartbeat against a console, report scan matches as
-  sightings, and fulfill an operator's sample-retrieval requests),
-  `crates/console` (an HTTP service, `/api/v1`, recording
-  enrollment/heartbeats/sightings/sample requests in the same Postgres
-  intel graph, reading sightings and sample-request status back out by
-  host or by hash, and downloading a retrieved sample's actual content
-  either by request or by hash). Enrollment requires a console-operator
-  bootstrap secret; each enrolled host gets its own credential for
-  authenticated heartbeats, sighting submission, and sample-request
-  polling/fulfillment; a third, separate console-operator credential
-  gates reading sightings and sample data back out and creating sample
-  requests. No fleet UI yet -- see
+  sightings and per-invocation scan coverage, and fulfill an operator's
+  sample-retrieval requests), `crates/console` (an HTTP service and
+  server-rendered fleet UI, `/api/v1`, recording
+  enrollment/heartbeats/sightings/sample requests/scan coverage in the
+  same Postgres intel graph; per-agent credentials with operator-driven
+  rotation and revocation; reading sightings, sample-request status, and
+  fleet-wide host/sensor-health state back out; downloading a retrieved
+  sample's actual content). See
   [`docs/phase1-design.md`](docs/phase1-design.md) for exactly what's
-  covered and what's deliberately deferred.
-- **Phase 2:** CVE hunt packs, KEV first.
-- **Phase 3:** Folder correlation scoring. Must come after Phase 1 because
-  the scoring model cannot be tuned without real telemetry; building it
-  early ships a false-positive generator.
+  covered and what's deliberately deferred. This is enough infrastructure
+  to prove the agent architecture works; further fleet-administration
+  expansion (scheduling, richer deployment management, and the like) is
+  deliberately paused here rather than continued out of momentum -- see
+  the roadmap correction below.
+- **Roadmap correction (current focus):** an external review of the
+  codebase pointed out that Phase 1 is the harder commercial sell --
+  "please deploy another endpoint agent" -- while this README's own hunt
+  pack description (above) already identifies the CVE-to-IOC mapping as
+  the product's actual moat, and nothing on that path had been built yet.
+  Endpoint fleet management is real, useful infrastructure, but it isn't
+  the wedge. Rather than keep building fleet features, the intelligence/
+  hunt-pack plane is promoted to the immediate next work, sequenced as:
+  intel freshness surfaced on every verdict (done -- see "What works
+  today" above), a hunt pack manifest format (YARA + Sigma + path/registry
+  signals + provenance, not a new rule language -- see "Locked
+  architecture decisions"), a first real KEV-seeded hunt pack, an adapter
+  boundary for running hunt packs against evidence from existing
+  security tools (not just this repo's own agent), first agentless hunt
+  execution, and normalizing those findings into the same evidence graph
+  everything else here already writes to. The endpoint agent becomes one
+  evidence source among several, not the prerequisite for using Apollo at
+  all -- the intel graph, provenance model, verdict engine, and console
+  APIs all survive this sequencing change unchanged.
+- **Phase 2:** CVE hunt packs, KEV first -- see the roadmap correction
+  above for why this moved up.
+- **Phase 3:** Folder correlation scoring. Must come after real hunt/fleet
+  telemetry exists because the scoring model cannot be tuned without it;
+  building it early ships a false-positive generator.
 - **Phase 4:** Change history and timeline, from the USN Journal, $MFT
   ($STANDARD_INFO vs $FILE_NAME to detect timestomping), VSS, Prefetch, and
   Amcache. This is timeline reconstruction with gaps, not true versioning;

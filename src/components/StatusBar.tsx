@@ -1,10 +1,10 @@
-import type { DbStatus, FeedSyncResult, SyncState, YaraStatus } from "../types";
+import type { DbStatus, FeedSyncResult, IntelSourceFreshness, YaraStatus } from "../types";
 import { formatDate } from "../format";
 
 interface Props {
   dbStatus: DbStatus | null;
   yaraStatus: YaraStatus | null;
-  syncStates: SyncState[];
+  syncStates: IntelSourceFreshness[];
   syncing: boolean;
   lastSyncResults: FeedSyncResult[] | null;
   onSync: () => void;
@@ -29,7 +29,7 @@ export function StatusBar({
         </span>
         {syncStates.map((s) => (
           <span className="status-pill" key={s.source}>
-            {s.source}: last synced {formatDate(s.last_synced_at)}
+            {s.source}: last synced {formatDate(s.last_successful_sync_at)}
           </span>
         ))}
       </div>

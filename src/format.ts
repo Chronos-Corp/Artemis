@@ -17,6 +17,25 @@ export function formatDate(iso: string | null): string {
   return d.toLocaleString();
 }
 
+// Short, relative form ("18 minutes ago", "11 days ago") for the intel
+// freshness display -- an analyst scanning a list of sources for "which
+// one has gone stale" is better served by relative age than an absolute
+// timestamp they'd have to mentally diff against now. formatDate above
+// remains the absolute-timestamp formatter used everywhere else
+// (provenance first/last-seen), which is what those need instead.
+export function formatRelativeTime(iso: string | null): string {
+  if (!iso) return "never";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "never";
+  const diffMinutes = Math.max(0, Math.round((Date.now() - d.getTime()) / 60000));
+  if (diffMinutes < 1) return "just now";
+  if (diffMinutes < 60) return `${diffMinutes} minute${diffMinutes === 1 ? "" : "s"} ago`;
+  const diffHours = Math.round(diffMinutes / 60);
+  if (diffHours < 24) return `${diffHours} hour${diffHours === 1 ? "" : "s"} ago`;
+  const diffDays = Math.round(diffHours / 24);
+  return `${diffDays} day${diffDays === 1 ? "" : "s"} ago`;
+}
+
 export function pathSeparator(path: string): string {
   return path.includes("\\") && !path.includes("/") ? "\\" : "/";
 }

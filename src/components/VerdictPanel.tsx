@@ -1,12 +1,60 @@
-import type { FileEntry, Verdict } from "../types";
+import type { FileEntry, IntelSourceFreshness, Verdict } from "../types";
 import { TIER_LABELS } from "../types";
-import { formatDate } from "../format";
+import { formatDate, formatRelativeTime } from "../format";
 
 interface Props {
   file: FileEntry | null;
   verdict: Verdict | null;
   loading: boolean;
   error: string | null;
+}
+
+// Documented-as-arbitrary default, matching the Phase 1 console's
+// NSIC_SCAN_STALENESS_HOURS precedent (crates/console/src/main.rs) for the
+// same reasoning: a sane ceiling for a feed expected to sync roughly daily,
+// not derived from any measured workload. Unlike the console, there's no
+// per-deployment operator here to override it via an env var -- this is a
+// single-analyst desktop app, so it's a constant, not a config value.
+const INTEL_STALENESS_HOURS = 24;
+
+function isStale(freshness: IntelSourceFreshness): boolean {
+  if (!freshness.last_successful_sync_at) return false;
+  const syncedAt = new Date(freshness.last_successful_sync_at).getTime();
+  if (Number.isNaN(syncedAt)) return false;
+  const ageHours = (Date.now() - syncedAt) / (60 * 60 * 1000);
+  return ageHours > INTEL_STALENESS_HOURS;
+}
+
+function IntelCoverage({ sources }: { sources: IntelSourceFreshness[] }) {
+  if (sources.length === 0) {
+    return (
+      <div className="intel-coverage intel-coverage-empty">
+        No feed has completed a sync yet -- this verdict reflects local YARA
+        rules and path/naming signals only, not any intel feed.
+      </div>
+    );
+  }
+  return (
+    <div className="intel-coverage">
+      <div className="intel-coverage-label">Intel coverage</div>
+      <ul>
+        {sources.map((s) => {
+          const never = !s.last_successful_sync_at;
+          const stale = !never && isStale(s);
+          const status = never ? "err" : stale ? "warn" : "ok";
+          const icon = never ? "✗" : stale ? "⚠" : "✓";
+          return (
+            <li key={s.source} className={`intel-source intel-source-${status}`}>
+              <span className="intel-source-icon">{icon}</span> {s.source} --{" "}
+              {never
+                ? "never successfully synced"
+                : `synced ${formatRelativeTime(s.last_successful_sync_at)}`}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
 }
 
 export function VerdictPanel({ file, verdict, loading, error }: Props) {
@@ -39,11 +87,15 @@ export function VerdictPanel({ file, verdict, loading, error }: Props) {
             </div>
           </div>
 
+          <IntelCoverage sources={verdict.intel_freshness} />
+
           {verdict.entries.length === 0 ? (
-            <div className="verdict-clean">
-              No matches in any tier checked (exact hash, fuzzy hash, YARA, path
-              pattern, contextual). Not a guarantee the file is clean, only that
-              nothing in the current intel store or local rules flagged it.
+            <div className="verdict-no-match">
+              No matching hash evidence, YARA hit, path pattern, or contextual
+              association in any tier checked. Not a guarantee the file is
+              clean -- only that nothing in the current intel store or local
+              rules flagged it. See intel coverage above for how current that
+              intel actually is.
             </div>
           ) : (
             <ul className="provenance-list">

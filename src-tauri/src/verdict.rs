@@ -57,15 +57,24 @@ pub async fn resolve(
     let hash = hashing::hash_file_cached(pool, path).await?;
     let mut entries = Vec::new();
 
-    // Tiers 1/2: bloom miss on both hashes means "clean" for the hash-based
-    // tiers, no DB round trip needed. This is the local-miss-means-clean
-    // path the agent model depends on for instant clicks at fleet scale.
+    // Tiers 1/2: a bloom miss on both hashes means no matching hash
+    // evidence exists in the currently available local intelligence
+    // corpus -- not that the file is clean, a distinction `intel_freshness`
+    // below exists to make visible -- so no DB round trip is needed. This
+    // is the local-miss-skips-the-round-trip path the agent model depends
+    // on for instant clicks at fleet scale.
     let bloom_hit = bloom.contains(&hash.sha256).await || bloom.contains(&hash.md5).await;
     if bloom_hit {
         let sha_rows = db::hash_matches(pool, IndicatorKind::Sha256, &hash.sha256).await?;
-        entries.extend(db::hash_matches_to_provenance(sha_rows, VerdictTier::ExactHash));
+        entries.extend(db::hash_matches_to_provenance(
+            sha_rows,
+            VerdictTier::ExactHash,
+        ));
         let md5_rows = db::hash_matches(pool, IndicatorKind::Md5, &hash.md5).await?;
-        entries.extend(db::hash_matches_to_provenance(md5_rows, VerdictTier::ExactHash));
+        entries.extend(db::hash_matches_to_provenance(
+            md5_rows,
+            VerdictTier::ExactHash,
+        ));
     }
 
     // Tier 3: YARA is orthogonal to known-bad hash status, always runs.
@@ -104,11 +113,18 @@ pub async fn resolve(
 
     entries.sort_by_key(|e| e.tier);
 
+    // Carried on every verdict, not just an empty one: even a verdict with
+    // real matches is only as current as the feeds that produced them, and
+    // an analyst comparing two verdicts benefits from seeing the same
+    // freshness context either way.
+    let intel_freshness = db::all_sync_states(pool).await?;
+
     Ok(Verdict {
         path: path_str,
         sha256: hash.sha256,
         md5: hash.md5,
         entries,
+        intel_freshness,
     })
 }
 
@@ -178,7 +194,10 @@ mod tests {
             .unwrap()
             .join("yara-rules");
         let yara = Arc::new(YaraEngine::load(&rules_dir).expect("load yara rules"));
-        assert!(yara.rule_count > 0, "expected the bundled EICAR rule to load");
+        assert!(
+            yara.rule_count > 0,
+            "expected the bundled EICAR rule to load"
+        );
 
         let bloom = BloomState::empty();
         let recent_yara_hits = RecentYaraHits::new();
@@ -201,12 +220,63 @@ mod tests {
         );
     }
 
+    /// `intel_freshness` must reflect `feed_sync_state`, not just exist as
+    /// an empty placeholder -- seeds a uniquely named source (so this test
+    /// can't collide with real feed data or another test run sharing this
+    /// sandbox's persistent local Postgres instance) and confirms `resolve`
+    /// surfaces it. This is the actual fix: previously an empty `entries`
+    /// carried no signal at all about whether the intel behind it was
+    /// current.
+    #[tokio::test]
+    #[ignore]
+    async fn intel_freshness_reflects_feed_sync_state() {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://nsic:nsic@localhost:5432/nsic".to_string());
+        let pool = crate::db::connect_and_migrate(&database_url)
+            .await
+            .expect("connect to test database");
+
+        let source = format!("test-source-{}", uuid::Uuid::new_v4());
+        crate::db::indicators::set_sync_cursor(&pool, &source, Some("cursor"))
+            .await
+            .expect("seed feed_sync_state");
+
+        let rules_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("yara-rules");
+        let yara = Arc::new(YaraEngine::load(&rules_dir).expect("load yara rules"));
+        let bloom = BloomState::empty();
+        let recent_yara_hits = RecentYaraHits::new();
+
+        let mut tmp = tempfile::NamedTempFile::new().expect("create temp file");
+        tmp.write_all(b"irrelevant content, not eicar").unwrap();
+        tmp.flush().unwrap();
+
+        let verdict = resolve(&pool, &bloom, &yara, &recent_yara_hits, tmp.path())
+            .await
+            .expect("resolve verdict");
+
+        let freshness = verdict
+            .intel_freshness
+            .iter()
+            .find(|f| f.source == source)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected seeded source {source} in intel_freshness, got: {:?}",
+                    verdict.intel_freshness
+                )
+            });
+        assert!(
+            freshness.last_successful_sync_at.is_some(),
+            "a source with a feed_sync_state row must report Some(...), not None"
+        );
+    }
+
     fn tempfile_eicar() -> tempfile::NamedTempFile {
         let mut f = tempfile::NamedTempFile::new().expect("create temp file");
-        f.write_all(
-            br"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*",
-        )
-        .expect("write eicar bytes");
+        f.write_all(br"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*")
+            .expect("write eicar bytes");
         f
     }
 }
