@@ -1,12 +1,13 @@
 # Phase 1 design: agent plus console
 
 Status: enrollment, heartbeat, sighting submission, reading sightings back
-out, and both halves of sample retrieval (request + agent fulfillment,
-and reading the retrieved content back out) are all authenticated end to
-end; most of the phase is still not built. This document tracks
-what Phase 1 actually is, what's landed so far, and what's deliberately
-deferred, in the same spirit as the README's Phase 0 "what works today /
-what's stubbed" split.
+out, both halves of sample retrieval (request + agent fulfillment, and
+reading the retrieved content back out), TLS, credential rotation/
+revocation, and a browser-facing fleet UI covering all of the above are
+authenticated end to end; most of the phase is still not built. This
+document tracks what Phase 1 actually is, what's landed so far, and
+what's deliberately deferred, in the same spirit as the README's Phase 0
+"what works today / what's stubbed" split.
 
 Per the README's build order, Phase 1 is: agent plus console, file-to-IOC
 across a fleet, sample retrieval. That's a lot; this document exists so
@@ -69,7 +70,18 @@ sequence, and why it's ordered this way:
     operator-credential-gated endpoints let an operator replace a host's
     credential in place, or lock it out without issuing a new one, while
     keeping the host's id and history intact.
-11. **Later, not started:** fleet UI.
+11. **PR #13 — fleet UI.** `crates/console` was API-only through PR #12 --
+    every read and write required `curl` or a script. This PR adds a
+    server-rendered HTML console (no Node/npm, no build step) covering
+    the whole operator workflow built so far: browse the fleet, drill
+    into a host's sightings and sample requests, request a new sample,
+    download retrieved content, and rotate or revoke a credential. Also
+    fills a long-documented gap along the way: `GET /api/v1/hosts` and
+    `GET /api/v1/hosts/{host_id}`, the "list all hosts" endpoint noted as
+    missing since PR #7.
+12. **Later, not started:** plugin/scripting support (see "What's
+    deliberately not here yet" below for the near-term answer already
+    available without building anything new).
 
 Auth before telemetry, deliberately: once YARA and sighting submission
 exist, the agent starts producing intelligence the console has to trust.
@@ -1006,6 +1018,190 @@ operator-only action so far (creating/listing sample requests, reading
 sightings back out), which are `curl`-with-a-bearer-token only, not
 wrapped in `nsic-agent`.
 
+### PR #13: fleet UI
+
+`crates/console` was API-only through PR #12 -- every read and every
+write required `curl`, a script, or `nsic-agent`. This PR adds a
+browser-facing UI covering the operator workflow built so far: browse
+every enrolled host, drill into one host's sightings and sample
+requests, request a new sample, download retrieved content, and rotate
+or revoke that host's credential.
+
+**Server-rendered Rust, not a second npm project.** The Phase 0 desktop
+app already has a React/Vite frontend (`src/`), but reusing that stack
+here would mean a second toolchain, a second CI job, and a build step
+`crates/console`'s binary has never needed -- undercutting the "plain
+Rust binary, no Node/npm" pitch this crate has made since PR #3. Chosen
+instead: `maud`'s `html!` macro renders HTML directly in Rust, compiled
+into the same binary, with no template files and no runtime template
+parser. Every page and form is plain HTML; write actions are plain
+`<form method="post">` submissions, not JS-driven `fetch()` calls --
+`crates/console` still ships zero client-side JavaScript. `maud`'s own
+`axum` integration feature was tried first and dropped: it pulls a newer
+`axum-core` than this workspace's `axum 0.8` depends on, so two
+incompatible `axum-core` versions ended up in the same binary and
+`IntoResponse` failed to resolve across the boundary. Rendering
+`Markup::into_string()` into `axum::response::Html` directly avoids
+needing that feature at all.
+
+**`maud` auto-escapes, which is load-bearing here, not incidental.**
+Hostnames, paths, detection names, and failure reasons are all agent- or
+analyst-supplied strings with no character restrictions (`sighting.rs`'s
+`validate_sighting_request` checks length and emptiness, never content;
+`host::enroll` doesn't validate `hostname` at all) -- every one of them
+lands directly in this UI's markup. Verified, not assumed: two tests
+(`host_directory_escapes_a_hostile_hostname`,
+`host_detail_escapes_hostile_sighting_fields`) enroll a host named
+`<script>alert(1)</script>` and report a sighting with `<img
+src=x onerror=alert(1)>` as its detection name, then assert the raw tag
+never appears in the rendered response and the escaped form
+(`&lt;script&gt;...`) does -- a real XSS regression test, not just
+trusting the templating library's documentation.
+
+**HTTP Basic auth against the same operator secret, not a new
+credential or a session.** The UI needs *some* way for a browser to
+authenticate as the operator, and `NSIC_OPERATOR_SECRET` already exists
+for exactly that role -- the question was only how to present it. Basic
+auth (`auth::authenticate_operator_ui`, checked against a `WWW-
+Authenticate: Basic` challenge, distinct from `authenticate_operator`'s
+Bearer check the JSON API still uses exclusively) gets a browser's native
+credential prompt for free, and once entered, the browser resends it
+automatically on every subsequent request to this origin -- which is
+what lets plain `<a href>` navigation, plain form POSTs, and plain
+download links all work with zero JavaScript and no session/cookie
+machinery to build (no cookie store, no CSRF-token-per-form
+infrastructure, no login/logout routes). The tradeoff, accepted and
+logged below: no logout short of closing the browser, and the same
+ambient-credential CSRF exposure a cookie-based session would have had
+anyway (see below).
+
+**A fresh credential is rendered directly, never redirected through a
+URL.** Rotating a host's credential from the UI (`rotate_credential_
+action`) renders a minimal, standalone success page directly as the POST
+response (`200`), with the new credential in a banner, instead of the
+more typical redirect-after-POST pattern the other two write actions
+(create sample request, revoke) use. Not a redirect: a redirect would
+need to carry the new credential somewhere for the next request to
+display it, and the only place available -- the URL's query string -- is
+a bad place to put a secret: it lands in browser history and can be
+logged by any proxy in front of the console. Not the full host detail
+page either -- an earlier draft rendered that directly, which meant three
+more database reads (host metadata, sightings, sample requests) happened
+*after* the credential had already been committed; if any of those three
+failed, the response would be a `500` with the old credential already
+invalidated and the new one never shown, recoverable only by rotating
+again. Caught in review. The success page now needs nothing beyond
+`host_id` and the credential already in hand, so nothing between the
+commit and the response can fail. The accepted remaining cost: refreshing
+that response (F5) prompts the browser to ask about resubmitting the
+form, since it's a direct POST response.
+
+**Two new JSON endpoints, useful independent of the UI.** `GET
+/api/v1/hosts` and `GET /api/v1/hosts/{host_id}` fill a gap flagged since
+PR #7 ("no way to discover valid host_ids through the API at all") --
+needed for the UI's host directory and detail pages, but available to
+any operator-credentialed caller (a script, `curl`) the same way every
+other list/get endpoint is. New `nsic_core::proto::HostView`/
+`HostListResponse` types; `HostView` deliberately never includes
+`credential_hash` -- nothing operator-facing has a reason to read that
+back, hashed or not.
+
+**Read queries are shared with the JSON API, not duplicated.**
+`sighting::fetch_host_sightings`, `sample::fetch_sample_requests`,
+`sample::fetch_content_by_request`, `host::fetch_all_hosts`, and
+`host::fetch_host` were factored out of the existing JSON handlers
+(`list_host_sightings`, `list_sample_requests`,
+`download_sample_by_request`, and the two new host endpoints above) into
+`pub(crate)` functions returning plain Rust values, called by both the
+JSON handler and the corresponding UI page. The alternative -- writing a
+second, UI-specific copy of each query -- would let the JSON response and
+the HTML page silently drift apart on what "every sighting for this
+host" actually returns. Write paths took the same approach:
+`sample::insert_sample_request` and `host::set_host_credential` (already
+shared by `rotate_credential`/`revoke_credential` since PR #12) are
+called directly by the UI's form handlers, so a rotate/revoke/sample-
+request performed through the browser goes through the exact same
+validation, transaction, and audit-event logic as the one performed
+through `curl`.
+
+**CSRF protection: a single per-process token, not a session.** An
+earlier draft of this PR shipped with no CSRF defense at all, reasoning
+that "loopback-only by default" made it unnecessary -- caught in review
+as wrong: a malicious page can target `http://localhost:8787` (or
+`127.0.0.1`) directly regardless of what network serves the attacker's
+own page, and the browser attaches a cached Basic Auth credential to a
+cross-origin form submission exactly as readily as it would a same-origin
+one. Basic Auth alone is not CSRF protection -- it proves the request
+carries a valid operator credential, not that the operator actually
+intended to submit it. Fixed with `AppState::csrf_token`: one high-entropy
+value (`auth::generate_csrf_token`) generated once at console startup,
+rendered as a hidden field in all three UI POST forms, and checked
+(`auth::verify_csrf`, `ui::require_csrf`) before any of the three
+handlers does anything else. This doesn't require per-user sessions or
+even per-request rotation -- the token's only job is being unreadable to
+a cross-origin attacker, and the Same-Origin Policy already guarantees
+that regardless of whether the token ever changes: an attacker's page can
+*submit* a form to this console, but it cannot *read* this console's
+authenticated HTML to discover what value belongs in the hidden field, so
+it cannot construct a request `verify_csrf` accepts.
+
+**`Content-Security-Policy` and `X-Frame-Options`, applied as a layer
+over the whole UI sub-router.** `security_headers`
+(`crates/console/src/ui.rs`) sets `default-src 'none'` with no
+`script-src` exception -- since this module ships no client-side
+JavaScript, a CSP that would block any acts as a standing correctness
+check on that claim, not just hardening (`style-src 'unsafe-inline'` is
+the one exception, needed only because `layout` inlines its stylesheet
+rather than serving a separate file). `frame-ancestors 'none'` plus the
+legacy `X-Frame-Options: DENY` stop the authenticated console from being
+embedded in another page's `<iframe>` for a clickjacking attack.
+`Cache-Control: no-store` moved from a single hand-set header on the old
+rotate response to this same layer, so it now covers every fleet UI
+response, not only the one that used to show a raw credential --
+sightings, paths, and downloaded sample bytes are all sensitive enough
+not to belong in a shared or browser cache either.
+
+**The revoke form's inline `onsubmit="return confirm(...)"` was
+removed, not kept alongside a looser CSP.** An earlier draft had this on
+the revoke button for a native "are you sure?" browser dialog -- flagged
+in review as inline JavaScript contradicting this PR's own "zero
+client-side JavaScript" claim, and incompatible with a strict CSP that
+disallows scripts entirely. Removed rather than carved out an exception:
+the CSRF token now also gates this action (an accidental double-submit
+without a deliberate page load can't happen the way a lone confirmation
+dialog was guarding against), and the claim is now literally
+enforced by the CSP, not just true by convention.
+
+**Verified against a live Postgres and the real binaries.** 25 new tests
+(19 in `ui.rs` -- including the two XSS-escaping tests, dedicated
+CSRF-rejection tests for both the create-sample-request and rotate
+actions, and a test confirming the security headers are actually present
+on a response rather than just configured -- plus 6 host-listing tests in
+`host.rs`) -- full workspace suite now **132 tests**, run twice for
+rerun-safety. Live end to end against the real `nsic-console` binary and
+`curl` in place of a browser: an unauthenticated request to `/` returns
+`401` with a `WWW-Authenticate: Basic` header (confirming a real browser
+would be prompted, not shown a bare error); a `GET /hosts` response
+carries `Cache-Control: no-store`, a `Content-Security-Policy` blocking
+scripts, and `X-Frame-Options: DENY`; a forged cross-site-style POST with
+no `csrf_token` field is rejected (`422`, from the form extractor itself)
+and one with a wrong token value is rejected (`403`, from `require_csrf`)
+-- both confirmed to leave the target host's credential untouched; a
+legitimate revoke using the real token extracted from the rendered page
+succeeds (`303`) and the credential is then locked out (`401` on
+heartbeat); a legitimate rotate using the real token renders the new
+credential directly and it authenticates while the old one no longer
+does; and the rendered page contains no `onsubmit`/`confirm(` text
+anywhere, confirming the removed inline handler is actually gone, not
+just removed from one code path. Also re-verified from the prior round:
+enrolled a host and confirmed it appears on `/hosts`; created a sample
+request through the UI form and confirmed the `303` redirect and the
+pending row; fulfilled it via `nsic-agent fulfill-samples` against a real
+file and downloaded it back through the UI's download link,
+byte-identical via `diff`; and confirmed `host_credential_event`
+accumulated both events (`rotated`, then `revoked`) in order, the same
+accumulation property PR #12 already established.
+
 ## What's deliberately not here yet
 
 - **Sensor health / scan coverage.** PR #6 only sends positive sightings
@@ -1137,8 +1333,37 @@ wrapped in `nsic-agent`.
   no per-user identity or audit trail beyond "the operator, as a whole"
   did this. Same deferred item PR #7 logged for sighting reads, now also
   true of sample requests.
-- **Fleet console UI.** No frontend for any of this; `crates/console` is
-  API-only.
+- **The fleet UI's CSRF token is a single per-process value, not
+  per-user or rotatable without a restart.** PR #13's three POST actions
+  are protected by `AppState::csrf_token` (see PR #13 above for why one
+  unrotated value is sufficient against the actual threat it defends
+  against). What it doesn't provide: per-analyst attribution of who took
+  a given action (the same single-shared-operator-identity gap logged
+  above for the read side), or a way to invalidate the token without
+  restarting the console. Neither matters yet for Phase 1's
+  single-operator framing; both would matter for a real multi-analyst
+  deployment.
+- **No indicator-centric pivot view in the fleet UI.** PR #7's
+  `GET /api/v1/indicators/{sha256}/sightings` (which hosts have sighted a
+  given hash) has no UI page yet -- the fleet UI only pivots the other
+  direction, host to its sightings. Straightforward to add the same way
+  once there's a real need for it.
+- **Plugin/scripting support.** Nothing here today, but nothing here
+  needs to be built for the near-term case either: `crates/console`'s
+  JSON API (operator-credential, documented throughout this file) is
+  already usable from any scripting language, Python included, with
+  nothing more than an HTTP client -- a Python script driving bulk sample
+  requests, enrichment, or custom triage logic works today with zero new
+  engineering. What doesn't exist is a *formal* plugin system (the
+  console itself discovering, loading, and calling into plugin code as
+  part of handling a request) -- that's a real design effort, most
+  commonly done as external subprocesses over a stdio/JSON protocol
+  rather than an embedded interpreter, since embedding one (e.g. Python
+  via `pyo3`) would mean shipping a language runtime and giving up the
+  "single static Rust binary, no runtime dependencies" property this
+  project has protected everywhere else (no GTK for `crates/console`, no
+  Node/npm, see PR #13 above). Worth designing deliberately once a
+  concrete use case is pulling for it, not before.
 - **Windows-specific agent internals.** USN journal, Amcache, etc. are
   Phase 4 territory per the README and untouched here.
 - **Migrations still live under `src-tauri/migrations/`.** That predates
@@ -1238,6 +1463,15 @@ cargo run -p agent --bin nsic-agent -- scan path/to/file --rules-dir yara-rules 
 # -> reported sighting: indicator_id=<uuid> rule=<rule name>
 
 curl -H "Authorization: Bearer $NSIC_OPERATOR_SECRET" \
+  http://localhost:8787/api/v1/hosts
+# -> {"hosts": [{"id": "...", "hostname": "...", "os": "...",
+#     "agent_version": "...", "enrolled_at": "...", "last_heartbeat_at": "..."}],
+#     "truncated": false}
+curl -H "Authorization: Bearer $NSIC_OPERATOR_SECRET" \
+  http://localhost:8787/api/v1/hosts/<uuid>
+# -> {"id": "...", "hostname": "...", ...}  -- same shape, one host
+
+curl -H "Authorization: Bearer $NSIC_OPERATOR_SECRET" \
   http://localhost:8787/api/v1/hosts/<uuid>/sightings
 curl -H "Authorization: Bearer $NSIC_OPERATOR_SECRET" \
   http://localhost:8787/api/v1/indicators/<sha256>/sightings
@@ -1321,6 +1555,51 @@ Omitting both `NSIC_TLS_CERT_PATH` and `NSIC_TLS_KEY_PATH` (the default)
 runs the console over plain HTTP exactly as shown above; setting only one
 of the two fails the console at startup rather than silently running
 without TLS.
+
+### Running it locally, with the fleet UI
+
+With the console running (either plain HTTP or TLS, as above), point a
+browser at it directly -- no separate build step, no `npm install`:
+
+```
+http://localhost:8787/
+```
+
+The browser will prompt for credentials (HTTP Basic) the first time a
+page under the operator's control is loaded; leave the username blank
+and enter `$NSIC_OPERATOR_SECRET` as the password. From there:
+
+- `/` and `/hosts` -- every enrolled host, linked through to its detail
+  page.
+- `/hosts/<uuid>` -- that host's metadata, sightings, and sample
+  requests, plus three forms: request a sample, rotate the host's
+  credential, revoke it.
+- Sample content download links appear next to any request that
+  resolved to `fulfilled` or `mismatched`.
+
+The same thing with `curl` standing in for a browser (useful for
+scripting or for confirming the UI is reachable without a GUI). GET
+requests need nothing beyond the operator credential; every POST also
+needs the console's CSRF token, which isn't a secret an operator
+configures -- it's generated once at startup and only ever shows up
+embedded as a hidden field in the UI's own rendered forms, so pulling it
+out of the page is the only way to get it (this is the point: an
+attacker's cross-origin page has no way to read it either):
+
+```bash
+curl -u ":$NSIC_OPERATOR_SECRET" http://localhost:8787/hosts
+curl -u ":$NSIC_OPERATOR_SECRET" http://localhost:8787/hosts/<uuid>
+
+TOKEN=$(curl -s -u ":$NSIC_OPERATOR_SECRET" http://localhost:8787/hosts/<uuid> \
+  | grep -oP 'name="csrf_token" value="\K[a-f0-9]+' | head -1)
+
+curl -u ":$NSIC_OPERATOR_SECRET" -X POST \
+  -d "path=/path/on/the/host&expected_sha256=&csrf_token=$TOKEN" \
+  http://localhost:8787/hosts/<uuid>/sample-requests
+curl -u ":$NSIC_OPERATOR_SECRET" -X POST \
+  -d "csrf_token=$TOKEN" \
+  http://localhost:8787/hosts/<uuid>/credential/rotate
+```
 
 `crates/agent` and `crates/console` do not need the WebKitGTK/GTK system
 libraries `src-tauri` requires on Linux (`libwebkit2gtk-4.1-dev` etc.);

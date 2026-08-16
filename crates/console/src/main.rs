@@ -1,8 +1,9 @@
 //! Phase 1 fleet console. Accepts agent enrollment, heartbeats, YARA
 //! sighting reports, and sample-retrieval requests, and records them in
 //! the shared Postgres intel graph (the same schema `src-tauri` uses).
-//! See docs/phase1-design.md for what's deliberately not here yet (a
-//! fleet UI, credential rotation, rate limiting).
+//! Also serves a server-rendered fleet UI (`crate::ui`) for the operator
+//! persona. See docs/phase1-design.md for what's deliberately not here
+//! yet (plugin/scripting support, rate limiting).
 //!
 //! TLS is opt-in via `NSIC_TLS_CERT_PATH`/`NSIC_TLS_KEY_PATH` (both or
 //! neither -- see `main`). Plain HTTP remains the default so existing
@@ -22,13 +23,16 @@
 //! credential. An agent's per-agent credential authenticates that one
 //! host's own writes -- it must not also authenticate reading or
 //! directing the rest of the fleet, hence the separate operator
-//! credential.
+//! credential. The fleet UI (`crate::ui`) gates on that same operator
+//! credential too, presented as HTTP Basic instead of Bearer -- see
+//! `auth::authenticate_operator_ui`.
 
 mod auth;
 mod host;
 mod pagination;
 mod sample;
 mod sighting;
+mod ui;
 mod validate;
 
 use anyhow::Context;
@@ -43,6 +47,10 @@ pub(crate) struct AppState {
     pool: PgPool,
     bootstrap_secret: String,
     operator_secret: String,
+    /// The fleet UI's CSRF token -- one per process, generated at
+    /// startup. See `auth::generate_csrf_token`'s doc comment for why a
+    /// single unrotated value is sufficient here.
+    csrf_token: String,
 }
 
 #[tokio::main]
@@ -94,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
         pool,
         bootstrap_secret,
         operator_secret,
+        csrf_token: auth::generate_csrf_token(),
     });
 
     // Loopback-only by default regardless of TLS: network-wide exposure
@@ -202,9 +211,39 @@ fn build_router(state: AppState) -> Router {
         ))
         .with_state(state.clone());
 
+    // The fleet UI gets its own sub-router too, so `ui::security_headers`
+    // (Cache-Control: no-store, CSP, X-Frame-Options -- see that
+    // function's doc comment) applies to every HTML page and download
+    // this module serves without also being layered onto the JSON API,
+    // which has no use for browser-facing headers like CSP.
+    let ui_routes = Router::new()
+        .route("/", get(ui::host_directory))
+        .route("/hosts", get(ui::host_directory))
+        .route("/hosts/{host_id}", get(ui::host_detail))
+        .route(
+            "/hosts/{host_id}/sample-requests",
+            post(ui::create_sample_request_action),
+        )
+        .route(
+            "/hosts/{host_id}/sample-requests/{request_id}/content",
+            get(ui::download_sample),
+        )
+        .route(
+            "/hosts/{host_id}/credential/rotate",
+            post(ui::rotate_credential_action),
+        )
+        .route(
+            "/hosts/{host_id}/credential/revoke",
+            post(ui::revoke_credential_action),
+        )
+        .layer(axum::middleware::from_fn(ui::security_headers))
+        .with_state(state.clone());
+
     Router::new()
         .route("/api/v1/agents/enroll", post(host::enroll))
         .route("/api/v1/agents/{host_id}/heartbeat", post(host::heartbeat))
+        .route("/api/v1/hosts", get(host::list_hosts))
+        .route("/api/v1/hosts/{host_id}", get(host::get_host))
         .route(
             "/api/v1/hosts/{host_id}/credential/rotate",
             post(host::rotate_credential),
@@ -247,6 +286,7 @@ fn build_router(state: AppState) -> Router {
         )
         .with_state(state)
         .merge(sample_content_route)
+        .merge(ui_routes)
 }
 
 #[cfg(test)]
