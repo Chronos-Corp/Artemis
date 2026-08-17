@@ -14,6 +14,14 @@ on:
   schedule:
     - cron: "0 6 * * 1" # Mondays 06:00 UTC
 
+# Least privilege for GITHUB_TOKEN -- see the matching block in ci.yml.
+# It matters more here than there: this is the one workflow handling a real
+# repository secret (ABUSECH_API_KEY), so a compromised or typosquatted
+# action in this job would run alongside that secret. It only checks out
+# and runs a test; it never writes to the repo.
+permissions:
+  contents: read
+
 jobs:
   live-ingest:
     runs-on: ubuntu-latest

@@ -124,6 +124,19 @@ history shows single instances get fixed while siblings survive.
 - [ ] `cargo audit` / `npm audit` clean, or triaged with a written reason?
 - [ ] Open Dependabot alerts reviewed (do not merge past them silently)?
 
+**CI/CD (the build system is part of the attack surface)**
+- [ ] Does every workflow declare an explicit least-privilege `permissions` block?
+- [ ] Does any job that handles a secret grant more token scope than it needs?
+- [ ] Are new third-party actions pinned and from a source worth trusting?
+- [ ] Could a PR from a fork reach a job that holds secrets?
+
+> This section exists because the first version of this checklist did not
+> have it, and CodeQL immediately caught a missing `permissions` block in
+> the very CI job added to *implement* the supply-chain item above. A
+> checklist that only covers the boundaries you already thought of is the
+> same reactive failure at one remove; when a tool finds a class this file
+> is silent on, the class gets added here, not just the instance fixed.
+
 ## Known accepted risks
 
 - **Coarse locking over the intel corpus.** `IntelGate` serializes a whole

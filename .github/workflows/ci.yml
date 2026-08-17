@@ -6,6 +6,16 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege for GITHUB_TOKEN. Without an explicit block a workflow
+# inherits the repository default, which can include write scopes none of
+# these jobs need -- every job here only checks out and builds/tests, none
+# writes to the repo, publishes, or comments. Flagged by CodeQL
+# (code-scanning alert 5) against the supply-chain job added in cd3bf5a.
+# A job that legitimately needs more should widen it at the job level
+# rather than loosening this default. See docs/threat-model.md (CI/CD).
+permissions:
+  contents: read
+
 jobs:
   backend:
     runs-on: ubuntu-latest
