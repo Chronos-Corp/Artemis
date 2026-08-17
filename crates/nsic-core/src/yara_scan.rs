@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -128,7 +128,9 @@ impl YaraEngine {
 
         let mut rule_files: Vec<PathBuf> = Vec::new();
         for entry in WalkDir::new(rules_dir) {
-            let entry = entry.with_context(|| format!("walking YARA rules directory {}", rules_dir.display()))?;
+            let entry = entry.with_context(|| {
+                format!("walking YARA rules directory {}", rules_dir.display())
+            })?;
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -266,16 +268,57 @@ impl YaraEngine {
     }
 }
 
-fn read_rule_file_bounded(path: &Path) -> Result<Vec<u8>> {
-    let file = File::open(path)
+/// Opens one rule source so the safety decision is made against the opened
+/// object, not against `WalkDir` metadata collected earlier. The rules tree is
+/// attacker-influenced on a compromised host; a pathname that was a regular
+/// file during enumeration can be swapped before use.
+fn open_rule_file(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A FIFO opened read-only without O_NONBLOCK waits for a writer before
+        // `metadata()` can ever inspect the handle. O_NONBLOCK makes the open
+        // itself safe; the same-handle regular-file check below then rejects
+        // FIFOs, devices, sockets, and any other special object.
+        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+
+    let file = options
+        .open(path)
         .with_context(|| format!("opening YARA rule file {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspecting opened YARA rule file {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "refusing non-regular YARA rule file {} after open",
+            path.display()
+        );
+    }
+    if metadata.len() > MAX_YARA_RULE_FILE_BYTES as u64 {
+        bail!(
+            "YARA rule file {} exceeds the {MAX_YARA_RULE_FILE_BYTES}-byte limit",
+            path.display()
+        );
+    }
+    Ok(file)
+}
+
+fn read_rule_file_bounded(path: &Path) -> Result<Vec<u8>> {
+    let file = open_rule_file(path)?;
     let mut bytes = Vec::new();
     file.take(MAX_YARA_RULE_FILE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
         .with_context(|| format!("reading YARA rule file {}", path.display()))?;
+    // Keep the read-side ceiling even after checking opened-handle metadata:
+    // a regular file can grow after fstat. The bytes used for fingerprinting
+    // and compilation are therefore bounded by what was actually read, not a
+    // stale size snapshot.
     if bytes.len() > MAX_YARA_RULE_FILE_BYTES {
         bail!(
-            "YARA rule file {} exceeds the {MAX_YARA_RULE_FILE_BYTES}-byte limit",
+            "YARA rule file {} exceeded the {MAX_YARA_RULE_FILE_BYTES}-byte limit while reading",
             path.display()
         );
     }
@@ -536,6 +579,25 @@ mod tests {
         assert!(
             err.to_string().contains("exceeds"),
             "expected a size-bound error, got: {err:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_rule_reader_rejects_a_fifo_without_waiting_for_a_writer() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().expect("create temp rules dir");
+        let fifo = dir.path().join("swapped.yar");
+        let c_path = CString::new(fifo.as_os_str().as_bytes()).expect("fifo path has no nul");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+
+        let err = read_rule_file_bounded(&fifo).expect_err("FIFO must be rejected");
+        assert!(
+            err.to_string().contains("non-regular"),
+            "expected opened-handle type rejection, got: {err:#}"
         );
     }
 
