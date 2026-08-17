@@ -1,4 +1,5 @@
 pub mod indicators;
+pub mod relationship_bounds;
 
 /// Connects to Postgres and runs any pending migrations. DATABASE_URL must
 /// point at a reachable Postgres instance; see docker-compose.yml for a
