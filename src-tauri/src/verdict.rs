@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use std::collections::HashSet;
 use std::path::Path;
@@ -9,8 +9,20 @@ use tokio::sync::Mutex;
 use crate::bloom::BloomState;
 use crate::db::indicators as db;
 use crate::hashing;
-use crate::models::{derive_relationships, DetectionKind, IndicatorKind, Verdict, VerdictTier};
+use crate::models::{
+    derive_relationships, DetectionKind, IndicatorKind, ProvenanceEntry, Verdict, VerdictTier,
+};
 use crate::yara_scan::YaraEngine;
+
+/// Source/confidence for a `detection_detects_indicator` edge (and the
+/// matching current-scan `RelationshipEvidence` hop) written by this
+/// desktop app's own live YARA pass, as opposed to some other source that
+/// might someday write to the same table. Named constants rather than
+/// literals repeated at each of the three sites that need to agree on
+/// them exactly (`record_yara_hit`'s persistence, the current `YaraHit`
+/// `ProvenanceEntry`s, and `cve_matches_via_detection`'s hop 1).
+pub(crate) const LOCAL_YARA_SOURCE: &str = "local:yara_scan";
+pub(crate) const LOCAL_YARA_CONFIDENCE: i16 = 65;
 
 /// Tracks (sha256, rule_name) pairs already persisted this session, so
 /// re-clicking a file already known to match a rule doesn't re-run the same
@@ -68,7 +80,12 @@ pub async fn resolve(
     recent_yara_hits: &RecentYaraHits,
     path: &Path,
 ) -> Result<Verdict> {
-    let hash = hashing::hash_file_cached(pool, path).await?;
+    // Read the file's bytes exactly once and hash + YARA-scan the identical
+    // buffer -- see `hashing::hash_and_read_file`'s doc comment for why:
+    // two separate reads (one to hash, one to scan) can observe different
+    // content if the file changes in between, silently binding a YARA hit's
+    // persisted edge to the wrong hash.
+    let (hash, file_data) = hashing::hash_and_read_file(pool, path).await?;
     let mut entries = Vec::new();
 
     // Tiers 1/2: a bloom miss on both hashes means no matching hash
@@ -77,18 +94,28 @@ pub async fn resolve(
     // below exists to make visible -- so no DB round trip is needed. This
     // is the local-miss-skips-the-round-trip path the agent model depends
     // on for instant clicks at fleet scale.
-    let bloom_hit = bloom.contains(&hash.sha256).await || bloom.contains(&hash.md5).await;
+    //
+    // Only trusted when the filter itself is known valid (`!bloom_valid`
+    // forces the DB path unconditionally): a review caught that neither
+    // startup's nor `sync_feeds`'s bloom refresh propagated failure beyond
+    // a log warning, so an empty/stale filter could otherwise make a real
+    // match look like a clean miss. See `BloomState`'s doc comment.
+    let bloom_valid = bloom.is_valid();
+    let bloom_hit =
+        !bloom_valid || bloom.contains(&hash.sha256).await || bloom.contains(&hash.md5).await;
     let mut dedicated_relationships = Vec::new();
     if bloom_hit {
         let sha_rows = db::hash_matches(pool, IndicatorKind::Sha256, &hash.sha256).await?;
         entries.extend(db::hash_matches_to_provenance(
             sha_rows,
             VerdictTier::ExactHash,
+            IndicatorKind::Sha256,
         ));
         let md5_rows = db::hash_matches(pool, IndicatorKind::Md5, &hash.md5).await?;
         entries.extend(db::hash_matches_to_provenance(
             md5_rows,
             VerdictTier::ExactHash,
+            IndicatorKind::Md5,
         ));
 
         // Malware-family attribution and CVE-via-report relationships can
@@ -114,12 +141,19 @@ pub async fn resolve(
 
     // Tier 3: YARA is orthogonal to known-bad hash status, always runs.
     // Scanning is synchronous CPU/IO-bound work, so it runs on tokio's
-    // blocking pool rather than an async worker thread.
+    // blocking pool rather than an async worker thread. Scans the same
+    // `file_data` buffer that was just hashed -- see the read-once comment
+    // at the top of this function.
     let yara_for_scan = Arc::clone(yara);
-    let path_owned = path.to_path_buf();
-    let yara_hits = tokio::task::spawn_blocking(move || yara_for_scan.scan(&path_owned))
+    let yara_hits = tokio::task::spawn_blocking(move || yara_for_scan.scan_bytes(&file_data))
         .await
         .context("yara scan task panicked")??;
+
+    // One timestamp for every observation this scan produces (the
+    // persisted edge and the current-scan evidence hops below), so they
+    // can't drift apart into "the edge says one time, the relationship
+    // says another" for what is definitionally the same event.
+    let now = Utc::now();
     for hit in &yara_hits {
         if !recent_yara_hits
             .contains(&hash.sha256, &hit.rule_name)
@@ -128,21 +162,46 @@ pub async fn resolve(
             // Only marked seen *after* this succeeds -- see
             // `RecentYaraHits::mark_seen`'s doc comment for why persisting
             // first and caching second (not the other way around) matters.
-            record_yara_hit(pool, bloom, &hash.sha256, &yara.rules_dir, &hit.rule_name).await?;
+            record_yara_hit(
+                pool,
+                bloom,
+                &hash.sha256,
+                &yara.rules_dir,
+                &yara.ruleset_fingerprint,
+                &hit.rule_name,
+                now,
+            )
+            .await?;
             recent_yara_hits
                 .mark_seen(&hash.sha256, &hit.rule_name)
                 .await;
         }
     }
-    // The names that actually fired in *this* scan, not any name that has
-    // ever had a detection_detects_indicator edge persisted for this hash.
-    // Both `yara_matches` and `cve_matches_via_detection` are scoped to
-    // exactly these names below -- see their doc comments for the stale-
-    // evidence defect this closes.
-    let current_rule_names: Vec<String> = yara_hits.iter().map(|h| h.rule_name.clone()).collect();
+
+    // Current YaraHit provenance is built directly from this scan's own
+    // result -- source/confidence/timestamp are exactly what was just
+    // persisted above, not reconstructed by re-querying
+    // `detection_detects_indicator` (which a review caught could pick up a
+    // historical or differently-sourced row for the same
+    // (detection, indicator) pair rather than the observation that just
+    // occurred).
     if !yara_hits.is_empty() {
-        entries.extend(db::yara_matches(pool, &hash.sha256, &current_rule_names).await?);
+        entries.extend(yara_hits.iter().map(|hit| ProvenanceEntry {
+            tier: VerdictTier::YaraHit,
+            source: LOCAL_YARA_SOURCE.to_string(),
+            confidence: LOCAL_YARA_CONFIDENCE,
+            first_seen: now,
+            last_seen: now,
+            report_id: None,
+            report_title: None,
+            report_url: None,
+            detection_name: Some(hit.rule_name.clone()),
+            indicator_kind: Some(IndicatorKind::Sha256),
+            ruleset_fingerprint: Some(yara.ruleset_fingerprint.clone()),
+            matched_value: hash.sha256.clone(),
+        }));
     }
+    let current_rule_names: Vec<String> = yara_hits.iter().map(|h| h.rule_name.clone()).collect();
 
     // CVE-via-detection has to be checked *after* the YARA tier above, not
     // folded into the bloom-gated block before it: a review caught that on
@@ -163,13 +222,22 @@ pub async fn resolve(
     // detection historically recorded for this hash surface a "matched
     // this exact file" CVE relationship even when zero rules fired in the
     // current scan. `cve_matches_via_detection` is additionally scoped to
-    // `current_rule_names`, so even when this branch runs it can only ever
-    // return detections that actually fired just now. Report/family
-    // lookups don't need the same treatment since ingestion, not
-    // `resolve`, is the only thing that ever creates those edges.
+    // `current_rule_names` and `yara.ruleset_fingerprint` -- see its doc
+    // comment for why a rule name alone isn't durable version identity.
+    // Report/family lookups don't need the same treatment since ingestion,
+    // not `resolve`, is the only thing that ever creates those edges.
     if !yara_hits.is_empty() {
-        dedicated_relationships
-            .extend(db::cve_matches_via_detection(pool, &hash.sha256, &current_rule_names).await?);
+        dedicated_relationships.extend(
+            db::cve_matches_via_detection(
+                pool,
+                &current_rule_names,
+                &yara.ruleset_fingerprint,
+                LOCAL_YARA_SOURCE,
+                LOCAL_YARA_CONFIDENCE,
+                now,
+            )
+            .await?,
+        );
     }
 
     // Tier 4: path/naming pattern.
@@ -214,12 +282,15 @@ pub async fn resolve(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn record_yara_hit(
     pool: &PgPool,
     bloom: &BloomState,
     sha256: &str,
     rules_dir: &Path,
+    ruleset_fingerprint: &str,
     rule_name: &str,
+    now: DateTime<Utc>,
 ) -> Result<()> {
     let (indicator_id, indicator_inserted) =
         db::upsert_indicator(pool, IndicatorKind::Sha256, sha256).await?;
@@ -233,15 +304,15 @@ async fn record_yara_hit(
         None,
     )
     .await?;
-    let now = Utc::now();
     db::upsert_detection_detects_indicator(
         pool,
         detection_id,
         indicator_id,
-        "local:yara_scan",
-        65,
+        LOCAL_YARA_SOURCE,
+        LOCAL_YARA_CONFIDENCE,
         now,
         now,
+        Some(ruleset_fingerprint),
     )
     .await?;
 
@@ -368,7 +439,7 @@ mod tests {
             .unwrap();
         tmp.flush().unwrap();
 
-        let hash = crate::hashing::hash_file_cached(&pool, tmp.path())
+        let (hash, _) = crate::hashing::hash_and_read_file(&pool, tmp.path())
             .await
             .expect("hash temp file");
 
@@ -468,7 +539,7 @@ mod tests {
             .unwrap();
         tmp.flush().unwrap();
 
-        let hash = crate::hashing::hash_file_cached(&pool, tmp.path())
+        let (hash, _) = crate::hashing::hash_and_read_file(&pool, tmp.path())
             .await
             .expect("hash temp file");
 
@@ -561,7 +632,7 @@ mod tests {
             .unwrap();
         tmp.flush().unwrap();
 
-        let hash = crate::hashing::hash_file_cached(&pool, tmp.path())
+        let (hash, _) = crate::hashing::hash_and_read_file(&pool, tmp.path())
             .await
             .expect("hash temp file");
 
@@ -706,7 +777,7 @@ mod tests {
             .write_all(format!("cve via report test content {marker_report}").as_bytes())
             .unwrap();
         tmp_report.flush().unwrap();
-        let hash_report = crate::hashing::hash_file_cached(&pool, tmp_report.path())
+        let (hash_report, _) = crate::hashing::hash_and_read_file(&pool, tmp_report.path())
             .await
             .expect("hash temp file");
 
@@ -779,7 +850,10 @@ mod tests {
             "the two-hop chain must be preserved, not collapsed to one flat value: {:?}",
             via_report.evidence
         );
-        assert_eq!(via_report.evidence[0].relation, "observed_in_report");
+        assert_eq!(
+            via_report.evidence[0].relation,
+            crate::models::EvidenceRelation::ObservedInReport
+        );
         assert_eq!(
             via_report.evidence[0].source, "parent-edge-source",
             "the first hop must carry indicator_observed_in_report's own provenance"
@@ -787,7 +861,10 @@ mod tests {
         assert_eq!(via_report.evidence[0].confidence, 20);
         assert_eq!(via_report.evidence[0].first_seen, parent_first_seen);
         assert_eq!(via_report.evidence[0].last_seen, parent_last_seen);
-        assert_eq!(via_report.evidence[1].relation, "report_references_cve");
+        assert_eq!(
+            via_report.evidence[1].relation,
+            crate::models::EvidenceRelation::ReportReferencesCve
+        );
         assert_eq!(
             via_report.evidence[1].source, "cve-edge-source",
             "must carry report_references_cve's own source, not indicator_observed_in_report's"
@@ -880,6 +957,7 @@ mod tests {
             88,
             cve_first_seen,
             cve_last_seen,
+            None,
         )
         .await
         .expect("seed detection covers cve");
@@ -912,14 +990,20 @@ mod tests {
             "the two-hop chain must be preserved, not collapsed to one flat value: {:?}",
             via_detection.evidence
         );
-        assert_eq!(via_detection.evidence[0].relation, "detects_indicator");
+        assert_eq!(
+            via_detection.evidence[0].relation,
+            crate::models::EvidenceRelation::DetectsIndicator
+        );
         assert_eq!(
             via_detection.evidence[0].source, "local:yara_scan",
             "the first hop must carry the live scan's own detection_detects_indicator \
              provenance (record_yara_hit's), not detection_covers_cve's"
         );
         assert_eq!(via_detection.evidence[0].confidence, 65);
-        assert_eq!(via_detection.evidence[1].relation, "detection_covers_cve");
+        assert_eq!(
+            via_detection.evidence[1].relation,
+            crate::models::EvidenceRelation::DetectionCoversCve
+        );
         assert_eq!(
             via_detection.evidence[1].source, "covers-edge-source",
             "must carry detection_covers_cve's own source, not detection_detects_indicator's"
@@ -1002,6 +1086,7 @@ mod tests {
             80,
             now,
             now,
+            None,
         )
         .await
         .expect("seed detection covers cve");
@@ -1058,7 +1143,7 @@ mod tests {
         tmp.write_all(format!("dual hash cve dedup test content {marker}").as_bytes())
             .unwrap();
         tmp.flush().unwrap();
-        let hash = crate::hashing::hash_file_cached(&pool, tmp.path())
+        let (hash, _) = crate::hashing::hash_and_read_file(&pool, tmp.path())
             .await
             .expect("hash temp file");
 
@@ -1218,6 +1303,7 @@ mod tests {
             80,
             now,
             now,
+            None,
         )
         .await
         .expect("seed detection B covers cve");
@@ -1522,11 +1608,21 @@ mod tests {
         let marker_hex = unique_marker.simple().to_string();
         let sha256 = format!("{marker_hex}{marker_hex}");
         let rule_name = format!("FakeRule-{unique_marker}");
+        let ruleset_fingerprint = "test-fingerprint";
+        let now = Utc::now();
 
         assert!(!recent_yara_hits.contains(&sha256, &rule_name).await);
 
-        let first_attempt =
-            record_yara_hit(&broken_pool, &bloom, &sha256, &rules_dir, &rule_name).await;
+        let first_attempt = record_yara_hit(
+            &broken_pool,
+            &bloom,
+            &sha256,
+            &rules_dir,
+            ruleset_fingerprint,
+            &rule_name,
+            now,
+        )
+        .await;
         assert!(
             first_attempt.is_err(),
             "expected persistence against a closed pool to fail"
@@ -1536,19 +1632,38 @@ mod tests {
             "a failed persistence attempt must not mark the pair as seen"
         );
 
-        record_yara_hit(&pool, &bloom, &sha256, &rules_dir, &rule_name)
-            .await
-            .expect("retry against a live pool should succeed");
+        record_yara_hit(
+            &pool,
+            &bloom,
+            &sha256,
+            &rules_dir,
+            ruleset_fingerprint,
+            &rule_name,
+            now,
+        )
+        .await
+        .expect("retry against a live pool should succeed");
         recent_yara_hits.mark_seen(&sha256, &rule_name).await;
 
-        let rows = db::yara_matches(&pool, &sha256, std::slice::from_ref(&rule_name))
-            .await
-            .expect("query yara matches");
+        // Confirm the edge actually landed.
+        let exists = sqlx::query_scalar!(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM detection_detects_indicator ddi
+                JOIN detection d ON d.id = ddi.detection_id
+                JOIN indicator i ON i.id = ddi.indicator_id
+                WHERE d.kind = 'yara' AND d.name = $1 AND i.kind = 'sha256' AND i.value = $2
+            ) AS "exists!"
+            "#,
+            rule_name,
+            sha256,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("query detection edge");
         assert!(
-            rows.iter()
-                .any(|e| e.detection_name.as_deref() == Some(rule_name.as_str())),
-            "expected the detection edge to actually be persisted after the successful retry, \
-             got: {rows:?}"
+            exists,
+            "expected the detection edge to actually be persisted after the successful retry"
         );
     }
 
@@ -1582,7 +1697,7 @@ mod tests {
         tmp.write_all(format!("stale detection test content {marker}").as_bytes())
             .unwrap();
         tmp.flush().unwrap();
-        let hash = crate::hashing::hash_file_cached(&pool, tmp.path())
+        let (hash, _) = crate::hashing::hash_and_read_file(&pool, tmp.path())
             .await
             .expect("hash temp file");
 
@@ -1639,6 +1754,7 @@ mod tests {
             50,
             now,
             now,
+            None,
         )
         .await
         .expect("seed stale detection detects indicator");
@@ -1654,6 +1770,7 @@ mod tests {
             80,
             now,
             now,
+            None,
         )
         .await
         .expect("seed stale detection covers cve");
@@ -1698,7 +1815,7 @@ mod tests {
 
         let mut tmp = tempfile_eicar();
         tmp.flush().unwrap();
-        let hash = crate::hashing::hash_file_cached(&pool, tmp.path())
+        let (hash, _) = crate::hashing::hash_and_read_file(&pool, tmp.path())
             .await
             .expect("hash temp file");
 
@@ -1729,6 +1846,7 @@ mod tests {
             50,
             now,
             now,
+            None,
         )
         .await
         .expect("seed stale detection detects indicator");
@@ -1764,6 +1882,245 @@ mod tests {
             "a rule that did not fire in this scan must not surface as a current Detection \
              relationship either, got: {:?}",
             verdict.threat_relationships
+        );
+    }
+
+    /// Review finding 2 (round 5): a bloom filter that has never
+    /// successfully refreshed (or whose last refresh failed) must not be
+    /// trusted to report a miss. Deliberately never calls `bloom.refresh`,
+    /// so this `BloomState` stays exactly as invalid as the real one would
+    /// be if startup's or `sync_feeds`'s refresh had failed -- see
+    /// `BloomState`'s doc comment. Seeds a real exact-hash match and a
+    /// real malware-family attribution directly in Postgres and confirms
+    /// `resolve()` still surfaces both through the DB fallback path,
+    /// proving a miss from an unsynchronized filter can't hide real
+    /// evidence.
+    #[tokio::test]
+    #[ignore]
+    async fn bloom_fallback_surfaces_db_evidence_when_the_filter_is_not_valid() {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://nsic:nsic@localhost:5432/nsic".to_string());
+        let pool = crate::db::connect_and_migrate(&database_url)
+            .await
+            .expect("connect to test database");
+
+        let rules_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("yara-rules");
+        let yara = Arc::new(YaraEngine::load(&rules_dir).expect("load yara rules"));
+        // Never refreshed -- must stay invalid.
+        let bloom = BloomState::empty();
+        let recent_yara_hits = RecentYaraHits::new();
+        assert!(
+            !bloom.is_valid(),
+            "sanity: a fresh BloomState must start invalid"
+        );
+
+        let mut tmp = tempfile::NamedTempFile::new().expect("create temp file");
+        let marker = uuid::Uuid::new_v4();
+        tmp.write_all(format!("bloom fallback test content {marker}").as_bytes())
+            .unwrap();
+        tmp.flush().unwrap();
+        let (hash, _) = crate::hashing::hash_and_read_file(&pool, tmp.path())
+            .await
+            .expect("hash temp file");
+
+        let (indicator_id, _) =
+            crate::db::indicators::upsert_indicator(&pool, IndicatorKind::Sha256, &hash.sha256)
+                .await
+                .expect("seed indicator");
+        let now = Utc::now();
+        let (report_id, _) = crate::db::indicators::upsert_report(
+            &pool,
+            "test-source",
+            Some(&marker.to_string()),
+            Some("Test report"),
+            None,
+            Some(now),
+            &serde_json::json!({}),
+        )
+        .await
+        .expect("seed report");
+        crate::db::indicators::upsert_indicator_observed_in_report(
+            &pool,
+            indicator_id,
+            report_id,
+            "test-source",
+            90,
+            now,
+            now,
+        )
+        .await
+        .expect("seed indicator observed in report");
+        let family_name = format!("BloomFallbackFamily-{marker}");
+        let (family_id, _) = crate::db::indicators::upsert_malware_family(&pool, &family_name)
+            .await
+            .expect("seed malware family");
+        crate::db::indicators::upsert_indicator_attributed_to_malware_family(
+            &pool,
+            indicator_id,
+            family_id,
+            report_id,
+            "test-source",
+            90,
+            now,
+            now,
+        )
+        .await
+        .expect("seed attribution edge");
+
+        // Deliberately not calling bloom.insert either -- the point is
+        // that the fallback works even when the filter genuinely has no
+        // idea this hash exists.
+        let verdict = resolve(&pool, &bloom, &yara, &recent_yara_hits, tmp.path())
+            .await
+            .expect("resolve verdict");
+
+        assert!(
+            verdict
+                .entries
+                .iter()
+                .any(|e| e.tier == VerdictTier::ExactHash),
+            "expected the DB fallback path to surface the exact-hash match even though the \
+             bloom filter was never valid, got: {:?}",
+            verdict.entries
+        );
+        assert!(
+            verdict
+                .threat_relationships
+                .iter()
+                .any(|r| r.kind == crate::models::RelationshipKind::MalwareFamily
+                    && r.target == family_name),
+            "expected the DB fallback path to surface the malware-family relationship even \
+             though the bloom filter was never valid, got: {:?}",
+            verdict.threat_relationships
+        );
+    }
+
+    /// Review finding 3 (round 5): `detection` rows are keyed by
+    /// `(kind, name)`, so editing a YARA rule's body while keeping its
+    /// name reuses the same row -- a `detection_covers_cve` edge attached
+    /// to that row must not silently keep applying once the rule's
+    /// content has actually changed. Loads two temporary rulesets sharing
+    /// one rule *identifier* but with different bodies (matching different
+    /// marker strings, so each only fires on its own content), attaches
+    /// CVE coverage scoped to the v1 ruleset's fingerprint, then scans
+    /// v2-matching content with the v2 engine and confirms the coverage
+    /// does not transfer.
+    #[tokio::test]
+    #[ignore]
+    async fn cve_coverage_does_not_transfer_across_a_rule_content_revision() {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://nsic:nsic@localhost:5432/nsic".to_string());
+        let pool = crate::db::connect_and_migrate(&database_url)
+            .await
+            .expect("connect to test database");
+
+        let marker = uuid::Uuid::new_v4().simple().to_string();
+        let rule_name = format!("VersionedRule_{marker}");
+
+        let v1_dir = tempfile::tempdir().expect("create v1 rules dir");
+        std::fs::write(
+            v1_dir.path().join("rule.yar"),
+            format!("rule {rule_name} {{ strings: $s = \"MARKERV1_{marker}\" condition: $s }}"),
+        )
+        .expect("write v1 rule");
+        let yara_v1 = Arc::new(YaraEngine::load(v1_dir.path()).expect("load v1 rules"));
+
+        let v2_dir = tempfile::tempdir().expect("create v2 rules dir");
+        std::fs::write(
+            v2_dir.path().join("rule.yar"),
+            format!("rule {rule_name} {{ strings: $s = \"MARKERV2_{marker}\" condition: $s }}"),
+        )
+        .expect("write v2 rule");
+        let yara_v2 = Arc::new(YaraEngine::load(v2_dir.path()).expect("load v2 rules"));
+
+        assert_ne!(
+            yara_v1.ruleset_fingerprint, yara_v2.ruleset_fingerprint,
+            "sanity: different rule bodies must produce different fingerprints"
+        );
+
+        let bloom = BloomState::empty();
+
+        // Scan v1-matching content with the v1 engine: persists a real
+        // detects_indicator edge carrying v1's fingerprint.
+        let mut tmp_v1 = tempfile::NamedTempFile::new().expect("create temp file");
+        tmp_v1
+            .write_all(format!("MARKERV1_{marker}").as_bytes())
+            .unwrap();
+        tmp_v1.flush().unwrap();
+        let recent_yara_hits_v1 = RecentYaraHits::new();
+        let verdict_v1 = resolve(&pool, &bloom, &yara_v1, &recent_yara_hits_v1, tmp_v1.path())
+            .await
+            .expect("resolve v1 verdict");
+        assert!(
+            verdict_v1
+                .entries
+                .iter()
+                .any(|e| e.tier == VerdictTier::YaraHit
+                    && e.detection_name.as_deref() == Some(rule_name.as_str())),
+            "expected the v1 rule to fire on v1 content, got: {:?}",
+            verdict_v1.entries
+        );
+
+        // CVE coverage is scoped to v1's fingerprint specifically.
+        let detection_id = crate::db::indicators::upsert_detection(
+            &pool,
+            DetectionKind::Yara,
+            &rule_name,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("seed detection");
+        let cve_id = format!("CVE-TEST-{marker}");
+        crate::db::indicators::upsert_cve(&pool, &cve_id, None, None, None)
+            .await
+            .expect("seed cve");
+        let now = Utc::now();
+        crate::db::indicators::upsert_detection_covers_cve(
+            &pool,
+            detection_id,
+            &cve_id,
+            "test-source",
+            80,
+            now,
+            now,
+            Some(&yara_v1.ruleset_fingerprint),
+        )
+        .await
+        .expect("seed detection covers cve scoped to v1");
+
+        // Scan v2-matching content with the v2 engine: same rule
+        // identifier, different body/fingerprint.
+        let mut tmp_v2 = tempfile::NamedTempFile::new().expect("create temp file");
+        tmp_v2
+            .write_all(format!("MARKERV2_{marker}").as_bytes())
+            .unwrap();
+        tmp_v2.flush().unwrap();
+        let recent_yara_hits_v2 = RecentYaraHits::new();
+        let verdict_v2 = resolve(&pool, &bloom, &yara_v2, &recent_yara_hits_v2, tmp_v2.path())
+            .await
+            .expect("resolve v2 verdict");
+        assert!(
+            verdict_v2
+                .entries
+                .iter()
+                .any(|e| e.tier == VerdictTier::YaraHit
+                    && e.detection_name.as_deref() == Some(rule_name.as_str())),
+            "expected the v2 rule to fire on v2 content, got: {:?}",
+            verdict_v2.entries
+        );
+        assert!(
+            !verdict_v2
+                .threat_relationships
+                .iter()
+                .any(|r| r.kind == crate::models::RelationshipKind::Cve && r.target == cve_id),
+            "v1's CVE coverage must not transfer to a scan performed with a different ruleset \
+             fingerprint, got: {:?}",
+            verdict_v2.threat_relationships
         );
     }
 

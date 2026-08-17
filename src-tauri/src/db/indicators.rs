@@ -5,8 +5,8 @@ use sqlx::{PgExecutor, PgPool};
 use uuid::Uuid;
 
 use crate::models::{
-    DetectionKind, IndicatorKind, IntelSourceFreshness, ProvenanceEntry, RelationshipEvidence,
-    RelationshipKind, RelationshipStrength, ThreatRelationship, VerdictTier,
+    DetectionKind, EvidenceRelation, IndicatorKind, IntelSourceFreshness, ProvenanceEntry,
+    RelationshipEvidence, RelationshipKind, RelationshipStrength, ThreatRelationship, VerdictTier,
 };
 
 /// Returns (report_id, was_inserted). was_inserted uses the `xmax = 0` trick
@@ -252,16 +252,18 @@ pub async fn upsert_detection_covers_cve(
     confidence: i16,
     first_seen: DateTime<Utc>,
     last_seen: DateTime<Utc>,
+    ruleset_fingerprint: Option<&str>,
 ) -> Result<()> {
     sqlx::query!(
         r#"
         INSERT INTO detection_covers_cve
-            (detection_id, cve_id, source, confidence, first_seen, last_seen)
-        VALUES ($1, $2, $3, $4, $5, $6)
+            (detection_id, cve_id, source, confidence, first_seen, last_seen, ruleset_fingerprint)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT (detection_id, cve_id, source) DO UPDATE SET
             confidence = EXCLUDED.confidence,
             first_seen = LEAST(detection_covers_cve.first_seen, EXCLUDED.first_seen),
-            last_seen = GREATEST(detection_covers_cve.last_seen, EXCLUDED.last_seen)
+            last_seen = GREATEST(detection_covers_cve.last_seen, EXCLUDED.last_seen),
+            ruleset_fingerprint = EXCLUDED.ruleset_fingerprint
         "#,
         detection_id,
         cve_id,
@@ -269,6 +271,7 @@ pub async fn upsert_detection_covers_cve(
         confidence,
         first_seen,
         last_seen,
+        ruleset_fingerprint,
     )
     .execute(pool)
     .await?;
@@ -312,16 +315,18 @@ pub async fn upsert_detection_detects_indicator(
     confidence: i16,
     first_seen: DateTime<Utc>,
     last_seen: DateTime<Utc>,
+    ruleset_fingerprint: Option<&str>,
 ) -> Result<()> {
     sqlx::query!(
         r#"
         INSERT INTO detection_detects_indicator
-            (detection_id, indicator_id, source, confidence, first_seen, last_seen)
-        VALUES ($1, $2, $3, $4, $5, $6)
+            (detection_id, indicator_id, source, confidence, first_seen, last_seen, ruleset_fingerprint)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT (detection_id, indicator_id, source) DO UPDATE SET
             confidence = EXCLUDED.confidence,
             first_seen = LEAST(detection_detects_indicator.first_seen, EXCLUDED.first_seen),
-            last_seen = GREATEST(detection_detects_indicator.last_seen, EXCLUDED.last_seen)
+            last_seen = GREATEST(detection_detects_indicator.last_seen, EXCLUDED.last_seen),
+            ruleset_fingerprint = EXCLUDED.ruleset_fingerprint
         "#,
         detection_id,
         indicator_id,
@@ -329,6 +334,7 @@ pub async fn upsert_detection_detects_indicator(
         confidence,
         first_seen,
         last_seen,
+        ruleset_fingerprint,
     )
     .execute(pool)
     .await?;
@@ -465,6 +471,7 @@ pub async fn hash_matches(
 pub fn hash_matches_to_provenance(
     rows: Vec<HashMatchRow>,
     tier: VerdictTier,
+    kind: IndicatorKind,
 ) -> Vec<ProvenanceEntry> {
     rows.into_iter()
         .map(|r| ProvenanceEntry {
@@ -477,73 +484,23 @@ pub fn hash_matches_to_provenance(
             report_title: r.report_title,
             report_url: r.report_url,
             detection_name: None,
+            indicator_kind: Some(kind),
+            ruleset_fingerprint: None,
             matched_value: r.matched_value,
         })
         .collect()
 }
 
-struct YaraMatchRow {
-    detection_name: String,
-    source: String,
-    confidence: i16,
-    first_seen: DateTime<Utc>,
-    last_seen: DateTime<Utc>,
-}
-
-/// Tier 3: YARA rule hits recorded against this hash's indicator, whether
-/// from a live local scan or a previously ingested detection. Deliberately
-/// does not also aggregate `detection_covers_cve.cve_id` onto this row --
-/// see `hash_matches`'s doc comment for why; `cve_matches_via_detection` is
-/// the one correctly-sourced presentation path for that CVE data now.
-///
-/// `rule_names` restricts results to detections that actually fired in
-/// *this* scan: a review caught that this query previously returned every
-/// `detection_detects_indicator` YARA edge ever persisted for the hash, so
-/// a stale rule recorded from a past scan (content since changed, or
-/// curated from another source) would resurrect as a current `YaraHit`
-/// alongside whatever genuinely matched today. An empty `rule_names` slice
-/// correctly returns nothing rather than falling back to "all of them".
-pub async fn yara_matches(
-    pool: &PgPool,
-    sha256: &str,
-    rule_names: &[String],
-) -> Result<Vec<ProvenanceEntry>> {
-    let rows = sqlx::query_as!(
-        YaraMatchRow,
-        r#"
-        SELECT
-            d.name AS detection_name,
-            ddi.source,
-            ddi.confidence,
-            ddi.first_seen,
-            ddi.last_seen
-        FROM indicator i
-        JOIN detection_detects_indicator ddi ON ddi.indicator_id = i.id
-        JOIN detection d ON d.id = ddi.detection_id
-        WHERE i.kind = 'sha256' AND i.value = $1 AND d.kind = 'yara' AND d.name = ANY($2)
-        "#,
-        sha256,
-        rule_names,
-    )
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows
-        .into_iter()
-        .map(|r| ProvenanceEntry {
-            tier: VerdictTier::YaraHit,
-            source: r.source,
-            confidence: r.confidence,
-            first_seen: r.first_seen,
-            last_seen: r.last_seen,
-            report_id: None,
-            report_title: None,
-            report_url: None,
-            detection_name: Some(r.detection_name),
-            matched_value: sha256.to_string(),
-        })
-        .collect())
-}
+// Note: there is no `yara_matches` query here. Current YaraHit provenance
+// is built directly by `verdict::resolve` from the live `yara_hits` scan
+// result (rule identity, `LOCAL_YARA_SOURCE`/`LOCAL_YARA_CONFIDENCE`, and
+// one `now` shared with the persisted edge), not reconstructed by
+// re-querying `detection_detects_indicator`. A review caught that
+// reconstruction picking up a historical or differently-sourced row for
+// the same (detection, indicator) pair -- via whatever the query's
+// ordering happened to select -- rather than the observation that just
+// occurred; the current scan's own in-memory result is the one thing that
+// can't be stale or mis-attributed.
 
 struct MalwareFamilyMatchRow {
     family_name: String,
@@ -554,6 +511,8 @@ struct MalwareFamilyMatchRow {
     report_id: Uuid,
     report_title: Option<String>,
     report_url: Option<String>,
+    indicator_kind: IndicatorKind,
+    indicator_value: String,
 }
 
 /// Malware-family attribution for this file, checked against both hash
@@ -593,7 +552,9 @@ pub async fn malware_family_matches(
             iamf.last_seen,
             r.id AS report_id,
             r.title AS report_title,
-            r.url AS report_url
+            r.url AS report_url,
+            i.kind AS "indicator_kind: IndicatorKind",
+            i.value AS indicator_value
         FROM indicator i
         JOIN indicator_attributed_to_malware_family iamf ON iamf.indicator_id = i.id
         JOIN malware_family mf ON mf.id = iamf.malware_family_id
@@ -617,7 +578,7 @@ pub async fn malware_family_matches(
                  variants, configs, payloads, and family-specific detections."
                     .to_string(),
             evidence: vec![RelationshipEvidence {
-                relation: "attributed_to_malware_family".to_string(),
+                relation: EvidenceRelation::AttributedToMalwareFamily,
                 source: r.source,
                 confidence: r.confidence,
                 first_seen: r.first_seen,
@@ -625,7 +586,10 @@ pub async fn malware_family_matches(
                 report_id: Some(r.report_id),
                 report_title: r.report_title,
                 report_url: r.report_url,
+                indicator_kind: Some(r.indicator_kind),
+                indicator_value: Some(r.indicator_value),
                 detection_name: None,
+                ruleset_fingerprint: None,
             }],
         })
         .collect())
@@ -644,6 +608,8 @@ struct CveViaReportRow {
     parent_confidence: i16,
     parent_first_seen: DateTime<Utc>,
     parent_last_seen: DateTime<Utc>,
+    parent_indicator_kind: IndicatorKind,
+    parent_indicator_value: String,
 }
 
 /// CVE relationships inferred through report co-occurrence: this file's
@@ -695,11 +661,14 @@ pub(crate) async fn cve_matches_via_report(
             parent.source AS "parent_source!",
             parent.confidence AS "parent_confidence!",
             parent.first_seen AS "parent_first_seen!",
-            parent.last_seen AS "parent_last_seen!"
+            parent.last_seen AS "parent_last_seen!",
+            parent.indicator_kind AS "parent_indicator_kind!: IndicatorKind",
+            parent.indicator_value AS "parent_indicator_value!"
         FROM report_references_cve rrc
         JOIN report r ON r.id = rrc.report_id
         JOIN LATERAL (
-            SELECT iorr.source, iorr.confidence, iorr.first_seen, iorr.last_seen
+            SELECT iorr.source, iorr.confidence, iorr.first_seen, iorr.last_seen,
+                   i.kind AS indicator_kind, i.value AS indicator_value
             FROM indicator_observed_in_report iorr
             JOIN indicator i ON i.id = iorr.indicator_id
             WHERE iorr.report_id = r.id
@@ -728,7 +697,7 @@ pub(crate) async fn cve_matches_via_report(
                     .to_string(),
             evidence: vec![
                 RelationshipEvidence {
-                    relation: "observed_in_report".to_string(),
+                    relation: EvidenceRelation::ObservedInReport,
                     source: r.parent_source,
                     confidence: r.parent_confidence,
                     first_seen: r.parent_first_seen,
@@ -736,10 +705,13 @@ pub(crate) async fn cve_matches_via_report(
                     report_id: Some(r.report_id),
                     report_title: r.report_title.clone(),
                     report_url: r.report_url.clone(),
+                    indicator_kind: Some(r.parent_indicator_kind),
+                    indicator_value: Some(r.parent_indicator_value),
                     detection_name: None,
+                    ruleset_fingerprint: None,
                 },
                 RelationshipEvidence {
-                    relation: "report_references_cve".to_string(),
+                    relation: EvidenceRelation::ReportReferencesCve,
                     source: r.cve_source,
                     confidence: r.cve_confidence,
                     first_seen: r.cve_first_seen,
@@ -747,7 +719,10 @@ pub(crate) async fn cve_matches_via_report(
                     report_id: Some(r.report_id),
                     report_title: r.report_title,
                     report_url: r.report_url,
+                    indicator_kind: None,
+                    indicator_value: None,
                     detection_name: None,
+                    ruleset_fingerprint: None,
                 },
             ],
         })
@@ -761,46 +736,50 @@ struct CveViaDetectionRow {
     cve_first_seen: DateTime<Utc>,
     cve_last_seen: DateTime<Utc>,
     detection_name: String,
-    parent_source: String,
-    parent_confidence: i16,
-    parent_first_seen: DateTime<Utc>,
-    parent_last_seen: DateTime<Utc>,
 }
 
 /// CVE relationships from a detection that fired against this *exact*
-/// file and is separately documented to cover a CVE
-/// (`detection --detects--> indicator`, `detection --covers--> cve`).
-/// One hop tighter than the report-co-occurrence path above (the
-/// detection matched this file directly, not merely a report that
-/// happens to mention both), so `strength` is `Strong` rather than
-/// `Contextual` -- still not `Direct`, since covering a CVE is the
-/// detection's own documented scope, not a per-file assertion the way
-/// malware-family attribution is. Both hops
-/// (`detects_indicator`/`detection_covers_cve`) are carried on `evidence`
-/// with their own provenance, for the same reason as the report path
-/// above; the detection's name is carried structurally on each hop, not
-/// just named in `explanation` prose, so PR #20's Hunt engine can walk
-/// `file -> detection -> cve` without parsing text.
+/// file, *in this scan*, and is separately documented to cover a CVE
+/// (`detection --detects--> indicator`, `detection --covers--> cve`). One
+/// hop tighter than the report-co-occurrence path above (the detection
+/// matched this file directly, not merely a report that happens to mention
+/// both), so `strength` is `Strong` rather than `Contextual` -- still not
+/// `Direct`, since covering a CVE is the detection's own documented scope,
+/// not a per-file assertion the way malware-family attribution is.
+///
+/// Unlike the report path, hop 1 (`detects_indicator`) is *not*
+/// reconstructed from the database at all: `verdict::resolve` supplies it
+/// directly as `observed_at`, using `LOCAL_YARA_SOURCE`/
+/// `LOCAL_YARA_CONFIDENCE` -- the exact values it just persisted via
+/// `record_yara_hit` for this same scan. A review caught that reading it
+/// back via `ORDER BY ddi.last_seen DESC LIMIT 1` could select a different
+/// source's historical row for the same (detection, indicator) pair rather
+/// than the observation that just occurred; the live scan's own result is
+/// the one thing that cannot be stale or mis-attributed.
 ///
 /// `rule_names` restricts this to detections that actually fired in the
-/// *current* scan (see `yara_matches`'s doc comment for the same defect
-/// class) -- a review caught that without this filter, a hash already
-/// known to the bloom filter (from an unrelated earlier hash match, not
-/// this scan's YARA pass) could surface a CVE relationship whose
-/// explanation claims a detection "matched this exact file" when zero
-/// rules actually fired this scan.
+/// *current* scan -- a review caught that without this filter, a hash
+/// already known to the bloom filter (from an unrelated earlier hash
+/// match, not this scan's YARA pass) could surface a CVE relationship
+/// whose explanation claims a detection "matched this exact file" when
+/// zero rules actually fired this scan.
 ///
-/// Anchored on `detection_covers_cve` with a `LATERAL` join picking one
-/// supporting `detection_detects_indicator` row per CVE edge, for the same
-/// join-cardinality reason as the report path above:
-/// `detection_detects_indicator` is keyed by `(detection_id, indicator_id,
-/// source)`, so more than one source can each have their own edge for the
-/// same detection/hash pair, which would otherwise return the same CVE
-/// edge once per source.
+/// `ruleset_fingerprint` additionally excludes any `detection_covers_cve`
+/// edge asserted against a *different* compiled ruleset than the one that
+/// just fired: `detection` rows are keyed by `(kind, name)`, so editing a
+/// rule's body while keeping its name reuses the same row, and a coverage
+/// edge attached to that row would otherwise silently carry over across
+/// rule-content revisions it was never actually asserted against. `NULL`
+/// on the edge is read as "applies to any version" (no real ingestion
+/// writes this table yet to assert a specific one).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn cve_matches_via_detection(
     pool: &PgPool,
-    sha256: &str,
     rule_names: &[String],
+    ruleset_fingerprint: &str,
+    observed_source: &str,
+    observed_confidence: i16,
+    observed_at: DateTime<Utc>,
 ) -> Result<Vec<ThreatRelationship>> {
     let rows = sqlx::query_as!(
         CveViaDetectionRow,
@@ -811,25 +790,14 @@ pub(crate) async fn cve_matches_via_detection(
             dcc.confidence AS cve_confidence,
             dcc.first_seen AS cve_first_seen,
             dcc.last_seen AS cve_last_seen,
-            d.name AS detection_name,
-            parent.source AS "parent_source!",
-            parent.confidence AS "parent_confidence!",
-            parent.first_seen AS "parent_first_seen!",
-            parent.last_seen AS "parent_last_seen!"
+            d.name AS detection_name
         FROM detection_covers_cve dcc
         JOIN detection d ON d.id = dcc.detection_id
-        JOIN LATERAL (
-            SELECT ddi.source, ddi.confidence, ddi.first_seen, ddi.last_seen
-            FROM detection_detects_indicator ddi
-            JOIN indicator i ON i.id = ddi.indicator_id
-            WHERE ddi.detection_id = d.id AND i.kind = 'sha256' AND i.value = $1
-            ORDER BY ddi.last_seen DESC
-            LIMIT 1
-        ) parent ON true
-        WHERE d.kind = 'yara' AND d.name = ANY($2)
+        WHERE d.kind = 'yara' AND d.name = ANY($1)
+          AND (dcc.ruleset_fingerprint IS NULL OR dcc.ruleset_fingerprint = $2)
         "#,
-        sha256,
         rule_names,
+        ruleset_fingerprint,
     )
     .fetch_all(pool)
     .await?;
@@ -841,24 +809,28 @@ pub(crate) async fn cve_matches_via_detection(
             strength: RelationshipStrength::Strong,
             target: r.cve_id,
             explanation: format!(
-                "The local detection \"{}\", which matched this exact file, is documented to \
-                 cover this CVE -- assess exposure and hunt for exploitation evidence.",
+                "The local detection \"{}\", which matched this exact file in the current scan, \
+                 is documented to cover this CVE -- assess exposure and hunt for exploitation \
+                 evidence.",
                 r.detection_name
             ),
             evidence: vec![
                 RelationshipEvidence {
-                    relation: "detects_indicator".to_string(),
-                    source: r.parent_source,
-                    confidence: r.parent_confidence,
-                    first_seen: r.parent_first_seen,
-                    last_seen: r.parent_last_seen,
+                    relation: EvidenceRelation::DetectsIndicator,
+                    source: observed_source.to_string(),
+                    confidence: observed_confidence,
+                    first_seen: observed_at,
+                    last_seen: observed_at,
                     report_id: None,
                     report_title: None,
                     report_url: None,
+                    indicator_kind: None,
+                    indicator_value: None,
                     detection_name: Some(r.detection_name.clone()),
+                    ruleset_fingerprint: Some(ruleset_fingerprint.to_string()),
                 },
                 RelationshipEvidence {
-                    relation: "detection_covers_cve".to_string(),
+                    relation: EvidenceRelation::DetectionCoversCve,
                     source: r.cve_source,
                     confidence: r.cve_confidence,
                     first_seen: r.cve_first_seen,
@@ -866,7 +838,10 @@ pub(crate) async fn cve_matches_via_detection(
                     report_id: None,
                     report_title: None,
                     report_url: None,
+                    indicator_kind: None,
+                    indicator_value: None,
                     detection_name: Some(r.detection_name),
+                    ruleset_fingerprint: Some(ruleset_fingerprint.to_string()),
                 },
             ],
         })
@@ -923,6 +898,8 @@ pub async fn path_pattern_matches(pool: &PgPool, file_path: &str) -> Result<Vec<
             report_title: r.report_title,
             report_url: r.report_url,
             detection_name: None,
+            indicator_kind: Some(IndicatorKind::Path),
+            ruleset_fingerprint: None,
             matched_value: r.matched_value,
         })
         .collect())
@@ -934,6 +911,7 @@ struct ContextualRow {
     report_id: Uuid,
     report_title: Option<String>,
     report_url: Option<String>,
+    ingested_at: DateTime<Utc>,
 }
 
 /// Tier 5: contextual association. The scanned file's name matches a file
@@ -952,7 +930,8 @@ pub async fn contextual_matches(pool: &PgPool, file_name: &str) -> Result<Vec<Pr
             r.source,
             r.id AS report_id,
             r.title AS report_title,
-            r.url AS report_url
+            r.url AS report_url,
+            r.ingested_at
         FROM report r
         WHERE lower(r.raw ->> 'file_name') = lower($1)
         LIMIT 20
@@ -970,12 +949,20 @@ pub async fn contextual_matches(pool: &PgPool, file_name: &str) -> Result<Vec<Pr
                 tier: VerdictTier::Contextual,
                 source: r.source,
                 confidence: 25,
-                first_seen: Utc::now(),
-                last_seen: Utc::now(),
+                // The report's own `ingested_at`, not `Utc::now()` at query
+                // time -- a review caught the latter fabricating edge-style
+                // observation timing for a tier with no backing evidence
+                // edge at all; `ingested_at` is the one real, honest
+                // timestamp this match has (when Apollo actually learned
+                // about the report the filename came from).
+                first_seen: r.ingested_at,
+                last_seen: r.ingested_at,
                 report_id: Some(r.report_id),
                 report_title: r.report_title,
                 report_url: r.report_url,
                 detection_name: None,
+                indicator_kind: None,
+                ruleset_fingerprint: None,
                 matched_value,
             })
         })

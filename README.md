@@ -123,14 +123,49 @@ What works today:
   inference) and `detection_covers_cve --> Strong` (one hop tighter: the
   detection matched this exact file, though covering a CVE is still the
   detection's own documented scope, not a per-file assertion).
-  `cve_matches_via_detection` and the YARA provenance query (`yara_matches`)
-  are both scoped to the detection names that actually fired in the
-  *current* scan, not any `detection_detects_indicator` edge ever
-  persisted for the hash -- a detection recorded historically (a rule that
-  has since changed, or one curated from another source) must not resurface
-  as though it matched this exact file just because a *different* rule
-  genuinely fired, or because the hash happens to be bloom-known for an
-  unrelated reason. Threat-actor and campaign relationship kinds are
+  `cve_matches_via_detection` is scoped to the detection names that
+  actually fired in the *current* scan, not any `detection_detects_indicator`
+  edge ever persisted for the hash -- a detection recorded historically (a
+  rule that has since changed, or one curated from another source) must not
+  resurface as though it matched this exact file just because a *different*
+  rule genuinely fired, or because the hash happens to be bloom-known for an
+  unrelated reason. `detection` rows are keyed by `(kind, name)`, so editing
+  a rule's body while keeping its name reuses the same row -- a
+  `ruleset_fingerprint` column (migration `0010`, sourced from
+  `YaraEngine::ruleset_fingerprint`, a SHA-256 over every rule file's
+  content) is now stamped on both `detection_detects_indicator` and
+  `detection_covers_cve` edges as they're written, and
+  `cve_matches_via_detection` filters on it (NULL = "applies to any
+  version," for edges written before the column existed), so a CVE
+  coverage assertion made against one revision of a rule's content can't
+  silently carry over to a later revision that reuses the same rule name.
+  The YARA-hit provenance entry and CVE-via-detection's first evidence hop
+  are now supplied directly from the current scan's own known values
+  (rule name, source, confidence, timestamp) rather than reconstructed by
+  reading back whatever row a `LATERAL ... ORDER BY last_seen DESC LIMIT 1`
+  query happened to pick, which could otherwise surface a different
+  source's historical provenance for the same edge.
+  Hashing and YARA scanning read a file's bytes exactly once
+  (`hashing::hash_and_read_file`) instead of two separate reads, closing a
+  TOCTOU race where a file changing between the hash read and the scan
+  read could bind a YARA hit's persisted edge to the wrong hash --
+  mirrors the read-once-then-hash-and-scan-the-same-buffer pattern
+  `crates/agent/src/main.rs` already used. The bloom filter now tracks its
+  own validity (`BloomState::is_valid`, an `AtomicBool` cleared whenever a
+  refresh fails, even after an earlier refresh had succeeded): a bloom miss
+  only short-circuits the indicator-table lookups when the filter is known
+  to be in sync with the intel store, so a sync failure degrades to doing
+  the DB round trip on every scan rather than silently turning into false
+  negatives. `RelationshipEvidence.relation` is a closed `EvidenceRelation`
+  enum (one variant per edge table: `observed_in_report`,
+  `report_references_cve`, `detects_indicator`, `detection_covers_cve`,
+  `attributed_to_malware_family`, `contextual_filename_match`) rather than
+  a free-form string, and each hop now carries the specific node it
+  traversed -- `indicator_kind`/`indicator_value` or `detection_name`/
+  `ruleset_fingerprint` -- so the full evidence chain is reconstructable
+  from the wire object alone, which PR #20's hunt engine will need to walk
+  programmatically rather than parsing prose. Threat-actor and campaign
+  relationship kinds are
   structurally supported (the graph tables already existed) but correctly
   surface no data yet, since no ingestion populates them until later
   hunt-pack work; ATT&amp;CK technique has no data source at all yet and is

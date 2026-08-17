@@ -1,5 +1,6 @@
 import type { RelationshipStrength, ThreatRelationship } from "../types";
 import {
+  EVIDENCE_RELATION_LABELS,
   RELATIONSHIP_KIND_LABELS,
   RELATIONSHIP_STRENGTH_LABELS,
   RELATIONSHIP_STRENGTH_ORDER,
@@ -67,10 +68,13 @@ export function ThreatRelationshipList({ relationships }: Props) {
                   {r.evidence.map((e, j) => (
                     <div key={j} className="evidence-hop">
                       {r.evidence.length > 1 && (
-                        <span className="evidence-relation">{e.relation}: </span>
+                        <span className="evidence-relation">
+                          {EVIDENCE_RELATION_LABELS[e.relation]}:{" "}
+                        </span>
                       )}
                       {e.source} -- {e.confidence}% confidence
                       {e.detection_name && ` -- ${e.detection_name}`}
+                      {e.indicator_value && ` -- ${e.indicator_value}`}
                       {e.report_title &&
                         (e.report_url ? (
                           <>

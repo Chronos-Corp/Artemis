@@ -29,6 +29,23 @@ export const TIER_ORDER: VerdictTier[] = [
   "contextual",
 ];
 
+// Mirrors nsic_core::models::IndicatorKind's wire form -- that enum has no
+// `#[serde(rename_all)]` of its own, unlike VerdictTier/RelationshipKind/
+// RelationshipStrength/EvidenceRelation below, so it serializes as its
+// Rust variant names (PascalCase), not snake_case.
+export type IndicatorKind =
+  | "Sha256"
+  | "Md5"
+  | "Sha1"
+  | "Imphash"
+  | "Tlsh"
+  | "Ssdeep"
+  | "Path"
+  | "Regkey"
+  | "Mutex"
+  | "Domain"
+  | "Ip";
+
 export interface ProvenanceEntry {
   tier: VerdictTier;
   source: string;
@@ -40,6 +57,8 @@ export interface ProvenanceEntry {
   report_url: string | null;
   detection_name: string | null;
   matched_value: string;
+  indicator_kind: IndicatorKind | null;
+  ruleset_fingerprint: string | null;
 }
 
 export interface IntelSourceFreshness {
@@ -91,6 +110,25 @@ export const RELATIONSHIP_STRENGTH_ORDER: RelationshipStrength[] = [
   "weak",
 ];
 
+// What a RelationshipEvidence hop asserts, named after the edge table it
+// comes from -- a closed, typed vocabulary rather than free-form prose.
+export type EvidenceRelation =
+  | "observed_in_report"
+  | "report_references_cve"
+  | "detects_indicator"
+  | "detection_covers_cve"
+  | "attributed_to_malware_family"
+  | "contextual_filename_match";
+
+export const EVIDENCE_RELATION_LABELS: Record<EvidenceRelation, string> = {
+  observed_in_report: "observed in report",
+  report_references_cve: "report references CVE",
+  detects_indicator: "detects indicator",
+  detection_covers_cve: "detection covers CVE",
+  attributed_to_malware_family: "attributed to malware family",
+  contextual_filename_match: "contextual filename match",
+};
+
 // One hop of evidence supporting a ThreatRelationship. A single-hop
 // relationship (ioc/detection/risk_based/malware_family) carries exactly
 // one; a cve relationship carries the full multi-hop chain it was
@@ -99,7 +137,7 @@ export const RELATIONSHIP_STRENGTH_ORDER: RelationshipStrength[] = [
 // this to one flat value would either pick the wrong edge's provenance or
 // silently discard a hop's evidence.
 export interface RelationshipEvidence {
-  relation: string;
+  relation: EvidenceRelation;
   source: string;
   confidence: number;
   first_seen: string;
@@ -107,7 +145,10 @@ export interface RelationshipEvidence {
   report_id: string | null;
   report_title: string | null;
   report_url: string | null;
+  indicator_kind: IndicatorKind | null;
+  indicator_value: string | null;
   detection_name: string | null;
+  ruleset_fingerprint: string | null;
 }
 
 export interface ThreatRelationship {

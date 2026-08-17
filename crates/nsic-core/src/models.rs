@@ -64,6 +64,15 @@ pub struct ProvenanceEntry {
     pub report_url: Option<String>,
     pub detection_name: Option<String>,
     pub matched_value: String,
+    /// The indicator kind this entry's match traversed, when it traversed
+    /// one at all (`None` for `Contextual`, which never touched the
+    /// `indicator` table). Threaded through into `RelationshipEvidence` by
+    /// `derive_relationships` so a hop records which specific indicator it
+    /// used, not just the value -- see `RelationshipEvidence::indicator_kind`.
+    pub indicator_kind: Option<IndicatorKind>,
+    /// Which compiled ruleset produced this entry, for `YaraHit` only --
+    /// see `RelationshipEvidence::ruleset_fingerprint`.
+    pub ruleset_fingerprint: Option<String>,
 }
 
 /// How current the local copy of one intel feed is, as of the moment a
@@ -161,6 +170,25 @@ pub enum RelationshipStrength {
     Direct,
 }
 
+/// What a `RelationshipEvidence` hop asserts, named after the edge table it
+/// comes from. A closed, typed vocabulary rather than a free-form
+/// `String` -- a review caught that a plain string field lets a typo or an
+/// inconsistent spelling compile without complaint, which defeats the
+/// point of PR #20 consuming this structurally instead of parsing prose:
+/// an unconstrained "magic string" is just prose with extra steps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceRelation {
+    ObservedInReport,
+    ReportReferencesCve,
+    DetectsIndicator,
+    DetectionCoversCve,
+    AttributedToMalwareFamily,
+    /// The one tier with no backing edge table at all (a filename match
+    /// against `report.raw`, never looked up against `indicator`).
+    ContextualFilenameMatch,
+}
+
 /// One hop of evidence supporting a `ThreatRelationship`. Postgres stores
 /// provenance per *edge*, not per relationship -- a single-hop relationship
 /// (`Ioc`, `Detection`, `RiskBased`, `MalwareFamily`) carries exactly one of
@@ -179,13 +207,7 @@ pub enum RelationshipStrength {
 /// the supporting report or detection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelationshipEvidence {
-    /// What this hop's edge asserts, named after the edge table it comes
-    /// from (`observed_in_report`, `report_references_cve`,
-    /// `detects_indicator`, `detection_covers_cve`,
-    /// `attributed_to_malware_family`, or `contextual_filename_match` for
-    /// the one tier with no backing edge table) so a hop is traceable to
-    /// its exact source, not just prose.
-    pub relation: String,
+    pub relation: EvidenceRelation,
     pub source: String,
     pub confidence: i16,
     pub first_seen: DateTime<Utc>,
@@ -193,7 +215,28 @@ pub struct RelationshipEvidence {
     pub report_id: Option<Uuid>,
     pub report_title: Option<String>,
     pub report_url: Option<String>,
+    /// The specific indicator this hop traverses, for indicator-backed
+    /// relations (`ObservedInReport`, `AttributedToMalwareFamily`). A
+    /// review caught that e.g. `cve_matches_via_report` picks sha256 over
+    /// md5 when a report observed both, but the evidence never recorded
+    /// *which* indicator was actually chosen -- without this, "walk the
+    /// chain" was only true at the SQL-implementation level, not from the
+    /// wire object alone.
+    pub indicator_kind: Option<IndicatorKind>,
+    pub indicator_value: Option<String>,
+    /// The detection this hop traverses, for detection-backed relations
+    /// (`DetectsIndicator`, `DetectionCoversCve`).
     pub detection_name: Option<String>,
+    /// Which compiled ruleset (see `YaraEngine::ruleset_fingerprint`)
+    /// produced this hop, for detection-backed relations. A rule's name
+    /// alone can't reconstruct what it actually checked for once the rule
+    /// file has since been edited -- a review caught that a
+    /// `detection_covers_cve` edge attached to a `(kind, name)` detection
+    /// row could otherwise silently keep applying across rule-content
+    /// revisions. `None` on a `detection_covers_cve` hop is read as
+    /// "applies to any ruleset version" (no real ingestion writes this
+    /// table yet to assert otherwise).
+    pub ruleset_fingerprint: Option<String>,
 }
 
 /// A single structured relationship between a file and a threat concept --
@@ -250,9 +293,9 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
     let mut relationships = Vec::new();
 
     for entry in entries {
-        let single_hop = |relation: &str| {
+        let single_hop = |relation: EvidenceRelation| {
             vec![RelationshipEvidence {
-                relation: relation.to_string(),
+                relation,
                 source: entry.source.clone(),
                 confidence: entry.confidence,
                 first_seen: entry.first_seen,
@@ -260,7 +303,10 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
                 report_id: entry.report_id,
                 report_title: entry.report_title.clone(),
                 report_url: entry.report_url.clone(),
+                indicator_kind: entry.indicator_kind,
+                indicator_value: entry.indicator_kind.map(|_| entry.matched_value.clone()),
                 detection_name: entry.detection_name.clone(),
+                ruleset_fingerprint: entry.ruleset_fingerprint.clone(),
             }]
         };
 
@@ -274,7 +320,7 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
                         "Exact hash match against a known indicator -- find other hosts or paths \
                          where this same indicator has been observed."
                             .to_string(),
-                    evidence: single_hop("observed_in_report"),
+                    evidence: single_hop(EvidenceRelation::ObservedInReport),
                 });
             }
             VerdictTier::FuzzyHash => {
@@ -286,7 +332,7 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
                         "Fuzzy hash similarity to a known indicator -- a close but non-exact \
                          match worth corroborating with other evidence."
                             .to_string(),
-                    evidence: single_hop("observed_in_report"),
+                    evidence: single_hop(EvidenceRelation::ObservedInReport),
                 });
             }
             VerdictTier::YaraHit => {
@@ -299,7 +345,7 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
                             "A local YARA rule fired against this exact file -- run the rule or \
                              trace its logic to see exactly what it matched on."
                                 .to_string(),
-                        evidence: single_hop("detects_indicator"),
+                        evidence: single_hop(EvidenceRelation::DetectsIndicator),
                     });
                 }
             }
@@ -312,7 +358,7 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
                         "Path or naming pattern matched a known indicator -- weaker than a \
                          content match, worth checking alongside other evidence."
                             .to_string(),
-                    evidence: single_hop("observed_in_report"),
+                    evidence: single_hop(EvidenceRelation::ObservedInReport),
                 });
                 relationships.push(ThreatRelationship {
                     kind: RelationshipKind::RiskBased,
@@ -322,7 +368,7 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
                         "Location or naming association only, not a content match -- expand the \
                          contextual hunt without treating this as direct compromise evidence."
                             .to_string(),
-                    evidence: single_hop("observed_in_report"),
+                    evidence: single_hop(EvidenceRelation::ObservedInReport),
                 });
             }
             VerdictTier::Contextual => {
@@ -335,7 +381,7 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
                          passed through the indicator table, so this is not itself a known IOC. \
                          The weakest signal here; corroborate before treating this as meaningful."
                             .to_string(),
-                    evidence: single_hop("contextual_filename_match"),
+                    evidence: single_hop(EvidenceRelation::ContextualFilenameMatch),
                 });
             }
         }
@@ -361,6 +407,8 @@ mod tests {
             report_url: None,
             detection_name: Some("Test_Rule".to_string()),
             matched_value: "deadbeef".to_string(),
+            indicator_kind: Some(IndicatorKind::Sha256),
+            ruleset_fingerprint: None,
         }
     }
 
@@ -482,7 +530,10 @@ mod tests {
         let entries = vec![entry(VerdictTier::ExactHash, 90)];
         let relationships = derive_relationships(&entries);
         assert_eq!(relationships[0].evidence.len(), 1);
-        assert_eq!(relationships[0].evidence[0].relation, "observed_in_report");
+        assert_eq!(
+            relationships[0].evidence[0].relation,
+            EvidenceRelation::ObservedInReport
+        );
         assert_eq!(relationships[0].evidence[0].source, "test-source");
         assert_eq!(relationships[0].evidence[0].confidence, 90);
     }
