@@ -106,13 +106,22 @@ What works today:
   `indicator_observed_in_report` on `(indicator_id, source)` alone can
   cross-attribute or duplicate whenever a source has filed more than one
   report for the same indicator.
-  Every `ThreatRelationship` carries an `evidence: RelationshipEvidence[]`
-  chain rather than one flat `source`/`confidence`/timestamp set: Postgres
-  stores provenance per *edge*, not per relationship, so a single-hop
-  relationship (IOC, Detection, RiskBased, MalwareFamily) carries exactly
-  one evidence item, while a CVE relationship carries the full multi-hop
-  chain it was inferred through, each hop with its own provenance. CVE
-  relationships come from two dedicated queries
+  Every `ThreatRelationship` carries an
+  `evidence_paths: RelationshipEvidence[][]` list rather than one flat
+  `source`/`confidence`/timestamp set: Postgres stores provenance per
+  *edge*, not per relationship, so a single-hop relationship (IOC,
+  Detection, RiskBased, MalwareFamily) carries exactly one path with one
+  evidence item, while a CVE relationship carries the full multi-hop chain
+  it was inferred through, each hop with its own provenance. Each inner
+  array is one complete, independently-walkable path from the file to the
+  target -- a CVE relationship inferred through report co-occurrence can
+  have *more than one* path when the report observed this file under more
+  than one hash (or via more than one source) before converging on the
+  same `report_references_cve` assertion: those are two real, parallel
+  first hops sharing one second hop, not one longer linear chain, so
+  flattening them into a single array would either misrepresent the
+  topology or force a consumer to infer the branch from repeated
+  `report_id`s. CVE relationships come from two dedicated queries
   (`db::indicators::cve_matches_via_report` / `cve_matches_via_detection`),
   each anchored on the CVE-specific edge (not the parent indicator/detection
   edge), so one real `report -> cve` or `detection -> cve` assertion can't
@@ -121,13 +130,14 @@ What works today:
   deduplicating the *relationship* without discarding any real supporting
   *evidence*: `cve_matches_via_report` groups every matching
   `indicator_observed_in_report` row (sha256, md5, or more than one source)
-  under the one CVE edge it supports, so all of them survive as separate
-  `ObservedInReport` hops rather than a `LIMIT 1` silently keeping only one
-  and throwing the rest away. `report_references_cve --> Contextual` (a
-  two-hop report co-occurrence inference) and `detection_covers_cve -->
-  Strong` (one hop tighter: the detection matched this exact file, though
-  covering a CVE is still the detection's own documented scope, not a
-  per-file assertion).
+  under the one CVE edge it supports, then emits one evidence path per
+  parent row (each ending at its own copy of the shared CVE hop), so all of
+  them survive as separate, self-contained paths rather than a `LIMIT 1`
+  silently keeping only one and throwing the rest away.
+  `report_references_cve --> Contextual` (a two-hop report co-occurrence
+  inference) and `detection_covers_cve --> Strong` (one hop tighter: the
+  detection matched this exact file, though covering a CVE is still the
+  detection's own documented scope, not a per-file assertion).
   `cve_matches_via_detection` is scoped to the detection names that
   actually fired in the *current* scan, not any `detection_detects_indicator`
   edge ever persisted for the hash -- a detection recorded historically (a
@@ -151,7 +161,14 @@ What works today:
   different concept -- see `host_sighted_indicator`'s migration comment):
   scoping CVE coverage by the whole compiled ruleset meant editing one
   unrelated rule elsewhere in the directory falsely invalidated every other
-  rule's own unchanged coverage. The YARA-hit provenance entry and
+  rule's own unchanged coverage. Which rule a file declares is found by a
+  lightweight lexer (`extract_rule_names`) that blanks out comments, string
+  literals, *and* regex literals before scanning for `rule <identifier>`
+  text -- regex literals matter because a YARA string pattern like
+  `$r = /rule TargetRule/` is completely ordinary, valid syntax, and
+  without stripping it the literal text inside the pattern was
+  indistinguishable from a real declaration, letting one file's
+  `rule_fingerprints` entry silently overwrite another's. The YARA-hit provenance entry and
   CVE-via-detection's first evidence hop are supplied directly from the
   current scan's own known values (rule name, its own fingerprint, source,
   confidence, timestamp, and the scanned indicator's kind/value) rather
@@ -170,20 +187,36 @@ What works today:
   what `len()` reports) and caps the read at 256 MiB, reported as a clear
   error rather than an OOM or an indefinite hang on a live filesystem
   `fs_browse::list_dir` otherwise exposes with no type/size information at
-  all. The bloom filter tracks its own validity (`BloomState::check`, one
+  all. It validates the object it actually opened, not a separate path
+  stat: `open_regular` opens with `O_NONBLOCK` on Unix (a no-op once a
+  regular file is confirmed, but it keeps opening a FIFO from blocking
+  indefinitely for a writer) and every subsequent check --
+  regular-file-or-not, size -- reads from an `fstat` on that same handle,
+  so there's no window between "stat says this path is safe" and "open
+  this path" for the underlying object to change.
+  The bloom filter tracks its own validity (`BloomState::check`, one
   lock acquisition covering both the validity check and the membership
   check together): a bloom miss only short-circuits the indicator-table
   lookups when the filter is known to be in sync with the intel store, so a
   refresh failure degrades to doing the DB round trip on every scan rather
   than silently turning into false negatives. `sync_feeds` calls
   `BloomState::invalidate` *before* `ingest::run_all` starts committing new
-  indicators/edges, not only after a failed post-sync refresh, closing a
-  window where a verdict resolved mid-sync could see a filter that reports
-  itself valid (against the *previous* corpus) while Postgres already
-  contains a match the filter doesn't know about yet; `refresh` holds one
-  write lock across both its DB query and the filter swap so a concurrent
-  `insert` (a fresh local YARA hit) can't be silently discarded by the
-  swap. `RelationshipEvidence.relation` is a closed `EvidenceRelation` enum
+  indicators/edges, not only after a failed post-sync refresh; `refresh`
+  holds one write lock across both its DB query and the filter swap so a
+  concurrent `insert` (a fresh local YARA hit) can't be silently discarded
+  by the swap. Beyond the bloom filter itself, `IntelGate`
+  (`src-tauri/src/bloom.rs`) serializes a verdict's *entire* intel-corpus
+  read (its bloom check through its final `intel_freshness` read) against a
+  feed sync's entire write (invalidate, ingest, refresh) as two mutually
+  exclusive units: `verdict::resolve` holds a read guard for its whole
+  duration, `commands::sync_feeds` holds the write guard around all three
+  of its steps, so a verdict can never observe a mix of pre-sync and
+  post-sync state -- a bloom-miss decision made against one corpus
+  generation paired with `intel_freshness` read back from a *different*,
+  newer one, purely because a sync happened to land in between. Many
+  verdicts can still resolve concurrently (shared read access); only a sync
+  excludes them, and only for its own short, explicit, manually-triggered
+  duration. `RelationshipEvidence.relation` is a closed `EvidenceRelation` enum
   (one variant per edge table: `observed_in_report`,
   `report_references_cve`, `detects_indicator`, `detection_covers_cve`,
   `attributed_to_malware_family`, `contextual_filename_match`) rather than

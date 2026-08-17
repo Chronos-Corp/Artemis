@@ -12,7 +12,7 @@ mod yara_scan;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bloom::BloomState;
+use bloom::{BloomState, IntelGate};
 use sqlx::PgPool;
 use tauri::Manager;
 use verdict::RecentYaraHits;
@@ -21,6 +21,9 @@ use yara_scan::YaraEngine;
 pub struct AppState {
     pub pool: Option<PgPool>,
     pub bloom: Arc<BloomState>,
+    /// Serializes a verdict's intel-corpus reads against a feed sync's
+    /// writes -- see `IntelGate`'s doc comment.
+    pub intel_gate: Arc<IntelGate>,
     pub yara: Arc<YaraEngine>,
     pub recent_yara_hits: Arc<RecentYaraHits>,
     pub api_key: String,
@@ -76,6 +79,7 @@ async fn init_state() -> AppState {
     AppState {
         pool,
         bloom,
+        intel_gate: Arc::new(IntelGate::new()),
         yara,
         recent_yara_hits: Arc::new(RecentYaraHits::new()),
         api_key,

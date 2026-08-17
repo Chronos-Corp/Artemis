@@ -29,6 +29,7 @@ pub async fn get_verdict(state: State<'_, AppState>, path: String) -> Result<Ver
     crate::verdict::resolve(
         pool,
         &state.bloom,
+        &state.intel_gate,
         &state.yara,
         &state.recent_yara_hits,
         std::path::Path::new(&path),
@@ -68,15 +69,20 @@ pub async fn sync_feeds(state: State<'_, AppState>) -> Result<Vec<FeedSyncResult
         );
     }
 
-    // Invalidated *before* ingestion starts, not just after a failed
-    // post-sync refresh: `ingest::run_all` commits new indicators/edges to
-    // Postgres per feed as it goes, so a verdict resolved mid-sync could
-    // otherwise see a bloom filter that reports itself valid (the last
-    // refresh, against the *previous* corpus, succeeded) while Postgres
-    // already contains a match the filter has no way to know about -- a
-    // round-6 review caught this as a real, not just theoretical, window
-    // for a clean-looking miss backed by data about to report itself as
-    // freshly synced. See `BloomState`'s doc comment.
+    // Held for invalidation + ingestion + refresh as one unit -- see
+    // `IntelGate`'s doc comment. A round-6 review already established that
+    // the bloom must be invalidated *before* `ingest::run_all` starts
+    // committing (not just after a failed post-sync refresh); a round-7
+    // review went further and caught that even with that ordering, a
+    // verdict running concurrently could still see the bloom decision from
+    // *before* this sync and the freshness state from *after* it, since
+    // nothing previously excluded a `resolve()` call from interleaving
+    // with these three steps. Holding this write guard blocks any
+    // concurrent `resolve()` (which takes the matching read guard for its
+    // whole duration) until the sync -- invalidate, ingest, refresh -- has
+    // completed as one atomic-from-the-outside unit.
+    let _intel_write_guard = state.intel_gate.write().await;
+
     state.bloom.invalidate().await;
     let results = crate::ingest::run_all(pool, &state.api_key).await;
     let mapped: Vec<FeedSyncResult> = results

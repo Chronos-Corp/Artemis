@@ -171,8 +171,16 @@ export interface ThreatRelationship {
   strength: RelationshipStrength;
   target: string;
   explanation: string;
-  // Ordered from the file outward; never empty.
-  evidence: RelationshipEvidence[];
+  // Every distinct, independently-walkable evidence path from the file to
+  // `target` -- each inner array is one complete, ordered chain (file
+  // outward). Most relationships have exactly one path; a Cve relationship
+  // derived from report co-occurrence can have more than one when the
+  // report observed this file under more than one hash (or via more than
+  // one source) before converging on the same CVE assertion -- a review
+  // caught that flattening those into one array made a two-parents-one-
+  // shared-tail shape look like a single linear chain. Never empty, and no
+  // inner path is ever empty.
+  evidence_paths: RelationshipEvidence[][];
 }
 
 export interface Verdict {

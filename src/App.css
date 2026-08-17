@@ -435,6 +435,22 @@ body {
   margin-top: 0.2rem;
 }
 
+.evidence-path {
+  margin-top: 0.3rem;
+}
+
+.evidence-path:first-child {
+  margin-top: 0;
+}
+
+.evidence-path-label {
+  color: #999;
+  font-size: 0.68rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
 .evidence-hop {
   color: #888;
   font-size: 0.72rem;
@@ -671,7 +687,8 @@ button:disabled {
   }
 
   .relationship-group-label,
-  .evidence-hop {
+  .evidence-hop,
+  .evidence-path-label {
     color: #999;
   }
 

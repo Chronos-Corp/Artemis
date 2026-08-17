@@ -58,34 +58,46 @@ export function ThreatRelationshipList({ relationships }: Props) {
                   </span>
                 </div>
                 <div className="relationship-explanation">{r.explanation}</div>
-                {/* One row per evidence hop -- a single-hop relationship
-                    (ioc/detection/risk_based/malware_family) renders one
-                    row; a multi-hop cve relationship renders its full
-                    chain, each hop labeled by the edge it came from, so
-                    the chain stays reconstructable rather than collapsed
-                    into one borrowed number. */}
+                {/* One block per evidence path -- most relationships have
+                    exactly one, but a Cve relationship can have more than
+                    one when a report observed this file under more than
+                    one hash (or via more than one source) before
+                    converging on the same CVE assertion. Rendering each
+                    path as its own block (rather than flattening every
+                    hop across every path into one list) keeps each
+                    path's own chain reconstructable -- a review caught
+                    that flattening made two parallel first hops sharing
+                    one second hop look like a single, longer linear
+                    chain. */}
                 <div className="relationship-evidence">
-                  {r.evidence.map((e, j) => (
-                    <div key={j} className="evidence-hop">
-                      {r.evidence.length > 1 && (
-                        <span className="evidence-relation">
-                          {EVIDENCE_RELATION_LABELS[e.relation]}:{" "}
-                        </span>
+                  {r.evidence_paths.map((path, pi) => (
+                    <div key={pi} className="evidence-path">
+                      {r.evidence_paths.length > 1 && (
+                        <div className="evidence-path-label">Path {pi + 1}</div>
                       )}
-                      {e.source} -- {e.confidence}% confidence
-                      {e.detection_name && ` -- ${e.detection_name}`}
-                      {e.indicator_value && ` -- ${e.indicator_value}`}
-                      {e.report_title &&
-                        (e.report_url ? (
-                          <>
-                            {" -- "}
-                            <a href={e.report_url} target="_blank" rel="noreferrer">
-                              {e.report_title}
-                            </a>
-                          </>
-                        ) : (
-                          ` -- ${e.report_title}`
-                        ))}
+                      {path.map((e, j) => (
+                        <div key={j} className="evidence-hop">
+                          {path.length > 1 && (
+                            <span className="evidence-relation">
+                              {EVIDENCE_RELATION_LABELS[e.relation]}:{" "}
+                            </span>
+                          )}
+                          {e.source} -- {e.confidence}% confidence
+                          {e.detection_name && ` -- ${e.detection_name}`}
+                          {e.indicator_value && ` -- ${e.indicator_value}`}
+                          {e.report_title &&
+                            (e.report_url ? (
+                              <>
+                                {" -- "}
+                                <a href={e.report_url} target="_blank" rel="noreferrer">
+                                  {e.report_title}
+                                </a>
+                              </>
+                            ) : (
+                              ` -- ${e.report_title}`
+                            ))}
+                        </div>
+                      ))}
                     </div>
                   ))}
                 </div>

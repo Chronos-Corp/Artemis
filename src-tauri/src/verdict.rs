@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::bloom::BloomState;
+use crate::bloom::{BloomState, IntelGate};
 use crate::db::indicators as db;
 use crate::hashing;
 use crate::models::{
@@ -76,10 +76,26 @@ impl Default for RecentYaraHits {
 pub async fn resolve(
     pool: &PgPool,
     bloom: &BloomState,
+    intel_gate: &IntelGate,
     yara: &Arc<YaraEngine>,
     recent_yara_hits: &RecentYaraHits,
     path: &Path,
 ) -> Result<Verdict> {
+    // Held for this call's entire duration -- see `IntelGate`'s doc
+    // comment. A round-7 review caught that the bloom-miss decision below
+    // and the `intel_freshness` read at the bottom of this function could
+    // otherwise straddle a concurrent feed sync: the decision correctly
+    // valid at the moment `bloom.check` ran, but a sync invalidating,
+    // committing new matching data, and refreshing before this function
+    // reaches `all_sync_states` would return a verdict claiming
+    // post-sync freshness for a relationship decision silently still made
+    // against the pre-sync corpus. Holding this guard for the whole
+    // function excludes `commands::sync_feeds`'s write guard for that
+    // entire span, so every read below -- the bloom check, the hash/family/
+    // report-CVE queries, and the final freshness read -- sees one
+    // consistent corpus.
+    let _intel_read_guard = intel_gate.read().await;
+
     // Read the file's bytes exactly once and hash + YARA-scan the identical
     // buffer -- see `hashing::hash_and_read_file`'s doc comment for why:
     // two separate reads (one to hash, one to scan) can observe different
@@ -404,14 +420,22 @@ mod tests {
         );
 
         let bloom = BloomState::empty();
+        let intel_gate = IntelGate::new();
         let recent_yara_hits = RecentYaraHits::new();
 
         let mut tmp = tempfile_eicar();
         tmp.flush().unwrap();
 
-        let verdict = resolve(&pool, &bloom, &yara, &recent_yara_hits, tmp.path())
-            .await
-            .expect("resolve verdict");
+        let verdict = resolve(
+            &pool,
+            &bloom,
+            &intel_gate,
+            &yara,
+            &recent_yara_hits,
+            tmp.path(),
+        )
+        .await
+        .expect("resolve verdict");
 
         assert!(
             verdict
@@ -462,6 +486,7 @@ mod tests {
             .join("yara-rules");
         let yara = Arc::new(YaraEngine::load(&rules_dir).expect("load yara rules"));
         let bloom = BloomState::empty();
+        let intel_gate = IntelGate::new();
         let recent_yara_hits = RecentYaraHits::new();
 
         let mut tmp = tempfile::NamedTempFile::new().expect("create temp file");
@@ -513,9 +538,16 @@ mod tests {
         // than waiting for a full refresh.
         bloom.insert(&hash.sha256).await;
 
-        let verdict = resolve(&pool, &bloom, &yara, &recent_yara_hits, tmp.path())
-            .await
-            .expect("resolve verdict");
+        let verdict = resolve(
+            &pool,
+            &bloom,
+            &intel_gate,
+            &yara,
+            &recent_yara_hits,
+            tmp.path(),
+        )
+        .await
+        .expect("resolve verdict");
 
         let relationship = verdict
             .threat_relationships
@@ -536,8 +568,9 @@ mod tests {
             relationship.strength,
             crate::models::RelationshipStrength::Direct
         );
-        assert_eq!(relationship.evidence.len(), 1);
-        assert_eq!(relationship.evidence[0].report_id, Some(report_id));
+        assert_eq!(relationship.evidence_paths.len(), 1);
+        assert_eq!(relationship.evidence_paths[0].len(), 1);
+        assert_eq!(relationship.evidence_paths[0][0].report_id, Some(report_id));
     }
 
     /// Review finding 4A: `malware_family_matches` originally hardcoded
@@ -562,6 +595,7 @@ mod tests {
             .join("yara-rules");
         let yara = Arc::new(YaraEngine::load(&rules_dir).expect("load yara rules"));
         let bloom = BloomState::empty();
+        let intel_gate = IntelGate::new();
         let recent_yara_hits = RecentYaraHits::new();
 
         let mut tmp = tempfile::NamedTempFile::new().expect("create temp file");
@@ -611,9 +645,16 @@ mod tests {
         // the query both actually check MD5, not just sha256.
         bloom.insert(&hash.md5).await;
 
-        let verdict = resolve(&pool, &bloom, &yara, &recent_yara_hits, tmp.path())
-            .await
-            .expect("resolve verdict");
+        let verdict = resolve(
+            &pool,
+            &bloom,
+            &intel_gate,
+            &yara,
+            &recent_yara_hits,
+            tmp.path(),
+        )
+        .await
+        .expect("resolve verdict");
 
         let relationship = verdict
             .threat_relationships
@@ -655,6 +696,7 @@ mod tests {
             .join("yara-rules");
         let yara = Arc::new(YaraEngine::load(&rules_dir).expect("load yara rules"));
         let bloom = BloomState::empty();
+        let intel_gate = IntelGate::new();
         let recent_yara_hits = RecentYaraHits::new();
 
         let mut tmp = tempfile::NamedTempFile::new().expect("create temp file");
@@ -741,9 +783,16 @@ mod tests {
 
         bloom.insert(&hash.sha256).await;
 
-        let verdict = resolve(&pool, &bloom, &yara, &recent_yara_hits, tmp.path())
-            .await
-            .expect("resolve verdict");
+        let verdict = resolve(
+            &pool,
+            &bloom,
+            &intel_gate,
+            &yara,
+            &recent_yara_hits,
+            tmp.path(),
+        )
+        .await
+        .expect("resolve verdict");
 
         let matches: Vec<_> = verdict
             .threat_relationships
@@ -758,7 +807,7 @@ mod tests {
             matches
         );
         assert_eq!(
-            matches[0].evidence[0].report_id,
+            matches[0].evidence_paths[0][0].report_id,
             Some(report_b_id),
             "the relationship must point at report B, the only report whose edge actually \
              asserts the family -- not report A, which merely observed the same indicator \
@@ -789,6 +838,7 @@ mod tests {
             .join("yara-rules");
         let yara = Arc::new(YaraEngine::load(&rules_dir).expect("load yara rules"));
         let bloom = BloomState::empty();
+        let intel_gate = IntelGate::new();
         let recent_yara_hits = RecentYaraHits::new();
 
         // Truncated to microsecond precision: Postgres TIMESTAMPTZ stores
@@ -859,9 +909,16 @@ mod tests {
         .expect("seed report references cve");
 
         bloom.insert(&hash_report.sha256).await;
-        let verdict_report = resolve(&pool, &bloom, &yara, &recent_yara_hits, tmp_report.path())
-            .await
-            .expect("resolve verdict for report path");
+        let verdict_report = resolve(
+            &pool,
+            &bloom,
+            &intel_gate,
+            &yara,
+            &recent_yara_hits,
+            tmp_report.path(),
+        )
+        .await
+        .expect("resolve verdict for report path");
 
         let via_report = verdict_report
             .threat_relationships
@@ -876,36 +933,42 @@ mod tests {
                 )
             });
         assert_eq!(
-            via_report.evidence.len(),
+            via_report.evidence_paths.len(),
+            1,
+            "only one real parent observation was seeded, so this must not branch: {:?}",
+            via_report.evidence_paths
+        );
+        let path = &via_report.evidence_paths[0];
+        assert_eq!(
+            path.len(),
             2,
-            "the two-hop chain must be preserved, not collapsed to one flat value: {:?}",
-            via_report.evidence
+            "the two-hop chain must be preserved, not collapsed to one flat value: {path:?}"
         );
         assert_eq!(
-            via_report.evidence[0].relation,
+            path[0].relation,
             crate::models::EvidenceRelation::ObservedInReport
         );
         assert_eq!(
-            via_report.evidence[0].source, "parent-edge-source",
+            path[0].source, "parent-edge-source",
             "the first hop must carry indicator_observed_in_report's own provenance"
         );
-        assert_eq!(via_report.evidence[0].confidence, 20);
-        assert_eq!(via_report.evidence[0].first_seen, parent_first_seen);
-        assert_eq!(via_report.evidence[0].last_seen, parent_last_seen);
+        assert_eq!(path[0].confidence, 20);
+        assert_eq!(path[0].first_seen, parent_first_seen);
+        assert_eq!(path[0].last_seen, parent_last_seen);
         assert_eq!(
-            via_report.evidence[1].relation,
+            path[1].relation,
             crate::models::EvidenceRelation::ReportReferencesCve
         );
         assert_eq!(
-            via_report.evidence[1].source, "cve-edge-source",
+            path[1].source, "cve-edge-source",
             "must carry report_references_cve's own source, not indicator_observed_in_report's"
         );
         assert_eq!(
-            via_report.evidence[1].confidence, 77,
+            path[1].confidence, 77,
             "must carry report_references_cve's own confidence, not indicator_observed_in_report's"
         );
-        assert_eq!(via_report.evidence[1].first_seen, cve_first_seen);
-        assert_eq!(via_report.evidence[1].last_seen, cve_last_seen);
+        assert_eq!(path[1].first_seen, cve_first_seen);
+        assert_eq!(path[1].last_seen, cve_last_seen);
         assert_eq!(
             via_report.strength,
             crate::models::RelationshipStrength::Contextual,
@@ -996,6 +1059,7 @@ mod tests {
         let verdict_detection = resolve(
             &pool,
             &bloom,
+            &intel_gate,
             &yara,
             &recent_yara_hits,
             tmp_detection.path(),
@@ -1016,54 +1080,58 @@ mod tests {
                 )
             });
         assert_eq!(
-            via_detection.evidence.len(),
+            via_detection.evidence_paths.len(),
+            1,
+            "cve_matches_via_detection's hop 1 always comes from exactly one live scan, so \
+             this must never branch: {:?}",
+            via_detection.evidence_paths
+        );
+        let path = &via_detection.evidence_paths[0];
+        assert_eq!(
+            path.len(),
             2,
-            "the two-hop chain must be preserved, not collapsed to one flat value: {:?}",
-            via_detection.evidence
+            "the two-hop chain must be preserved, not collapsed to one flat value: {path:?}"
         );
         assert_eq!(
-            via_detection.evidence[0].relation,
+            path[0].relation,
             crate::models::EvidenceRelation::DetectsIndicator
         );
         assert_eq!(
-            via_detection.evidence[0].source, "local:yara_scan",
+            path[0].source, "local:yara_scan",
             "the first hop must carry the live scan's own detection_detects_indicator \
              provenance (record_yara_hit's), not detection_covers_cve's"
         );
-        assert_eq!(via_detection.evidence[0].confidence, 65);
+        assert_eq!(path[0].confidence, 65);
         // Round 6 review finding 3B: hop 1 must identify the indicator it
         // detected -- `resolve()` knows the scanned hash, so this hop
         // should never be a structurally incomplete
         // `Detection --detects--> ???`.
+        assert_eq!(path[0].indicator_kind, Some(IndicatorKind::Sha256));
         assert_eq!(
-            via_detection.evidence[0].indicator_kind,
-            Some(IndicatorKind::Sha256)
-        );
-        assert_eq!(
-            via_detection.evidence[0].indicator_value,
+            path[0].indicator_value,
             Some(verdict_detection.sha256.clone())
         );
         assert_eq!(
-            via_detection.evidence[1].relation,
+            path[1].relation,
             crate::models::EvidenceRelation::DetectionCoversCve
         );
         assert_eq!(
-            via_detection.evidence[1].source, "covers-edge-source",
+            path[1].source, "covers-edge-source",
             "must carry detection_covers_cve's own source, not detection_detects_indicator's"
         );
         assert_eq!(
-            via_detection.evidence[1].confidence, 88,
+            path[1].confidence, 88,
             "must carry detection_covers_cve's own confidence, not detection_detects_indicator's"
         );
-        assert_eq!(via_detection.evidence[1].first_seen, cve_first_seen);
-        assert_eq!(via_detection.evidence[1].last_seen, cve_last_seen);
+        assert_eq!(path[1].first_seen, cve_first_seen);
+        assert_eq!(path[1].last_seen, cve_last_seen);
         // Round 6 review finding 3A: this coverage edge was seeded with the
         // wildcard ("" -> None) rule_fingerprint, meaning "applies to any
         // version" -- hop 2 must preserve that true edge value, not
         // fabricate the current scan's own fingerprint as though the edge
         // had actually been asserted against it.
         assert_eq!(
-            via_detection.evidence[1].rule_fingerprint, None,
+            path[1].rule_fingerprint, None,
             "a wildcard coverage edge's evidence must stay a wildcard, not be presented as \
              though asserted against the current scan's specific rule fingerprint"
         );
@@ -1111,6 +1179,7 @@ mod tests {
         // Deliberately empty, not seeded: this call must not depend on the
         // bloom filter already knowing this file's hash.
         let bloom = BloomState::empty();
+        let intel_gate = IntelGate::new();
         let recent_yara_hits = RecentYaraHits::new();
 
         // A hunt pack has already documented the bundled EICAR rule as
@@ -1152,9 +1221,16 @@ mod tests {
         // detection_detects_indicator edge do not exist in this bloom's
         // view of the world until record_yara_hit persists them partway
         // through this very call.
-        let verdict = resolve(&pool, &bloom, &yara, &recent_yara_hits, tmp.path())
-            .await
-            .expect("resolve verdict");
+        let verdict = resolve(
+            &pool,
+            &bloom,
+            &intel_gate,
+            &yara,
+            &recent_yara_hits,
+            tmp.path(),
+        )
+        .await
+        .expect("resolve verdict");
 
         assert!(
             verdict
@@ -1189,6 +1265,7 @@ mod tests {
             .join("yara-rules");
         let yara = Arc::new(YaraEngine::load(&rules_dir).expect("load yara rules"));
         let bloom = BloomState::empty();
+        let intel_gate = IntelGate::new();
         let recent_yara_hits = RecentYaraHits::new();
 
         let mut tmp = tempfile::NamedTempFile::new().expect("create temp file");
@@ -1263,9 +1340,16 @@ mod tests {
         .expect("seed report references cve");
 
         bloom.insert(&hash.sha256).await;
-        let verdict = resolve(&pool, &bloom, &yara, &recent_yara_hits, tmp.path())
-            .await
-            .expect("resolve verdict");
+        let verdict = resolve(
+            &pool,
+            &bloom,
+            &intel_gate,
+            &yara,
+            &recent_yara_hits,
+            tmp.path(),
+        )
+        .await
+        .expect("resolve verdict");
 
         let matches: Vec<_> = verdict
             .threat_relationships
@@ -1283,42 +1367,48 @@ mod tests {
         // not come at the cost of discarding either hash's real supporting
         // evidence -- both indicator_observed_in_report hops are genuine,
         // independent facts (the report really did observe this file under
-        // both hash representations) and both must still be reconstructable
-        // from the evidence chain, not silently reduced to whichever one a
-        // `LIMIT 1` happened to prefer.
-        let observed_hops: Vec<_> = matches[0]
-            .evidence
-            .iter()
-            .filter(|e| e.relation == crate::models::EvidenceRelation::ObservedInReport)
-            .collect();
+        // both hash representations) and both must still be reconstructable.
+        // Round 7 review finding 3 went further: those two hops converging
+        // on one shared report_references_cve hop are not one linear
+        // chain, they're two parallel paths -- `evidence_paths` must carry
+        // them as two separate, independently-walkable paths rather than
+        // one flat vec that leaves a consumer to infer the branch.
         assert_eq!(
-            observed_hops.len(),
+            matches[0].evidence_paths.len(),
             2,
             "both the sha256 and md5 observed_in_report hops must be preserved as separate \
-             evidence, not collapsed to one, got: {:?}",
-            matches[0].evidence
+             evidence *paths*, not collapsed into one linear chain, got: {:?}",
+            matches[0].evidence_paths
+        );
+        for path in &matches[0].evidence_paths {
+            assert_eq!(
+                path.len(),
+                2,
+                "each path must be a complete, self-contained two-hop chain: {path:?}"
+            );
+            assert_eq!(
+                path[0].relation,
+                crate::models::EvidenceRelation::ObservedInReport
+            );
+            assert_eq!(
+                path[1].relation,
+                crate::models::EvidenceRelation::ReportReferencesCve,
+                "every path must end at the shared report_references_cve hop, not just one of \
+                 them"
+            );
+        }
+        let observed_values: Vec<Option<String>> = matches[0]
+            .evidence_paths
+            .iter()
+            .map(|path| path[0].indicator_value.clone())
+            .collect();
+        assert!(
+            observed_values.contains(&Some(hash.sha256.clone())),
+            "expected a path whose first hop observed the sha256, got: {observed_values:?}"
         );
         assert!(
-            observed_hops
-                .iter()
-                .any(|e| e.indicator_value.as_deref() == Some(hash.sha256.as_str())),
-            "expected a hop for the sha256 observation, got: {observed_hops:?}"
-        );
-        assert!(
-            observed_hops
-                .iter()
-                .any(|e| e.indicator_value.as_deref() == Some(hash.md5.as_str())),
-            "expected a hop for the md5 observation, got: {observed_hops:?}"
-        );
-        assert_eq!(
-            matches[0]
-                .evidence
-                .iter()
-                .filter(|e| e.relation == crate::models::EvidenceRelation::ReportReferencesCve)
-                .count(),
-            1,
-            "the report_references_cve hop itself must still appear exactly once, got: {:?}",
-            matches[0].evidence
+            observed_values.contains(&Some(hash.md5.clone())),
+            "expected a path whose first hop observed the md5, got: {observed_values:?}"
         );
     }
 
@@ -1367,6 +1457,7 @@ mod tests {
         );
 
         let bloom = BloomState::empty();
+        let intel_gate = IntelGate::new();
         let recent_yara_hits = RecentYaraHits::new();
 
         let mut tmp = tempfile::NamedTempFile::new().expect("create temp file");
@@ -1403,9 +1494,16 @@ mod tests {
         .await
         .expect("seed detection B covers cve");
 
-        let verdict = resolve(&pool, &bloom, &yara, &recent_yara_hits, tmp.path())
-            .await
-            .expect("resolve verdict");
+        let verdict = resolve(
+            &pool,
+            &bloom,
+            &intel_gate,
+            &yara,
+            &recent_yara_hits,
+            tmp.path(),
+        )
+        .await
+        .expect("resolve verdict");
 
         // Sanity: both rules genuinely fired this scan, not just B.
         let yara_hit_names: Vec<_> = verdict
@@ -1441,7 +1539,7 @@ mod tests {
             relationship.explanation
         );
         assert_eq!(
-            relationship.evidence[1].detection_name,
+            relationship.evidence_paths[0][1].detection_name,
             Some(rule_b_name),
             "the structured evidence hop, not just the explanation prose, must identify rule B"
         );
@@ -1483,15 +1581,23 @@ mod tests {
             .join("yara-rules");
         let yara = Arc::new(YaraEngine::load(&rules_dir).expect("load yara rules"));
         let bloom = BloomState::empty();
+        let intel_gate = IntelGate::new();
         let recent_yara_hits = RecentYaraHits::new();
 
         let mut tmp = tempfile::NamedTempFile::new().expect("create temp file");
         tmp.write_all(b"irrelevant content, not eicar").unwrap();
         tmp.flush().unwrap();
 
-        let verdict = resolve(&pool, &bloom, &yara, &recent_yara_hits, tmp.path())
-            .await
-            .expect("resolve verdict");
+        let verdict = resolve(
+            &pool,
+            &bloom,
+            &intel_gate,
+            &yara,
+            &recent_yara_hits,
+            tmp.path(),
+        )
+        .await
+        .expect("resolve verdict");
 
         let freshness = verdict
             .intel_freshness
@@ -1612,13 +1718,14 @@ mod tests {
                 .join("yara-rules");
             let yara = Arc::new(YaraEngine::load(&rules_dir).expect("load yara rules"));
             let bloom = BloomState::empty();
+            let intel_gate = IntelGate::new();
             let recent_yara_hits = RecentYaraHits::new();
 
             let mut tmp = tempfile::NamedTempFile::new().expect("create temp file");
             tmp.write_all(b"irrelevant content, still not eicar").unwrap();
             tmp.flush().unwrap();
 
-            let verdict = resolve(&body_pool, &bloom, &yara, &recent_yara_hits, tmp.path())
+            let verdict = resolve(&body_pool, &bloom, &intel_gate, &yara, &recent_yara_hits, tmp.path())
                 .await
                 .expect("resolve verdict");
 
@@ -1785,6 +1892,7 @@ mod tests {
             .join("yara-rules");
         let yara = Arc::new(YaraEngine::load(&rules_dir).expect("load yara rules"));
         let bloom = BloomState::empty();
+        let intel_gate = IntelGate::new();
         let recent_yara_hits = RecentYaraHits::new();
 
         let mut tmp = tempfile::NamedTempFile::new().expect("create temp file");
@@ -1871,9 +1979,16 @@ mod tests {
         .expect("seed stale detection covers cve");
 
         bloom.insert(&hash.sha256).await;
-        let verdict = resolve(&pool, &bloom, &yara, &recent_yara_hits, tmp.path())
-            .await
-            .expect("resolve verdict");
+        let verdict = resolve(
+            &pool,
+            &bloom,
+            &intel_gate,
+            &yara,
+            &recent_yara_hits,
+            tmp.path(),
+        )
+        .await
+        .expect("resolve verdict");
 
         assert!(
             !verdict
@@ -1906,6 +2021,7 @@ mod tests {
             .join("yara-rules");
         let yara = Arc::new(YaraEngine::load(&rules_dir).expect("load yara rules"));
         let bloom = BloomState::empty();
+        let intel_gate = IntelGate::new();
         let recent_yara_hits = RecentYaraHits::new();
 
         let mut tmp = tempfile_eicar();
@@ -1946,9 +2062,16 @@ mod tests {
         .await
         .expect("seed stale detection detects indicator");
 
-        let verdict = resolve(&pool, &bloom, &yara, &recent_yara_hits, tmp.path())
-            .await
-            .expect("resolve verdict");
+        let verdict = resolve(
+            &pool,
+            &bloom,
+            &intel_gate,
+            &yara,
+            &recent_yara_hits,
+            tmp.path(),
+        )
+        .await
+        .expect("resolve verdict");
 
         assert!(
             verdict
@@ -2006,6 +2129,7 @@ mod tests {
         let yara = Arc::new(YaraEngine::load(&rules_dir).expect("load yara rules"));
         // Never refreshed -- must stay invalid.
         let bloom = BloomState::empty();
+        let intel_gate = IntelGate::new();
         let recent_yara_hits = RecentYaraHits::new();
         assert!(
             matches!(
@@ -2071,9 +2195,16 @@ mod tests {
         // Deliberately not calling bloom.insert either -- the point is
         // that the fallback works even when the filter genuinely has no
         // idea this hash exists.
-        let verdict = resolve(&pool, &bloom, &yara, &recent_yara_hits, tmp.path())
-            .await
-            .expect("resolve verdict");
+        let verdict = resolve(
+            &pool,
+            &bloom,
+            &intel_gate,
+            &yara,
+            &recent_yara_hits,
+            tmp.path(),
+        )
+        .await
+        .expect("resolve verdict");
 
         assert!(
             verdict
@@ -2141,6 +2272,7 @@ mod tests {
         );
 
         let bloom = BloomState::empty();
+        let intel_gate = IntelGate::new();
 
         // Scan v1-matching content with the v1 engine: persists a real
         // detects_indicator edge carrying v1's fingerprint.
@@ -2150,9 +2282,16 @@ mod tests {
             .unwrap();
         tmp_v1.flush().unwrap();
         let recent_yara_hits_v1 = RecentYaraHits::new();
-        let verdict_v1 = resolve(&pool, &bloom, &yara_v1, &recent_yara_hits_v1, tmp_v1.path())
-            .await
-            .expect("resolve v1 verdict");
+        let verdict_v1 = resolve(
+            &pool,
+            &bloom,
+            &intel_gate,
+            &yara_v1,
+            &recent_yara_hits_v1,
+            tmp_v1.path(),
+        )
+        .await
+        .expect("resolve v1 verdict");
         assert!(
             verdict_v1
                 .entries
@@ -2202,9 +2341,16 @@ mod tests {
             .unwrap();
         tmp_v2.flush().unwrap();
         let recent_yara_hits_v2 = RecentYaraHits::new();
-        let verdict_v2 = resolve(&pool, &bloom, &yara_v2, &recent_yara_hits_v2, tmp_v2.path())
-            .await
-            .expect("resolve v2 verdict");
+        let verdict_v2 = resolve(
+            &pool,
+            &bloom,
+            &intel_gate,
+            &yara_v2,
+            &recent_yara_hits_v2,
+            tmp_v2.path(),
+        )
+        .await
+        .expect("resolve v2 verdict");
         assert!(
             verdict_v2
                 .entries

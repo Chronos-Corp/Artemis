@@ -43,8 +43,20 @@ const FALSE_POSITIVE_RATE: f64 = 0.001;
 ///    duration of the (rare, explicitly-triggered) refresh query rather
 ///    than the far more common lookup path -- an accepted tradeoff for a
 ///    single-analyst desktop process where correctness matters more than a
-///    sync click's exact latency; a true multi-writer generation/epoch
-///    design is more than Phase 0 needs.
+///    sync click's exact latency.
+///
+/// A round-7 review found the boundary *after* `check()` still racy: two
+/// separate calls (`is_valid()`/`contains()`) were fixed by (2) above, but
+/// `resolve()` still made its bloom-miss decision, released the lock, and
+/// only much later read `all_sync_states()` for freshness -- if a sync
+/// invalidated, committed matching data, and refreshed in between, the
+/// returned verdict could carry post-sync freshness metadata while its
+/// relationship decision was silently still made against the pre-sync
+/// corpus. See `IntelGate` below, which closes that window by making the
+/// whole read side of a verdict and the whole write side of a sync
+/// mutually exclusive -- simpler than a generation/epoch-and-retry scheme,
+/// and consistent with the same "coarse lock, single-analyst desktop
+/// process" tradeoff already made for `refresh` above.
 pub struct BloomState {
     inner: RwLock<Inner>,
 }
@@ -155,6 +167,47 @@ impl BloomState {
     }
 }
 
+/// Serializes "read the intel corpus for one verdict" against "mutate the
+/// intel corpus" (a feed sync), so a verdict can never observe a mix of
+/// pre-sync and post-sync state -- see the round-7 addition to
+/// `BloomState`'s doc comment for the exact race this closes.
+/// `verdict::resolve` holds a read guard for its entire duration (its
+/// bloom-miss decision through its final `intel_freshness` read all see
+/// one consistent corpus); `commands::sync_feeds` holds the write guard
+/// around invalidating the bloom, running ingestion, and refreshing the
+/// bloom, so those three steps also happen as one atomic unit from a
+/// verdict's point of view. Many verdicts can resolve concurrently (shared
+/// read access); a sync excludes all of them for its duration, and vice
+/// versa -- coarser than a generation/epoch-and-retry scheme, but correct
+/// by construction and simple enough to reason about for a single-analyst
+/// desktop process, where a sync is a rare, explicit, manually-triggered
+/// action, not a hot path.
+pub struct IntelGate {
+    lock: RwLock<()>,
+}
+
+impl IntelGate {
+    pub fn new() -> Self {
+        Self {
+            lock: RwLock::new(()),
+        }
+    }
+
+    pub async fn read(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.lock.read().await
+    }
+
+    pub async fn write(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        self.lock.write().await
+    }
+}
+
+impl Default for IntelGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +255,70 @@ mod tests {
             bloom.check(&["anything"]).await,
             LookupResult::FilterInvalid
         ));
+    }
+
+    /// Round 7 review finding: the mutual-exclusion property `resolve()`
+    /// (read) and `sync_feeds` (write) depend on to stay each other's
+    /// exclusive alternative, tested directly against `IntelGate` rather
+    /// than through the much harder-to-orchestrate full DB-backed
+    /// verdict/sync machinery. While a write guard is held, a concurrent
+    /// read attempt must not be granted; once released, it must be.
+    #[tokio::test]
+    async fn write_guard_excludes_a_concurrent_read_guard() {
+        let gate = IntelGate::new();
+        let write_guard = gate.write().await;
+
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(200), gate.read()).await;
+        assert!(
+            blocked.is_err(),
+            "a read guard must not be granted while a write guard is held"
+        );
+
+        drop(write_guard);
+        let granted =
+            tokio::time::timeout(std::time::Duration::from_millis(200), gate.read()).await;
+        assert!(
+            granted.is_ok(),
+            "a read guard must be granted once the write guard is released"
+        );
+    }
+
+    /// The other half of the same property: a write guard (a sync) must
+    /// wait for an in-flight read guard (a verdict) to finish, not
+    /// interleave with it.
+    #[tokio::test]
+    async fn read_guard_excludes_a_concurrent_write_guard() {
+        let gate = IntelGate::new();
+        let read_guard = gate.read().await;
+
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(200), gate.write()).await;
+        assert!(
+            blocked.is_err(),
+            "a write guard must not be granted while a read guard is held"
+        );
+
+        drop(read_guard);
+        let granted =
+            tokio::time::timeout(std::time::Duration::from_millis(200), gate.write()).await;
+        assert!(
+            granted.is_ok(),
+            "a write guard must be granted once the read guard is released"
+        );
+    }
+
+    /// Many verdicts must be able to resolve concurrently -- the gate only
+    /// needs to exclude a *sync* from interleaving with reads, not readers
+    /// from each other.
+    #[tokio::test]
+    async fn multiple_read_guards_can_be_held_concurrently() {
+        let gate = IntelGate::new();
+        let _first = gate.read().await;
+        let second = tokio::time::timeout(std::time::Duration::from_millis(200), gate.read()).await;
+        assert!(
+            second.is_ok(),
+            "a second read guard must be grantable while another read guard is already held"
+        );
     }
 }

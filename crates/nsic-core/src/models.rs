@@ -297,11 +297,34 @@ pub struct ThreatRelationship {
     /// indicator value -- whatever `kind` identifies.
     pub target: String,
     pub explanation: String,
-    /// See `RelationshipEvidence`'s doc comment -- one item for a
-    /// single-hop relationship, the full chain for a multi-hop one. Never
-    /// empty: every relationship exists because at least one edge asserted
-    /// it.
-    pub evidence: Vec<RelationshipEvidence>,
+    /// Every distinct, independently-walkable evidence path from the file
+    /// to `target` -- each inner `Vec<RelationshipEvidence>` is one
+    /// complete, ordered chain (file outward), never itself ambiguous.
+    /// Most relationships have exactly one path with one hop
+    /// (`Ioc`/`Detection`/`RiskBased`/`MalwareFamily`) or one path with two
+    /// sequential hops (a `Cve` relationship from `cve_matches_via_detection`,
+    /// whose first hop is always the single live scan that produced it).
+    ///
+    /// A `Cve` relationship from `cve_matches_via_report` can have more
+    /// than one path: a review caught that when a report observed this
+    /// file under *both* its sha256 and md5 (or via more than one
+    /// source), the two real, independent `indicator_observed_in_report`
+    /// hops converging on the *same* `report_references_cve` hop were
+    /// being flattened into one `Vec<RelationshipEvidence>` -- syntactically
+    /// a single chain, but not semantically one: it was actually two
+    /// parallel first hops sharing a second hop, and nothing on the wire
+    /// object said so. A consumer (PR #20's Hunt engine especially) that
+    /// tried to walk that as one linear path would either double-count
+    /// the shared second hop or have to reverse-engineer the branch from
+    /// repeated `report_id`s. `evidence_paths` makes every branch an
+    /// explicit, separate, self-contained path instead -- each one ending
+    /// at its own copy of the shared hop, so any single path can be
+    /// walked start-to-finish without needing to know the others exist.
+    ///
+    /// Never empty, and no inner path is ever empty: every relationship
+    /// exists because at least one edge asserted it, and every path
+    /// reaches `target` by construction.
+    pub evidence_paths: Vec<Vec<RelationshipEvidence>>,
 }
 
 /// Derives the structured relationship view from a verdict's existing
@@ -363,7 +386,7 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
                         "Exact hash match against a known indicator -- find other hosts or paths \
                          where this same indicator has been observed."
                             .to_string(),
-                    evidence: single_hop(EvidenceRelation::ObservedInReport),
+                    evidence_paths: vec![single_hop(EvidenceRelation::ObservedInReport)],
                 });
             }
             VerdictTier::FuzzyHash => {
@@ -375,7 +398,7 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
                         "Fuzzy hash similarity to a known indicator -- a close but non-exact \
                          match worth corroborating with other evidence."
                             .to_string(),
-                    evidence: single_hop(EvidenceRelation::ObservedInReport),
+                    evidence_paths: vec![single_hop(EvidenceRelation::ObservedInReport)],
                 });
             }
             VerdictTier::YaraHit => {
@@ -388,7 +411,7 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
                             "A local YARA rule fired against this exact file -- run the rule or \
                              trace its logic to see exactly what it matched on."
                                 .to_string(),
-                        evidence: single_hop(EvidenceRelation::DetectsIndicator),
+                        evidence_paths: vec![single_hop(EvidenceRelation::DetectsIndicator)],
                     });
                 }
             }
@@ -401,7 +424,7 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
                         "Path or naming pattern matched a known indicator -- weaker than a \
                          content match, worth checking alongside other evidence."
                             .to_string(),
-                    evidence: single_hop(EvidenceRelation::ObservedInReport),
+                    evidence_paths: vec![single_hop(EvidenceRelation::ObservedInReport)],
                 });
                 relationships.push(ThreatRelationship {
                     kind: RelationshipKind::RiskBased,
@@ -411,7 +434,7 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
                         "Location or naming association only, not a content match -- expand the \
                          contextual hunt without treating this as direct compromise evidence."
                             .to_string(),
-                    evidence: single_hop(EvidenceRelation::ObservedInReport),
+                    evidence_paths: vec![single_hop(EvidenceRelation::ObservedInReport)],
                 });
             }
             VerdictTier::Contextual => {
@@ -424,7 +447,7 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
                          passed through the indicator table, so this is not itself a known IOC. \
                          The weakest signal here; corroborate before treating this as meaningful."
                             .to_string(),
-                    evidence: single_hop(EvidenceRelation::ContextualFilenameMatch),
+                    evidence_paths: vec![single_hop(EvidenceRelation::ContextualFilenameMatch)],
                 });
             }
         }
@@ -556,14 +579,14 @@ mod tests {
         contextual.timing = EvidenceTiming::ReceivedOnly;
         let relationships = derive_relationships(&[contextual]);
         assert_eq!(
-            relationships[0].evidence[0].timing,
+            relationships[0].evidence_paths[0][0].timing,
             EvidenceTiming::ReceivedOnly
         );
 
         let exact_hash = entry(VerdictTier::ExactHash, 90);
         let relationships = derive_relationships(&[exact_hash]);
         assert_eq!(
-            relationships[0].evidence[0].timing,
+            relationships[0].evidence_paths[0][0].timing,
             EvidenceTiming::Observed
         );
     }
@@ -588,22 +611,28 @@ mod tests {
     }
 
     #[test]
-    fn single_hop_relationships_carry_exactly_one_evidence_item() {
-        // A review's finding: a relationship's `evidence` chain must
-        // preserve every hop that established it, not collapse to a flat
-        // source/confidence -- single-hop tiers (everything derive_relationships
-        // produces) still carry exactly one, named after the edge it came
-        // from, and pure-derived relationships are entirely defined by
-        // it, not a mix of stale flat fields.
+    fn single_hop_relationships_carry_exactly_one_evidence_path_with_one_hop() {
+        // A review's finding: a relationship's evidence must preserve
+        // every hop that established it, not collapse to a flat
+        // source/confidence -- single-hop tiers (everything
+        // derive_relationships produces) still carry exactly one path
+        // containing exactly one hop, named after the edge it came from,
+        // and pure-derived relationships are entirely defined by it, not a
+        // mix of stale flat fields.
         let entries = vec![entry(VerdictTier::ExactHash, 90)];
         let relationships = derive_relationships(&entries);
-        assert_eq!(relationships[0].evidence.len(), 1);
         assert_eq!(
-            relationships[0].evidence[0].relation,
+            relationships[0].evidence_paths.len(),
+            1,
+            "a single-hop tier must never branch into multiple paths"
+        );
+        assert_eq!(relationships[0].evidence_paths[0].len(), 1);
+        assert_eq!(
+            relationships[0].evidence_paths[0][0].relation,
             EvidenceRelation::ObservedInReport
         );
-        assert_eq!(relationships[0].evidence[0].source, "test-source");
-        assert_eq!(relationships[0].evidence[0].confidence, 90);
+        assert_eq!(relationships[0].evidence_paths[0][0].source, "test-source");
+        assert_eq!(relationships[0].evidence_paths[0][0].confidence, 90);
     }
 
     #[test]

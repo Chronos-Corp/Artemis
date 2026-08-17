@@ -45,48 +45,67 @@ const MAX_SCAN_BYTES: u64 = 256 * 1024 * 1024;
 /// character device can return far more data than `len()` ever reported,
 /// e.g. `/dev/zero`, which stats at 0 bytes but reads forever), and
 /// anything larger than `MAX_SCAN_BYTES`.
+///
+/// A round-7 review caught that the first version of this guard still had
+/// a TOCTOU: it `stat`'d the *path*, decided the target was safe, and only
+/// afterward opened the *path* again -- on a live filesystem the directory
+/// entry (or a followed symlink's target) can be swapped for a FIFO or
+/// device in between, and the bounded read never helps because the open
+/// itself can hang before any read is attempted. The fix is to validate
+/// the object actually opened, not a pre-open pathname snapshot: `open_regular`
+/// opens with `O_NONBLOCK` on Unix (a no-op for a regular file's
+/// subsequent reads, but it makes opening a FIFO return immediately
+/// instead of blocking for a writer, and a nonblocking open of most other
+/// special files also returns promptly rather than hanging), then this
+/// function `fstat`s that same open handle -- never a separate path stat
+/// -- to decide whether to proceed.
 pub async fn hash_and_read_file(pool: &PgPool, path: &Path) -> Result<(HashResult, Vec<u8>)> {
-    let meta = tokio::fs::metadata(path)
-        .await
-        .with_context(|| format!("stat {}", path.display()))?;
-
-    if !meta.is_file() {
-        anyhow::bail!(
-            "{} is not a regular file, refusing to read it for scanning (directories, FIFOs, \
-             device nodes, and other special files are all rejected)",
-            path.display()
-        );
-    }
-    if meta.len() > MAX_SCAN_BYTES {
-        anyhow::bail!(
-            "{} is {} bytes, larger than the {} byte limit for an atomic hash+scan snapshot; \
-             not scanned",
-            path.display(),
-            meta.len(),
-            MAX_SCAN_BYTES
-        );
-    }
-
-    let size = meta.len() as i64;
-    let mtime: DateTime<Utc> = meta
-        .modified()
-        .with_context(|| format!("mtime for {}", path.display()))?
-        .into();
     let path_str = path.to_string_lossy().to_string();
 
-    // Read and hash on tokio's blocking pool: synchronous file I/O and
-    // CPU-bound digesting, so a large file doesn't stall the worker thread
-    // other commands (directory listing, other verdict lookups) share.
+    // Opening, validating, and reading all happen on one blocking-pool
+    // task against one open file handle: synchronous file I/O, so it
+    // doesn't stall the async worker threads other commands share, and
+    // single-handle so there is no path-based recheck anywhere in this
+    // sequence for a TOCTOU to hide in.
     let path_owned = path.to_path_buf();
-    let data = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-        // `meta.len()` above is a stat() snapshot that can be stale by the
-        // time this actually runs -- a regular file can grow between the
-        // two -- so the read itself is independently bounded rather than
-        // trusting that earlier number alone. `take(MAX_SCAN_BYTES + 1)`
-        // (one byte over the limit) lets a file exactly at the limit read
-        // in full while still detecting one that has grown past it.
-        let file = std::fs::File::open(&path_owned)
-            .with_context(|| format!("open {}", path_owned.display()))?;
+    let (size, mtime, data) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let file =
+            open_regular(&path_owned).with_context(|| format!("open {}", path_owned.display()))?;
+
+        // fstat on the handle just opened -- the object actually being
+        // read, not a separate stat() of the path that could already
+        // describe something else by the time it's used.
+        let meta = file
+            .metadata()
+            .with_context(|| format!("fstat {}", path_owned.display()))?;
+        if !meta.is_file() {
+            anyhow::bail!(
+                "{} is not a regular file, refusing to read it for scanning (directories, \
+                 FIFOs, device nodes, and other special files are all rejected)",
+                path_owned.display()
+            );
+        }
+        if meta.len() > MAX_SCAN_BYTES {
+            anyhow::bail!(
+                "{} is {} bytes, larger than the {} byte limit for an atomic hash+scan \
+                 snapshot; not scanned",
+                path_owned.display(),
+                meta.len(),
+                MAX_SCAN_BYTES
+            );
+        }
+        let size = meta.len() as i64;
+        let mtime: DateTime<Utc> = meta
+            .modified()
+            .with_context(|| format!("mtime for {}", path_owned.display()))?
+            .into();
+
+        // `meta.len()` is still a snapshot that can be stale by the time
+        // the read below finishes -- a regular file can grow while it's
+        // being read -- so the read itself is independently bounded
+        // rather than trusting that number alone. `take(MAX_SCAN_BYTES +
+        // 1)` (one byte over the limit) lets a file exactly at the limit
+        // read in full while still detecting one that has grown past it.
         let mut buf = Vec::new();
         file.take(MAX_SCAN_BYTES + 1)
             .read_to_end(&mut buf)
@@ -98,7 +117,7 @@ pub async fn hash_and_read_file(pool: &PgPool, path: &Path) -> Result<(HashResul
                 MAX_SCAN_BYTES
             );
         }
-        Ok(buf)
+        Ok((size, mtime, buf))
     })
     .await
     .context("read task panicked")??;
@@ -106,6 +125,25 @@ pub async fn hash_and_read_file(pool: &PgPool, path: &Path) -> Result<(HashResul
 
     store_cache(pool, &path_str, size, mtime, &result).await?;
     Ok((result, data))
+}
+
+/// Opens `path` for reading, following symlinks (same as a plain `stat`)
+/// but never blocking indefinitely on a special file at the end of that
+/// resolution. `O_NONBLOCK` has no effect on a regular file's subsequent
+/// reads, so leaving it set for the caller's later `read_to_end` is safe
+/// once `fstat` has confirmed the handle really is a regular file.
+#[cfg(unix)]
+fn open_regular(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_regular(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
 }
 
 async fn store_cache(
@@ -223,6 +261,16 @@ mod tests {
     /// before any read is attempted (this test would hang forever on its
     /// own `open`+`read` otherwise, since nothing here ever writes to the
     /// FIFO).
+    ///
+    /// A round-7 review pointed out that the *original* fix still stat'd
+    /// the path and only rejected based on that stat before a separate
+    /// open -- since this FIFO already exists before `hash_and_read_file`
+    /// is ever called, that earlier version could also "pass" this test
+    /// without ever exercising its own open() call at all (the stat alone
+    /// was enough to reject). `open_regular_does_not_block_opening_a_fifo_with_no_writer`
+    /// below tests the open() call in isolation to close that gap; this
+    /// test remains as the end-to-end confirmation through the real
+    /// `hash_and_read_file` path.
     #[tokio::test]
     #[ignore]
     #[cfg(unix)]
@@ -251,6 +299,44 @@ mod tests {
         assert!(
             err.to_string().contains("not a regular file"),
             "expected a not-a-regular-file error, got: {err}"
+        );
+    }
+
+    /// Round 7 review finding: the previous fix validated a `stat()` of
+    /// the *path*, then separately `open()`'d the *path* again -- on a
+    /// live filesystem the directory entry (or a followed symlink's
+    /// target) can change in between, and a blocking `open()` on a FIFO
+    /// with no writer hangs regardless of what any earlier stat said. This
+    /// test exercises `open_regular` directly (no DB, no
+    /// `hash_and_read_file` wrapper) against a FIFO with no writer and no
+    /// data ever queued -- a plain `std::fs::File::open` here would hang
+    /// forever; `open_regular` must return immediately because it always
+    /// requests `O_NONBLOCK`, and the resulting handle must fstat as a
+    /// non-regular file so the caller rejects it without ever reading.
+    #[test]
+    #[cfg(unix)]
+    fn open_regular_does_not_block_opening_a_fifo_with_no_writer() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let fifo_path = dir.path().join("test.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo failed");
+
+        let start = std::time::Instant::now();
+        let file = open_regular(&fifo_path).expect(
+            "a nonblocking open of a FIFO with no writer should succeed immediately, not error",
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "open_regular blocked opening a FIFO instead of returning immediately"
+        );
+
+        let meta = file.metadata().expect("fstat the open handle");
+        assert!(
+            !meta.is_file(),
+            "a FIFO must not report as a regular file via fstat on the open handle"
         );
     }
 }

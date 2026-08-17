@@ -589,7 +589,7 @@ pub async fn malware_family_matches(
                 "This file's hash is attributed to a known malware family -- look for other \
                  variants, configs, payloads, and family-specific detections."
                     .to_string(),
-            evidence: vec![RelationshipEvidence {
+            evidence_paths: vec![vec![RelationshipEvidence {
                 relation: EvidenceRelation::AttributedToMalwareFamily,
                 source: r.source,
                 confidence: r.confidence,
@@ -603,7 +603,7 @@ pub async fn malware_family_matches(
                 detection_name: None,
                 rule_fingerprint: None,
                 timing: EvidenceTiming::Observed,
-            }],
+            }]],
         })
         .collect())
 }
@@ -730,8 +730,8 @@ pub(crate) async fn cve_matches_via_report(
 
     Ok(groups
         .into_iter()
-        .map(|(_, r, mut evidence)| {
-            evidence.push(RelationshipEvidence {
+        .map(|(_, r, parent_hops)| {
+            let cve_hop = RelationshipEvidence {
                 relation: EvidenceRelation::ReportReferencesCve,
                 source: r.cve_source,
                 confidence: r.cve_confidence,
@@ -745,7 +745,21 @@ pub(crate) async fn cve_matches_via_report(
                 detection_name: None,
                 rule_fingerprint: None,
                 timing: EvidenceTiming::Observed,
-            });
+            };
+            // One path per real parent observation, each ending at its
+            // own copy of the shared `cve_hop` -- a review caught that
+            // flattening every parent hop plus one shared tail into a
+            // single `Vec<RelationshipEvidence>` reads as one linear
+            // chain when a report observing this file under more than one
+            // hash (or via more than one source) actually produces
+            // several independent first hops converging on that one
+            // shared second hop. Each path here is a genuine, complete,
+            // independently-walkable file -> CVE chain, so a consumer
+            // never has to infer the branch from repeated `report_id`s.
+            let evidence_paths = parent_hops
+                .into_iter()
+                .map(|parent_hop| vec![parent_hop, cve_hop.clone()])
+                .collect();
             ThreatRelationship {
                 kind: RelationshipKind::Cve,
                 strength: RelationshipStrength::Contextual,
@@ -755,7 +769,7 @@ pub(crate) async fn cve_matches_via_report(
                      CVE assertion. Assess exposure and hunt for exploitation evidence before \
                      treating this as confirmed."
                     .to_string(),
-                evidence,
+                evidence_paths,
             }
         })
         .collect())
@@ -878,7 +892,7 @@ pub(crate) async fn cve_matches_via_detection(
                  evidence.",
                 r.detection_name
             ),
-            evidence: vec![
+            evidence_paths: vec![vec![
                 RelationshipEvidence {
                     relation: EvidenceRelation::DetectsIndicator,
                     source: observed_source.to_string(),
@@ -913,7 +927,7 @@ pub(crate) async fn cve_matches_via_detection(
                     },
                     timing: EvidenceTiming::Observed,
                 },
-            ],
+            ]],
         })
         .collect())
 }

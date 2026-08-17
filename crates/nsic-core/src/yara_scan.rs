@@ -188,18 +188,26 @@ impl YaraEngine {
 
 /// Extracts every `rule <identifier>` declaration from a YARA source file,
 /// for building `rule_fingerprints`. A lightweight lexer, not a real YARA
-/// grammar: strips `//` and `/* */` comments and `"..."` string literals
-/// first (replacing their contents with spaces, so surrounding token
-/// structure and line numbers survive), then scans the remaining
-/// identifier-like tokens for `rule` followed by its identifier. This
-/// deliberately does not try to handle YARA's `/regex/` literals -- a
-/// `rule` substring inside one would be a false positive, but regex
-/// literals only appear inside a `strings:` block, never adjacent to an
-/// actual `rule` keyword, so in practice this does not misfire on real
-/// rule files. A name this misses (unusual formatting an extractor bug
-/// doesn't handle) degrades to "version unknown" for that rule --
-/// `rule_fingerprint` returns `None`, treated as the wildcard by callers,
-/// not a hard failure.
+/// grammar: strips `//`/`/* */` comments, `"..."` string literals, and
+/// `/.../ ` regex literals first (replacing their contents with spaces, so
+/// surrounding token structure and line numbers survive), then scans the
+/// remaining identifier-like tokens for `rule` followed by its identifier.
+///
+/// A round-7 review caught a real false-positive in an earlier version of
+/// this function that did *not* strip regex literals: a YARA string
+/// pattern like `$r = /rule TargetRule/` is a completely ordinary,
+/// syntactically valid regex string definition, and the un-stripped
+/// `rule TargetRule` substring inside it was indistinguishable from a real
+/// declaration -- worse, since `rule_fingerprints` is a plain `HashMap`
+/// keyed by identifier, a false match in file B could silently overwrite
+/// the correct mapping for a same-named rule genuinely declared in file A,
+/// corrupting that rule's actual version identity. `strip_comments_and_strings`
+/// now also recognizes and blanks regex literals.
+///
+/// This is still a lexer, not a parser, so it remains best-effort on truly
+/// unusual formatting -- a name this misses degrades to "version unknown"
+/// for that rule, `rule_fingerprint` returning `None`, never a hard
+/// failure or a silently wrong identity.
 fn extract_rule_names(source: &str) -> Vec<String> {
     let cleaned = strip_comments_and_strings(source);
     let tokens: Vec<&str> = cleaned
@@ -219,63 +227,111 @@ fn extract_rule_names(source: &str) -> Vec<String> {
     names
 }
 
-/// Replaces the contents of `//`/`/* */` comments and `"..."` string
-/// literals with spaces, character-by-character (not byte-by-byte, to stay
-/// UTF-8 safe on non-ASCII string contents) so a `rule`-like substring
-/// inside a comment or a quoted string (e.g. a YARA string pattern
-/// containing the literal text "rule engine") can't be mistaken for an
-/// actual declaration by `extract_rule_names`.
+/// Replaces the contents of `//`/`/* */` comments, `"..."` string
+/// literals, and `/.../ ` regex literals with spaces, character-by-character
+/// (not byte-by-byte, to stay UTF-8 safe on non-ASCII content) so a
+/// `rule`-like substring inside any of them (a comment, a quoted string
+/// containing the literal text "rule engine", or -- the case a round-7
+/// review caught missing -- a regex pattern like `$r = /rule TargetRule/`)
+/// can't be mistaken for an actual declaration by `extract_rule_names`.
+///
+/// A bare `/` is *not* ambiguous in YARA the way it is in languages like
+/// JavaScript: YARA's arithmetic division operator is a backslash (`\`),
+/// specifically so that `/` can unconditionally mean "start of a regex
+/// literal" outside a comment or string -- confirmed empirically while
+/// fixing this (an earlier version of this function tried to disambiguate
+/// `/` division from `/` regex using a same-line heuristic; every test
+/// rule using `/` for arithmetic failed to compile with libyara's own
+/// "unterminated regular expression" error, which is libyara telling us
+/// `/` was never a valid division operator to begin with). So every `/`
+/// reaching this point that isn't the start of `//` or `/*` begins a
+/// regex literal, full stop.
 fn strip_comments_and_strings(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
     let mut chars = source.chars().peekable();
+
     while let Some(c) = chars.next() {
-        match c {
-            '/' if chars.peek() == Some(&'/') => {
-                chars.next();
-                out.push_str("  ");
-                for c2 in chars.by_ref() {
-                    if c2 == '\n' {
-                        out.push('\n');
-                        break;
-                    }
-                    out.push(' ');
+        if c == '/' && chars.peek() == Some(&'/') {
+            chars.next();
+            out.push_str("  ");
+            for c2 in chars.by_ref() {
+                if c2 == '\n' {
+                    out.push('\n');
+                    break;
                 }
-            }
-            '/' if chars.peek() == Some(&'*') => {
-                chars.next();
-                out.push_str("  ");
-                let mut prev = ' ';
-                for c2 in chars.by_ref() {
-                    if prev == '*' && c2 == '/' {
-                        out.push(' ');
-                        break;
-                    }
-                    out.push(if c2 == '\n' { '\n' } else { ' ' });
-                    prev = c2;
-                }
-            }
-            '"' => {
                 out.push(' ');
-                let mut escaped = false;
-                for c2 in chars.by_ref() {
-                    if escaped {
-                        escaped = false;
-                        out.push(' ');
-                        continue;
-                    }
-                    if c2 == '\\' {
-                        escaped = true;
-                        out.push(' ');
-                        continue;
-                    }
+            }
+            continue;
+        }
+        if c == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            out.push_str("  ");
+            let mut prev = ' ';
+            for c2 in chars.by_ref() {
+                if prev == '*' && c2 == '/' {
                     out.push(' ');
-                    if c2 == '"' {
-                        break;
-                    }
+                    break;
+                }
+                out.push(if c2 == '\n' { '\n' } else { ' ' });
+                prev = c2;
+            }
+            continue;
+        }
+        if c == '/' {
+            // Regex literal: blank up to the closing unescaped `/`, then
+            // any trailing single-letter modifiers (e.g. the `i` in
+            // `/foo/i`), which YARA allows immediately after with no
+            // separator.
+            out.push(' ');
+            let mut escaped = false;
+            for c2 in chars.by_ref() {
+                if escaped {
+                    escaped = false;
+                    out.push(' ');
+                    continue;
+                }
+                if c2 == '\\' {
+                    escaped = true;
+                    out.push(' ');
+                    continue;
+                }
+                out.push(' ');
+                if c2 == '/' {
+                    break;
                 }
             }
-            other => out.push(other),
+            while let Some(&next) = chars.peek() {
+                if next.is_ascii_alphabetic() {
+                    out.push(' ');
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            continue;
         }
+        if c == '"' {
+            out.push(' ');
+            let mut escaped = false;
+            for c2 in chars.by_ref() {
+                if escaped {
+                    escaped = false;
+                    out.push(' ');
+                    continue;
+                }
+                if c2 == '\\' {
+                    escaped = true;
+                    out.push(' ');
+                    continue;
+                }
+                out.push(' ');
+                if c2 == '"' {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
     }
     out
 }
@@ -445,5 +501,103 @@ mod tests {
     fn rule_fingerprint_is_unknown_for_a_rule_that_was_never_loaded() {
         let engine = YaraEngine::load(&bundled_rules_dir()).expect("load bundled yara rules");
         assert_eq!(engine.rule_fingerprint("NoSuchRule"), None);
+    }
+
+    /// Round 7 review finding: a YARA regex literal (`/pattern/`) inside
+    /// one file's `strings:` block can contain the literal text
+    /// `rule <identifier>` as ordinary pattern content -- a fully valid,
+    /// unremarkable regex definition, not an edge case. An earlier version
+    /// of `strip_comments_and_strings` didn't recognize regex literals at
+    /// all, so that text passed through unstripped and `extract_rule_names`
+    /// mistook it for a real declaration; since `rule_fingerprints` is a
+    /// plain `HashMap`, the decoy file's fingerprint then silently
+    /// overwrote the real rule's correct one. This reproduces the review's
+    /// exact scenario: `a_target.yar` genuinely declares `TargetRule`;
+    /// `z_decoy.yar` (sorted after it, so processed second and able to
+    /// overwrite) declares an unrelated `Decoy` rule whose only pattern is
+    /// the regex `/rule TargetRule/`.
+    #[test]
+    fn a_regex_literal_containing_rule_syntax_does_not_hijack_another_files_fingerprint() {
+        let dir = tempfile::tempdir().expect("create temp rules dir");
+        std::fs::write(
+            dir.path().join("a_target.yar"),
+            "rule TargetRule { condition: true }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("z_decoy.yar"),
+            "rule Decoy { strings: $r = /rule TargetRule/ condition: $r }",
+        )
+        .unwrap();
+
+        let engine = YaraEngine::load(dir.path()).expect("load rules");
+        assert_eq!(engine.rule_count, 2, "expected both rules to load");
+
+        let target_fp = engine
+            .rule_fingerprint("TargetRule")
+            .expect("TargetRule should have a fingerprint")
+            .to_string();
+        let target_file_fp = hex::encode(Sha256::digest(
+            std::fs::read(dir.path().join("a_target.yar")).unwrap(),
+        ));
+        assert_eq!(
+            target_fp, target_file_fp,
+            "TargetRule's fingerprint must be a_target.yar's own content hash, not \
+             z_decoy.yar's (which the regex literal could otherwise hijack it to)"
+        );
+
+        // Editing only the decoy's regex must not change TargetRule's
+        // fingerprint -- proves the hijack is closed in both directions,
+        // not just that the initial load happened to pick the right file.
+        std::fs::write(
+            dir.path().join("z_decoy.yar"),
+            "rule Decoy { strings: $r = /rule TargetRule CHANGED/ condition: $r }",
+        )
+        .unwrap();
+        let reloaded = YaraEngine::load(dir.path()).expect("reload rules");
+        assert_eq!(
+            reloaded.rule_fingerprint("TargetRule"),
+            Some(target_fp.as_str()),
+            "editing only the decoy's regex must not change TargetRule's fingerprint"
+        );
+
+        // Editing the real TargetRule file, conversely, must change its
+        // fingerprint even with the decoy regex still present and
+        // unchanged.
+        std::fs::write(
+            dir.path().join("a_target.yar"),
+            "rule TargetRule { condition: filesize > 0 }",
+        )
+        .unwrap();
+        let after_real_edit = YaraEngine::load(dir.path()).expect("reload rules again");
+        assert_ne!(
+            after_real_edit.rule_fingerprint("TargetRule"),
+            Some(target_fp.as_str()),
+            "editing TargetRule's real file must change its fingerprint"
+        );
+    }
+
+    /// Sanity check for the claim in `strip_comments_and_strings`'s doc
+    /// comment: YARA's real arithmetic division operator is a backslash
+    /// (`\`), not `/`, precisely so `/` can unambiguously mean "regex" --
+    /// discovered while building the round-7 fix, when a `/`-based
+    /// division test rule failed to compile with libyara's own
+    /// "unterminated regular expression" error. Confirms an ordinary rule
+    /// using real (backslash) division still compiles and gets a
+    /// fingerprint.
+    #[test]
+    fn a_rule_using_real_division_still_loads_and_fingerprints() {
+        let dir = tempfile::tempdir().expect("create temp rules dir");
+        std::fs::write(
+            dir.path().join("div.yar"),
+            "rule DivRule\n{\n    condition:\n        filesize \\ 2 > 0\n}\n",
+        )
+        .unwrap();
+        let engine = YaraEngine::load(dir.path()).expect("load rule using division");
+        assert_eq!(
+            engine.rule_count, 1,
+            "expected the division rule to compile and load"
+        );
+        assert!(engine.rule_fingerprint("DivRule").is_some());
     }
 }
