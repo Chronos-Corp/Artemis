@@ -147,8 +147,20 @@ export function VerdictPanel({
                       </div>
                     )}
                     <div className="provenance-dates">
-                      First seen {formatDate(entry.first_seen)}, last seen{" "}
-                      {formatDate(entry.last_seen)}
+                      {entry.timing === "received_only" ? (
+                        // Contextual entries have no backing evidence edge,
+                        // so there's no source-claimed observation window
+                        // to report -- only when Apollo itself received the
+                        // report the filename came from. Labeling this the
+                        // same as "first/last seen" would present receipt
+                        // time as though it were observation time.
+                        <>Report received {formatDate(entry.first_seen)}</>
+                      ) : (
+                        <>
+                          First seen {formatDate(entry.first_seen)}, last seen{" "}
+                          {formatDate(entry.last_seen)}
+                        </>
+                      )}
                     </div>
                   </div>
                 </li>

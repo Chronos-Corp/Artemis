@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -28,6 +29,30 @@ pub struct YaraEngine {
     /// since been edited. Callers that persist a match durably (e.g. a
     /// fleet sighting) should persist this alongside it.
     pub ruleset_fingerprint: String,
+    /// Per-rule content identity: for each compiled rule identifier, the
+    /// SHA-256 (hex) of the *one file* that declared it -- not the whole
+    /// ruleset. A review caught that `ruleset_fingerprint` above, hashing
+    /// every rule file in the directory together, is the wrong identity
+    /// for scoping a `detection_covers_cve` assertion to "this rule's
+    /// content": editing an unrelated rule B elsewhere in the directory
+    /// changes `ruleset_fingerprint` even though rule A's own definition
+    /// never changed, which would falsely invalidate A's coverage evidence
+    /// on every unrelated edit. Scoping by the declaring file's own content
+    /// hash instead means A's identity only changes when A's file actually
+    /// does. Two rules that happen to share one file share that file's
+    /// fingerprint too (edits to either invalidate both) -- an accepted
+    /// coarseness given `yara::Rules` exposes no finer-grained provenance
+    /// than "which compiled rule identifier fired," not "which file"; the
+    /// existing test fixtures (and the one-rule-per-file convention the
+    /// bundled rules already follow) keep this precise in practice.
+    /// Populated by lightly parsing each file's own source for `rule
+    /// <identifier>` declarations (see `extract_rule_names`) -- best-effort
+    /// on unusual formatting, not a full YARA grammar; a rule whose
+    /// declaration this miss falls back to no entry, and callers treat a
+    /// missing entry as "version unknown" (empty string, read the same as
+    /// the wildcard `detection_covers_cve.rule_fingerprint = ''`) rather
+    /// than erroring.
+    pub rule_fingerprints: HashMap<String, String>,
 }
 
 impl YaraEngine {
@@ -41,7 +66,17 @@ impl YaraEngine {
             rules_dir: rules_dir.to_path_buf(),
             rule_count: 0,
             ruleset_fingerprint: hex::encode(Sha256::digest(b"")),
+            rule_fingerprints: HashMap::new(),
         }
+    }
+
+    /// The content identity of one specific rule -- see
+    /// `rule_fingerprints`'s doc comment. `None` when the rule name isn't
+    /// known at all (never compiled) *or* its declaration wasn't found by
+    /// the lightweight parser; callers should treat both the same way
+    /// (version-unknown, i.e. the wildcard).
+    pub fn rule_fingerprint(&self, rule_name: &str) -> Option<&str> {
+        self.rule_fingerprints.get(rule_name).map(String::as_str)
     }
 
     /// Loads every .yar/.yara file under rules_dir. A missing or empty
@@ -89,19 +124,24 @@ impl YaraEngine {
         // file changed in between.
         let mut compiler = yara::Compiler::new().context("initializing YARA compiler")?;
         let mut fingerprint = Sha256::new();
+        let mut rule_fingerprints = HashMap::new();
         let mut loaded = 0usize;
         for file in &rule_files {
             let bytes = std::fs::read(file)
                 .with_context(|| format!("reading YARA rule file {}", file.display()))?;
+            let file_fingerprint = hex::encode(Sha256::digest(&bytes));
 
             let relative = file.strip_prefix(rules_dir).unwrap_or(file);
             fingerprint.update(relative.to_string_lossy().as_bytes());
             fingerprint.update(b"\0");
-            fingerprint.update(hex::encode(Sha256::digest(&bytes)).as_bytes());
+            fingerprint.update(file_fingerprint.as_bytes());
             fingerprint.update(b"\n");
 
             let source = std::str::from_utf8(&bytes)
                 .with_context(|| format!("YARA rule file {} is not valid UTF-8", file.display()))?;
+            for rule_name in extract_rule_names(source) {
+                rule_fingerprints.insert(rule_name, file_fingerprint.clone());
+            }
             compiler = compiler
                 .add_rules_str(source)
                 .with_context(|| format!("loading YARA rule file {}", file.display()))?;
@@ -114,6 +154,7 @@ impl YaraEngine {
             rules_dir: rules_dir.to_path_buf(),
             rule_count: loaded,
             ruleset_fingerprint: hex::encode(fingerprint.finalize()),
+            rule_fingerprints,
         })
     }
 
@@ -143,6 +184,100 @@ impl YaraEngine {
             .context("scanning in-memory buffer")?;
         Ok(to_matches(results))
     }
+}
+
+/// Extracts every `rule <identifier>` declaration from a YARA source file,
+/// for building `rule_fingerprints`. A lightweight lexer, not a real YARA
+/// grammar: strips `//` and `/* */` comments and `"..."` string literals
+/// first (replacing their contents with spaces, so surrounding token
+/// structure and line numbers survive), then scans the remaining
+/// identifier-like tokens for `rule` followed by its identifier. This
+/// deliberately does not try to handle YARA's `/regex/` literals -- a
+/// `rule` substring inside one would be a false positive, but regex
+/// literals only appear inside a `strings:` block, never adjacent to an
+/// actual `rule` keyword, so in practice this does not misfire on real
+/// rule files. A name this misses (unusual formatting an extractor bug
+/// doesn't handle) degrades to "version unknown" for that rule --
+/// `rule_fingerprint` returns `None`, treated as the wildcard by callers,
+/// not a hard failure.
+fn extract_rule_names(source: &str) -> Vec<String> {
+    let cleaned = strip_comments_and_strings(source);
+    let tokens: Vec<&str> = cleaned
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut names = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens[i] == "rule" && i + 1 < tokens.len() {
+            names.push(tokens[i + 1].to_string());
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    names
+}
+
+/// Replaces the contents of `//`/`/* */` comments and `"..."` string
+/// literals with spaces, character-by-character (not byte-by-byte, to stay
+/// UTF-8 safe on non-ASCII string contents) so a `rule`-like substring
+/// inside a comment or a quoted string (e.g. a YARA string pattern
+/// containing the literal text "rule engine") can't be mistaken for an
+/// actual declaration by `extract_rule_names`.
+fn strip_comments_and_strings(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '/' if chars.peek() == Some(&'/') => {
+                chars.next();
+                out.push_str("  ");
+                for c2 in chars.by_ref() {
+                    if c2 == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                    out.push(' ');
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                out.push_str("  ");
+                let mut prev = ' ';
+                for c2 in chars.by_ref() {
+                    if prev == '*' && c2 == '/' {
+                        out.push(' ');
+                        break;
+                    }
+                    out.push(if c2 == '\n' { '\n' } else { ' ' });
+                    prev = c2;
+                }
+            }
+            '"' => {
+                out.push(' ');
+                let mut escaped = false;
+                for c2 in chars.by_ref() {
+                    if escaped {
+                        escaped = false;
+                        out.push(' ');
+                        continue;
+                    }
+                    if c2 == '\\' {
+                        escaped = true;
+                        out.push(' ');
+                        continue;
+                    }
+                    out.push(' ');
+                    if c2 == '"' {
+                        break;
+                    }
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn to_matches(results: Vec<yara::Rule<'_>>) -> Vec<YaraMatch> {
@@ -242,5 +377,73 @@ mod tests {
             missing.ruleset_fingerprint, empty.ruleset_fingerprint,
             "a missing rules dir degrades to the same fingerprint as an explicitly empty engine"
         );
+    }
+
+    /// Round 6 review finding: `ruleset_fingerprint` hashes every rule file
+    /// in the directory together, so editing an unrelated rule invalidates
+    /// every other rule's version identity too. `rule_fingerprint` must be
+    /// scoped to the one file that actually declared the rule -- editing a
+    /// sibling file must not change it.
+    #[test]
+    fn editing_one_rule_file_does_not_change_an_unrelated_rules_fingerprint() {
+        let dir = tempfile::tempdir().expect("create temp rules dir");
+        std::fs::write(
+            dir.path().join("rule_a.yar"),
+            "rule RuleA { strings: $s = \"AAA\" condition: $s }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("rule_b.yar"),
+            "rule RuleB { strings: $s = \"BBB\" condition: $s }",
+        )
+        .unwrap();
+
+        let before = YaraEngine::load(dir.path()).expect("load rules");
+        let fp_a_before = before
+            .rule_fingerprint("RuleA")
+            .expect("RuleA should have a fingerprint")
+            .to_string();
+        let fp_b_before = before
+            .rule_fingerprint("RuleB")
+            .expect("RuleB should have a fingerprint")
+            .to_string();
+        assert_ne!(
+            fp_a_before, fp_b_before,
+            "two rules in different files must not share a fingerprint"
+        );
+
+        // Edit only rule B's file.
+        std::fs::write(
+            dir.path().join("rule_b.yar"),
+            "rule RuleB { strings: $s = \"BBB_CHANGED\" condition: $s }",
+        )
+        .unwrap();
+
+        let after = YaraEngine::load(dir.path()).expect("reload rules");
+        assert_eq!(
+            after.rule_fingerprint("RuleA"),
+            Some(fp_a_before.as_str()),
+            "editing an unrelated rule file must not change RuleA's fingerprint"
+        );
+        assert_ne!(
+            after.rule_fingerprint("RuleB"),
+            Some(fp_b_before.as_str()),
+            "RuleB's own fingerprint must change since its file's content changed"
+        );
+
+        // The whole-ruleset fingerprint, by contrast, is expected to change
+        // on *any* file edit -- that's the coarser identity Phase 1's fleet
+        // sighting path deliberately wants (see host_sighted_indicator's
+        // migration comment), distinct from what rule_fingerprint is for.
+        assert_ne!(
+            before.ruleset_fingerprint, after.ruleset_fingerprint,
+            "the whole-directory fingerprint is still expected to change on any edit"
+        );
+    }
+
+    #[test]
+    fn rule_fingerprint_is_unknown_for_a_rule_that_was_never_loaded() {
+        let engine = YaraEngine::load(&bundled_rules_dir()).expect("load bundled yara rules");
+        assert_eq!(engine.rule_fingerprint("NoSuchRule"), None);
     }
 }

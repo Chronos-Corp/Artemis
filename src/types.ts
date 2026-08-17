@@ -46,19 +46,27 @@ export type IndicatorKind =
   | "Domain"
   | "Ip";
 
+// Whether first_seen/last_seen below are a genuine observation window from
+// a backing edge ("observed"), or only when Apollo itself received the
+// underlying report ("received_only") -- see the matching Rust doc
+// comment on EvidenceTiming. Only Contextual entries are "received_only";
+// every other tier has real edge provenance to source a timestamp from.
+export type EvidenceTiming = "observed" | "received_only";
+
 export interface ProvenanceEntry {
   tier: VerdictTier;
   source: string;
   confidence: number;
   first_seen: string;
   last_seen: string;
+  timing: EvidenceTiming;
   report_id: string | null;
   report_title: string | null;
   report_url: string | null;
   detection_name: string | null;
   matched_value: string;
   indicator_kind: IndicatorKind | null;
-  ruleset_fingerprint: string | null;
+  rule_fingerprint: string | null;
 }
 
 export interface IntelSourceFreshness {
@@ -142,13 +150,20 @@ export interface RelationshipEvidence {
   confidence: number;
   first_seen: string;
   last_seen: string;
+  timing: EvidenceTiming;
   report_id: string | null;
   report_title: string | null;
   report_url: string | null;
   indicator_kind: IndicatorKind | null;
   indicator_value: string | null;
   detection_name: string | null;
-  ruleset_fingerprint: string | null;
+  // The specific rule content's fingerprint (see the Rust
+  // YaraEngine::rule_fingerprint doc comment) -- deliberately scoped per
+  // rule, not the whole compiled ruleset, so an unrelated rule's edit
+  // can't falsely invalidate this one's coverage. null is the edge's own
+  // true "applies to any rule version" wildcard value, never fabricated
+  // from whatever ruleset happens to be active during a later scan.
+  rule_fingerprint: string | null;
 }
 
 export interface ThreatRelationship {

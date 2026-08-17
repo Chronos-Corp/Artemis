@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 /// without depending on the desktop app. Re-exported here so existing
 /// `crate::models::X` call sites in this crate are unaffected.
 pub use nsic_core::models::{
-    derive_relationships, DetectionKind, EvidenceRelation, IndicatorKind, IntelSourceFreshness,
-    ProvenanceEntry, RelationshipEvidence, RelationshipKind, RelationshipStrength,
-    ThreatRelationship, Verdict, VerdictTier,
+    derive_relationships, DetectionKind, EvidenceRelation, EvidenceTiming, IndicatorKind,
+    IntelSourceFreshness, ProvenanceEntry, RelationshipEvidence, RelationshipKind,
+    RelationshipStrength, ThreatRelationship, Verdict, VerdictTier,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

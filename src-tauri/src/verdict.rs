@@ -95,14 +95,17 @@ pub async fn resolve(
     // is the local-miss-skips-the-round-trip path the agent model depends
     // on for instant clicks at fleet scale.
     //
-    // Only trusted when the filter itself is known valid (`!bloom_valid`
-    // forces the DB path unconditionally): a review caught that neither
-    // startup's nor `sync_feeds`'s bloom refresh propagated failure beyond
-    // a log warning, so an empty/stale filter could otherwise make a real
-    // match look like a clean miss. See `BloomState`'s doc comment.
-    let bloom_valid = bloom.is_valid();
-    let bloom_hit =
-        !bloom_valid || bloom.contains(&hash.sha256).await || bloom.contains(&hash.md5).await;
+    // Only trusted when the filter itself is known valid: a review caught
+    // that neither startup's nor `sync_feeds`'s bloom refresh propagated
+    // failure beyond a log warning, so an empty/stale filter could
+    // otherwise make a real match look like a clean miss. A single
+    // `check()` call covers both the validity check and the membership
+    // check under one lock acquisition -- see `BloomState`'s doc comment
+    // for the race a round-6 review caught in two separate calls.
+    let bloom_hit = !matches!(
+        bloom.check(&[&hash.sha256, &hash.md5]).await,
+        crate::bloom::LookupResult::Miss
+    );
     let mut dedicated_relationships = Vec::new();
     if bloom_hit {
         let sha_rows = db::hash_matches(pool, IndicatorKind::Sha256, &hash.sha256).await?;
@@ -159,6 +162,14 @@ pub async fn resolve(
             .contains(&hash.sha256, &hit.rule_name)
             .await
         {
+            // "" (the wildcard/version-unknown value, never fabricated as
+            // a real fingerprint) if the lightweight rule-declaration
+            // parser somehow missed this rule's own declaration -- see
+            // `YaraEngine::rule_fingerprints`'s doc comment. Should not
+            // happen for a rule that just matched (it had to have been
+            // compiled from a file that was scanned for declarations too),
+            // but degrades safely rather than panicking if it ever does.
+            let rule_fingerprint = yara.rule_fingerprint(&hit.rule_name).unwrap_or("");
             // Only marked seen *after* this succeeds -- see
             // `RecentYaraHits::mark_seen`'s doc comment for why persisting
             // first and caching second (not the other way around) matters.
@@ -167,7 +178,7 @@ pub async fn resolve(
                 bloom,
                 &hash.sha256,
                 &yara.rules_dir,
-                &yara.ruleset_fingerprint,
+                rule_fingerprint,
                 &hit.rule_name,
                 now,
             )
@@ -192,16 +203,34 @@ pub async fn resolve(
             confidence: LOCAL_YARA_CONFIDENCE,
             first_seen: now,
             last_seen: now,
+            timing: crate::models::EvidenceTiming::Observed,
             report_id: None,
             report_title: None,
             report_url: None,
             detection_name: Some(hit.rule_name.clone()),
             indicator_kind: Some(IndicatorKind::Sha256),
-            ruleset_fingerprint: Some(yara.ruleset_fingerprint.clone()),
+            // `None` (honestly "version unknown"), not fabricated, when
+            // the rule's own fingerprint couldn't be determined -- see the
+            // matching comment above this loop.
+            rule_fingerprint: yara.rule_fingerprint(&hit.rule_name).map(str::to_string),
             matched_value: hash.sha256.clone(),
         }));
     }
-    let current_rule_names: Vec<String> = yara_hits.iter().map(|h| h.rule_name.clone()).collect();
+
+    // Each rule that fired paired with *its own* content fingerprint (not
+    // one shared whole-ruleset value) -- see `cve_matches_via_detection`'s
+    // doc comment for why per-rule scoping matters.
+    let scanned_rules: Vec<(String, String)> = yara_hits
+        .iter()
+        .map(|h| {
+            (
+                h.rule_name.clone(),
+                yara.rule_fingerprint(&h.rule_name)
+                    .unwrap_or("")
+                    .to_string(),
+            )
+        })
+        .collect();
 
     // CVE-via-detection has to be checked *after* the YARA tier above, not
     // folded into the bloom-gated block before it: a review caught that on
@@ -221,20 +250,22 @@ pub async fn resolve(
     // knowledge (an exact-hash match from ingestion, say) and would let a
     // detection historically recorded for this hash surface a "matched
     // this exact file" CVE relationship even when zero rules fired in the
-    // current scan. `cve_matches_via_detection` is additionally scoped to
-    // `current_rule_names` and `yara.ruleset_fingerprint` -- see its doc
-    // comment for why a rule name alone isn't durable version identity.
-    // Report/family lookups don't need the same treatment since ingestion,
-    // not `resolve`, is the only thing that ever creates those edges.
+    // current scan. `cve_matches_via_detection` is additionally scoped per
+    // rule to `scanned_rules` -- see its doc comment for why a rule name
+    // alone isn't durable version identity, and why the whole-ruleset
+    // fingerprint isn't the right scope either. Report/family lookups
+    // don't need the same treatment since ingestion, not `resolve`, is the
+    // only thing that ever creates those edges.
     if !yara_hits.is_empty() {
         dedicated_relationships.extend(
             db::cve_matches_via_detection(
                 pool,
-                &current_rule_names,
-                &yara.ruleset_fingerprint,
+                &scanned_rules,
                 LOCAL_YARA_SOURCE,
                 LOCAL_YARA_CONFIDENCE,
                 now,
+                IndicatorKind::Sha256,
+                &hash.sha256,
             )
             .await?,
         );
@@ -288,7 +319,7 @@ async fn record_yara_hit(
     bloom: &BloomState,
     sha256: &str,
     rules_dir: &Path,
-    ruleset_fingerprint: &str,
+    rule_fingerprint: &str,
     rule_name: &str,
     now: DateTime<Utc>,
 ) -> Result<()> {
@@ -312,7 +343,7 @@ async fn record_yara_hit(
         LOCAL_YARA_CONFIDENCE,
         now,
         now,
-        Some(ruleset_fingerprint),
+        rule_fingerprint,
     )
     .await?;
 
@@ -957,7 +988,7 @@ mod tests {
             88,
             cve_first_seen,
             cve_last_seen,
-            None,
+            "",
         )
         .await
         .expect("seed detection covers cve");
@@ -1000,6 +1031,18 @@ mod tests {
              provenance (record_yara_hit's), not detection_covers_cve's"
         );
         assert_eq!(via_detection.evidence[0].confidence, 65);
+        // Round 6 review finding 3B: hop 1 must identify the indicator it
+        // detected -- `resolve()` knows the scanned hash, so this hop
+        // should never be a structurally incomplete
+        // `Detection --detects--> ???`.
+        assert_eq!(
+            via_detection.evidence[0].indicator_kind,
+            Some(IndicatorKind::Sha256)
+        );
+        assert_eq!(
+            via_detection.evidence[0].indicator_value,
+            Some(verdict_detection.sha256.clone())
+        );
         assert_eq!(
             via_detection.evidence[1].relation,
             crate::models::EvidenceRelation::DetectionCoversCve
@@ -1014,6 +1057,16 @@ mod tests {
         );
         assert_eq!(via_detection.evidence[1].first_seen, cve_first_seen);
         assert_eq!(via_detection.evidence[1].last_seen, cve_last_seen);
+        // Round 6 review finding 3A: this coverage edge was seeded with the
+        // wildcard ("" -> None) rule_fingerprint, meaning "applies to any
+        // version" -- hop 2 must preserve that true edge value, not
+        // fabricate the current scan's own fingerprint as though the edge
+        // had actually been asserted against it.
+        assert_eq!(
+            via_detection.evidence[1].rule_fingerprint, None,
+            "a wildcard coverage edge's evidence must stay a wildcard, not be presented as \
+             though asserted against the current scan's specific rule fingerprint"
+        );
         assert_eq!(
             via_detection.strength,
             crate::models::RelationshipStrength::Strong,
@@ -1086,7 +1139,7 @@ mod tests {
             80,
             now,
             now,
-            None,
+            "",
         )
         .await
         .expect("seed detection covers cve");
@@ -1225,6 +1278,48 @@ mod tests {
             "one report_references_cve edge must produce exactly one relationship, not one per \
              hash kind the file happens to have, got: {matches:?}"
         );
+
+        // Round 6 review finding 4: deduplicating the *relationship* must
+        // not come at the cost of discarding either hash's real supporting
+        // evidence -- both indicator_observed_in_report hops are genuine,
+        // independent facts (the report really did observe this file under
+        // both hash representations) and both must still be reconstructable
+        // from the evidence chain, not silently reduced to whichever one a
+        // `LIMIT 1` happened to prefer.
+        let observed_hops: Vec<_> = matches[0]
+            .evidence
+            .iter()
+            .filter(|e| e.relation == crate::models::EvidenceRelation::ObservedInReport)
+            .collect();
+        assert_eq!(
+            observed_hops.len(),
+            2,
+            "both the sha256 and md5 observed_in_report hops must be preserved as separate \
+             evidence, not collapsed to one, got: {:?}",
+            matches[0].evidence
+        );
+        assert!(
+            observed_hops
+                .iter()
+                .any(|e| e.indicator_value.as_deref() == Some(hash.sha256.as_str())),
+            "expected a hop for the sha256 observation, got: {observed_hops:?}"
+        );
+        assert!(
+            observed_hops
+                .iter()
+                .any(|e| e.indicator_value.as_deref() == Some(hash.md5.as_str())),
+            "expected a hop for the md5 observation, got: {observed_hops:?}"
+        );
+        assert_eq!(
+            matches[0]
+                .evidence
+                .iter()
+                .filter(|e| e.relation == crate::models::EvidenceRelation::ReportReferencesCve)
+                .count(),
+            1,
+            "the report_references_cve hop itself must still appear exactly once, got: {:?}",
+            matches[0].evidence
+        );
     }
 
     /// Review finding 3 (round 3): when two detections both matched a hash
@@ -1303,7 +1398,7 @@ mod tests {
             80,
             now,
             now,
-            None,
+            "",
         )
         .await
         .expect("seed detection B covers cve");
@@ -1754,7 +1849,7 @@ mod tests {
             50,
             now,
             now,
-            None,
+            "",
         )
         .await
         .expect("seed stale detection detects indicator");
@@ -1770,7 +1865,7 @@ mod tests {
             80,
             now,
             now,
-            None,
+            "",
         )
         .await
         .expect("seed stale detection covers cve");
@@ -1846,7 +1941,7 @@ mod tests {
             50,
             now,
             now,
-            None,
+            "",
         )
         .await
         .expect("seed stale detection detects indicator");
@@ -1913,7 +2008,10 @@ mod tests {
         let bloom = BloomState::empty();
         let recent_yara_hits = RecentYaraHits::new();
         assert!(
-            !bloom.is_valid(),
+            matches!(
+                bloom.check(&[]).await,
+                crate::bloom::LookupResult::FilterInvalid
+            ),
             "sanity: a fresh BloomState must start invalid"
         );
 
@@ -2037,7 +2135,8 @@ mod tests {
         let yara_v2 = Arc::new(YaraEngine::load(v2_dir.path()).expect("load v2 rules"));
 
         assert_ne!(
-            yara_v1.ruleset_fingerprint, yara_v2.ruleset_fingerprint,
+            yara_v1.rule_fingerprint(&rule_name),
+            yara_v2.rule_fingerprint(&rule_name),
             "sanity: different rule bodies must produce different fingerprints"
         );
 
@@ -2088,7 +2187,9 @@ mod tests {
             80,
             now,
             now,
-            Some(&yara_v1.ruleset_fingerprint),
+            yara_v1
+                .rule_fingerprint(&rule_name)
+                .expect("v1 rule should have a fingerprint"),
         )
         .await
         .expect("seed detection covers cve scoped to v1");

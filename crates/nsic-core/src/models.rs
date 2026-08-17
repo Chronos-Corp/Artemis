@@ -49,6 +49,29 @@ pub enum VerdictTier {
     Contextual,
 }
 
+/// What a `first_seen`/`last_seen` pair actually means. Every edge table
+/// this codebase reads from (`indicator_observed_in_report`,
+/// `detection_detects_indicator`, `report_references_cve`,
+/// `detection_covers_cve`, `indicator_attributed_to_malware_family`)
+/// carries a genuine claimed observation window -- when the asserting
+/// source first/last said this fact was true -- so entries built from one
+/// of those are `Observed`. `Contextual` (a filename match against
+/// `report.raw`) has no backing edge at all, so there is no observation
+/// window to report; a review caught an earlier version fabricating one
+/// with `Utc::now()` at lookup time, then a later one silently relabeling
+/// the report's own `ingested_at` (when Apollo *received* the report) as
+/// though it were first/last-seen observation timing -- receipt time and
+/// observation time are different facts, and a generic consumer (PR #20's
+/// hunt engine, an analyst reading the UI) cannot tell them apart from the
+/// timestamp value alone. `ReceivedOnly` makes that distinction explicit
+/// on the wire instead of overloading one field name for two meanings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceTiming {
+    Observed,
+    ReceivedOnly,
+}
+
 /// A single piece of evidence backing a verdict. One file can accumulate
 /// several of these across tiers and sources; the UI shows all of them
 /// rather than collapsing to one number.
@@ -70,9 +93,15 @@ pub struct ProvenanceEntry {
     /// `derive_relationships` so a hop records which specific indicator it
     /// used, not just the value -- see `RelationshipEvidence::indicator_kind`.
     pub indicator_kind: Option<IndicatorKind>,
-    /// Which compiled ruleset produced this entry, for `YaraHit` only --
-    /// see `RelationshipEvidence::ruleset_fingerprint`.
-    pub ruleset_fingerprint: Option<String>,
+    /// Which specific rule's content produced this entry, for `YaraHit`
+    /// only -- see `RelationshipEvidence::rule_fingerprint`.
+    pub rule_fingerprint: Option<String>,
+    /// Whether `first_seen`/`last_seen` above are a genuine observation
+    /// window from a backing edge (`Observed`, the default for every
+    /// tier with real edge provenance), or merely when Apollo itself
+    /// received the underlying report (`ReceivedOnly`, used only by
+    /// `Contextual` -- see `EvidenceTiming`'s doc comment).
+    pub timing: EvidenceTiming,
 }
 
 /// How current the local copy of one intel feed is, as of the moment a
@@ -227,16 +256,29 @@ pub struct RelationshipEvidence {
     /// The detection this hop traverses, for detection-backed relations
     /// (`DetectsIndicator`, `DetectionCoversCve`).
     pub detection_name: Option<String>,
-    /// Which compiled ruleset (see `YaraEngine::ruleset_fingerprint`)
+    /// Which specific rule content (see `YaraEngine::rule_fingerprint` --
+    /// the hash of the one file that declared this rule, deliberately
+    /// *not* `YaraEngine::ruleset_fingerprint`'s whole-directory hash, a
+    /// round-6 review caught the whole-ruleset value as the wrong scope:
+    /// editing an unrelated rule elsewhere in the directory would
+    /// otherwise falsely invalidate this rule's own unchanged coverage)
     /// produced this hop, for detection-backed relations. A rule's name
     /// alone can't reconstruct what it actually checked for once the rule
     /// file has since been edited -- a review caught that a
     /// `detection_covers_cve` edge attached to a `(kind, name)` detection
     /// row could otherwise silently keep applying across rule-content
-    /// revisions. `None` on a `detection_covers_cve` hop is read as
-    /// "applies to any ruleset version" (no real ingestion writes this
-    /// table yet to assert otherwise).
-    pub ruleset_fingerprint: Option<String>,
+    /// revisions. `None` on a `detection_covers_cve` hop is the edge's own
+    /// true stored value, read as "applies to any rule version" -- always
+    /// the actual DB value, never fabricated from the current scan's own
+    /// fingerprint (a round-6 review caught an earlier version doing
+    /// exactly that: presenting a wildcard/unscoped edge as though it were
+    /// asserted against the current ruleset).
+    pub rule_fingerprint: Option<String>,
+    /// See `EvidenceTiming`'s doc comment -- whether `first_seen`/
+    /// `last_seen` above are a genuine observation window or only Apollo's
+    /// own receipt time. `Observed` for every hop with real edge
+    /// provenance (every relation except `ContextualFilenameMatch`).
+    pub timing: EvidenceTiming,
 }
 
 /// A single structured relationship between a file and a threat concept --
@@ -306,7 +348,8 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
                 indicator_kind: entry.indicator_kind,
                 indicator_value: entry.indicator_kind.map(|_| entry.matched_value.clone()),
                 detection_name: entry.detection_name.clone(),
-                ruleset_fingerprint: entry.ruleset_fingerprint.clone(),
+                rule_fingerprint: entry.rule_fingerprint.clone(),
+                timing: entry.timing,
             }]
         };
 
@@ -408,7 +451,8 @@ mod tests {
             detection_name: Some("Test_Rule".to_string()),
             matched_value: "deadbeef".to_string(),
             indicator_kind: Some(IndicatorKind::Sha256),
-            ruleset_fingerprint: None,
+            rule_fingerprint: None,
+            timing: EvidenceTiming::Observed,
         }
     }
 
@@ -498,6 +542,30 @@ mod tests {
         );
         assert_eq!(relationships[0].kind, RelationshipKind::RiskBased);
         assert_eq!(relationships[0].strength, RelationshipStrength::Weak);
+    }
+
+    #[test]
+    fn timing_propagates_from_provenance_entry_into_the_evidence_hop() {
+        // Round 6 review finding: a contextual match's timestamps are only
+        // Apollo's own receipt time (no backing edge to source an
+        // observation window from), and that distinction must survive into
+        // the wire-level RelationshipEvidence, not just ProvenanceEntry --
+        // PR #20 and the UI both read the relationship layer, not the raw
+        // entries.
+        let mut contextual = entry(VerdictTier::Contextual, 25);
+        contextual.timing = EvidenceTiming::ReceivedOnly;
+        let relationships = derive_relationships(&[contextual]);
+        assert_eq!(
+            relationships[0].evidence[0].timing,
+            EvidenceTiming::ReceivedOnly
+        );
+
+        let exact_hash = entry(VerdictTier::ExactHash, 90);
+        let relationships = derive_relationships(&[exact_hash]);
+        assert_eq!(
+            relationships[0].evidence[0].timing,
+            EvidenceTiming::Observed
+        );
     }
 
     #[test]

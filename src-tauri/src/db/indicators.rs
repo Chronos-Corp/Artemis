@@ -5,8 +5,9 @@ use sqlx::{PgExecutor, PgPool};
 use uuid::Uuid;
 
 use crate::models::{
-    DetectionKind, EvidenceRelation, IndicatorKind, IntelSourceFreshness, ProvenanceEntry,
-    RelationshipEvidence, RelationshipKind, RelationshipStrength, ThreatRelationship, VerdictTier,
+    DetectionKind, EvidenceRelation, EvidenceTiming, IndicatorKind, IntelSourceFreshness,
+    ProvenanceEntry, RelationshipEvidence, RelationshipKind, RelationshipStrength,
+    ThreatRelationship, VerdictTier,
 };
 
 /// Returns (report_id, was_inserted). was_inserted uses the `xmax = 0` trick
@@ -243,6 +244,15 @@ pub async fn upsert_report_references_cve(
 /// `verdict.rs`'s live regression test proving `cve_matches_via_detection`
 /// preserves this edge's own provenance rather than the parent
 /// `detection_detects_indicator` edge's.
+///
+/// `rule_fingerprint` is `""` for "applies to any rule version" (the
+/// permissive wildcard, since no real ingestion writes this table yet to
+/// assert a specific one), never `Option` -- see migration `0010`'s
+/// comment for why the column itself is `NOT NULL DEFAULT ''` and part of
+/// the primary key: a round-6 review caught the original nullable,
+/// non-key version silently merging (and losing) separate version
+/// histories on conflict, since two different rule-content versions of
+/// the same `(detection_id, cve_id, source)` upserted into the same row.
 #[allow(clippy::too_many_arguments, dead_code)]
 pub async fn upsert_detection_covers_cve(
     pool: &PgPool,
@@ -252,18 +262,17 @@ pub async fn upsert_detection_covers_cve(
     confidence: i16,
     first_seen: DateTime<Utc>,
     last_seen: DateTime<Utc>,
-    ruleset_fingerprint: Option<&str>,
+    rule_fingerprint: &str,
 ) -> Result<()> {
     sqlx::query!(
         r#"
         INSERT INTO detection_covers_cve
-            (detection_id, cve_id, source, confidence, first_seen, last_seen, ruleset_fingerprint)
+            (detection_id, cve_id, source, confidence, first_seen, last_seen, rule_fingerprint)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT (detection_id, cve_id, source) DO UPDATE SET
+        ON CONFLICT (detection_id, cve_id, source, rule_fingerprint) DO UPDATE SET
             confidence = EXCLUDED.confidence,
             first_seen = LEAST(detection_covers_cve.first_seen, EXCLUDED.first_seen),
-            last_seen = GREATEST(detection_covers_cve.last_seen, EXCLUDED.last_seen),
-            ruleset_fingerprint = EXCLUDED.ruleset_fingerprint
+            last_seen = GREATEST(detection_covers_cve.last_seen, EXCLUDED.last_seen)
         "#,
         detection_id,
         cve_id,
@@ -271,7 +280,7 @@ pub async fn upsert_detection_covers_cve(
         confidence,
         first_seen,
         last_seen,
-        ruleset_fingerprint,
+        rule_fingerprint,
     )
     .execute(pool)
     .await?;
@@ -306,6 +315,9 @@ pub async fn upsert_detection(
     Ok(rec)
 }
 
+/// `rule_fingerprint` is `""` for "applies to any rule version" -- see
+/// `upsert_detection_covers_cve`'s doc comment for why this is a plain
+/// `&str`, not `Option`, and part of the conflict target.
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert_detection_detects_indicator(
     pool: &PgPool,
@@ -315,18 +327,17 @@ pub async fn upsert_detection_detects_indicator(
     confidence: i16,
     first_seen: DateTime<Utc>,
     last_seen: DateTime<Utc>,
-    ruleset_fingerprint: Option<&str>,
+    rule_fingerprint: &str,
 ) -> Result<()> {
     sqlx::query!(
         r#"
         INSERT INTO detection_detects_indicator
-            (detection_id, indicator_id, source, confidence, first_seen, last_seen, ruleset_fingerprint)
+            (detection_id, indicator_id, source, confidence, first_seen, last_seen, rule_fingerprint)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT (detection_id, indicator_id, source) DO UPDATE SET
+        ON CONFLICT (detection_id, indicator_id, source, rule_fingerprint) DO UPDATE SET
             confidence = EXCLUDED.confidence,
             first_seen = LEAST(detection_detects_indicator.first_seen, EXCLUDED.first_seen),
-            last_seen = GREATEST(detection_detects_indicator.last_seen, EXCLUDED.last_seen),
-            ruleset_fingerprint = EXCLUDED.ruleset_fingerprint
+            last_seen = GREATEST(detection_detects_indicator.last_seen, EXCLUDED.last_seen)
         "#,
         detection_id,
         indicator_id,
@@ -334,7 +345,7 @@ pub async fn upsert_detection_detects_indicator(
         confidence,
         first_seen,
         last_seen,
-        ruleset_fingerprint,
+        rule_fingerprint,
     )
     .execute(pool)
     .await?;
@@ -485,7 +496,8 @@ pub fn hash_matches_to_provenance(
             report_url: r.report_url,
             detection_name: None,
             indicator_kind: Some(kind),
-            ruleset_fingerprint: None,
+            rule_fingerprint: None,
+            timing: EvidenceTiming::Observed,
             matched_value: r.matched_value,
         })
         .collect()
@@ -589,7 +601,8 @@ pub async fn malware_family_matches(
                 indicator_kind: Some(r.indicator_kind),
                 indicator_value: Some(r.indicator_value),
                 detection_name: None,
-                ruleset_fingerprint: None,
+                rule_fingerprint: None,
+                timing: EvidenceTiming::Observed,
             }],
         })
         .collect())
@@ -626,15 +639,24 @@ struct CveViaReportRow {
 /// `Contextual` specifically to keep this two-hop inference honest,
 /// distinct from the one-hop `cve_matches_via_detection` case below.
 ///
-/// Anchored on `report_references_cve` (not `indicator`), with a `LATERAL`
-/// join picking exactly one supporting `indicator_observed_in_report` row
-/// per CVE edge: a review caught the previous indicator-anchored version
-/// returning the *same* CVE edge twice whenever a report observed both the
-/// file's sha256 *and* md5 (as MalwareBazaar's ingestion does) -- one real
-/// `report -> cve` assertion was surfacing as two conceptual relationships
-/// just because the file has two hash representations. Preferring the
-/// sha256-backed row when both exist keeps the choice deterministic rather
-/// than arbitrary.
+/// Anchored on `report_references_cve` (not `indicator`): a review caught
+/// the original indicator-anchored version returning the *same* CVE edge
+/// twice whenever a report observed both the file's sha256 *and* md5 (as
+/// MalwareBazaar's ingestion does) -- one real `report -> cve` assertion
+/// was surfacing as two conceptual relationships just because the file has
+/// two hash representations. A follow-up round-6 review caught that the
+/// fix for *that* (a `LATERAL ... LIMIT 1` picking exactly one supporting
+/// parent row) went too far the other way: it stopped the relationship
+/// from duplicating by *discarding* whichever parent hop it didn't pick,
+/// even when both were real, independently-sourced evidence (e.g. the
+/// report legitimately observed both hash kinds, or two different sources
+/// both reported the same indicator into the same report). The relationship
+/// itself must be deduplicated (one row per real `report_references_cve`
+/// edge); its supporting evidence must not be -- every matching
+/// `indicator_observed_in_report` row becomes its own `ObservedInReport`
+/// evidence hop, grouped under the one relationship its `report_references_cve`
+/// edge belongs to, ordered sha256-then-md5 and most-recent-first within a
+/// kind for determinism.
 ///
 /// `pub(crate)` rather than private: `verdict::resolve` calls this and
 /// `cve_matches_via_detection` separately rather than through a combined
@@ -658,24 +680,18 @@ pub(crate) async fn cve_matches_via_report(
             r.id AS report_id,
             r.title AS report_title,
             r.url AS report_url,
-            parent.source AS "parent_source!",
-            parent.confidence AS "parent_confidence!",
-            parent.first_seen AS "parent_first_seen!",
-            parent.last_seen AS "parent_last_seen!",
-            parent.indicator_kind AS "parent_indicator_kind!: IndicatorKind",
-            parent.indicator_value AS "parent_indicator_value!"
+            iorr.source AS parent_source,
+            iorr.confidence AS parent_confidence,
+            iorr.first_seen AS parent_first_seen,
+            iorr.last_seen AS parent_last_seen,
+            i.kind AS "parent_indicator_kind: IndicatorKind",
+            i.value AS parent_indicator_value
         FROM report_references_cve rrc
         JOIN report r ON r.id = rrc.report_id
-        JOIN LATERAL (
-            SELECT iorr.source, iorr.confidence, iorr.first_seen, iorr.last_seen,
-                   i.kind AS indicator_kind, i.value AS indicator_value
-            FROM indicator_observed_in_report iorr
-            JOIN indicator i ON i.id = iorr.indicator_id
-            WHERE iorr.report_id = r.id
-              AND ((i.kind = 'sha256' AND i.value = $1) OR (i.kind = 'md5' AND i.value = $2))
-            ORDER BY (i.kind = 'sha256') DESC, iorr.last_seen DESC
-            LIMIT 1
-        ) parent ON true
+        JOIN indicator_observed_in_report iorr ON iorr.report_id = r.id
+        JOIN indicator i ON i.id = iorr.indicator_id
+        WHERE (i.kind = 'sha256' AND i.value = $1) OR (i.kind = 'md5' AND i.value = $2)
+        ORDER BY rrc.cve_id, rrc.source, (i.kind = 'sha256') DESC, iorr.last_seen DESC
         "#,
         sha256,
         md5,
@@ -683,48 +699,64 @@ pub(crate) async fn cve_matches_via_report(
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
+    // Group by the specific report_references_cve edge each row's parent
+    // hop supports -- (report_id, cve_id, cve_source) identifies exactly
+    // one such edge, since that's its own primary key. Every row in a
+    // group shares the same CVE-edge fields; only the parent hop differs.
+    type CveGroupKey = (Uuid, String, String);
+    let mut groups: Vec<(CveGroupKey, CveViaReportRow, Vec<RelationshipEvidence>)> = Vec::new();
+    for r in rows {
+        let key = (r.report_id, r.cve_id.clone(), r.cve_source.clone());
+        let parent_hop = RelationshipEvidence {
+            relation: EvidenceRelation::ObservedInReport,
+            source: r.parent_source.clone(),
+            confidence: r.parent_confidence,
+            first_seen: r.parent_first_seen,
+            last_seen: r.parent_last_seen,
+            report_id: Some(r.report_id),
+            report_title: r.report_title.clone(),
+            report_url: r.report_url.clone(),
+            indicator_kind: Some(r.parent_indicator_kind),
+            indicator_value: Some(r.parent_indicator_value.clone()),
+            detection_name: None,
+            rule_fingerprint: None,
+            timing: EvidenceTiming::Observed,
+        };
+        match groups.iter_mut().find(|(k, ..)| *k == key) {
+            Some((_, _, hops)) => hops.push(parent_hop),
+            None => groups.push((key, r, vec![parent_hop])),
+        }
+    }
+
+    Ok(groups
         .into_iter()
-        .map(|r| ThreatRelationship {
-            kind: RelationshipKind::Cve,
-            strength: RelationshipStrength::Contextual,
-            target: r.cve_id,
-            explanation:
-                "This file was observed in a report that also references a CVE -- an inferred \
-                 association through report co-occurrence, not a direct per-file CVE assertion. \
-                 Assess exposure and hunt for exploitation evidence before treating this as \
-                 confirmed."
+        .map(|(_, r, mut evidence)| {
+            evidence.push(RelationshipEvidence {
+                relation: EvidenceRelation::ReportReferencesCve,
+                source: r.cve_source,
+                confidence: r.cve_confidence,
+                first_seen: r.cve_first_seen,
+                last_seen: r.cve_last_seen,
+                report_id: Some(r.report_id),
+                report_title: r.report_title,
+                report_url: r.report_url,
+                indicator_kind: None,
+                indicator_value: None,
+                detection_name: None,
+                rule_fingerprint: None,
+                timing: EvidenceTiming::Observed,
+            });
+            ThreatRelationship {
+                kind: RelationshipKind::Cve,
+                strength: RelationshipStrength::Contextual,
+                target: r.cve_id,
+                explanation: "This file was observed in a report that also references a CVE -- an \
+                     inferred association through report co-occurrence, not a direct per-file \
+                     CVE assertion. Assess exposure and hunt for exploitation evidence before \
+                     treating this as confirmed."
                     .to_string(),
-            evidence: vec![
-                RelationshipEvidence {
-                    relation: EvidenceRelation::ObservedInReport,
-                    source: r.parent_source,
-                    confidence: r.parent_confidence,
-                    first_seen: r.parent_first_seen,
-                    last_seen: r.parent_last_seen,
-                    report_id: Some(r.report_id),
-                    report_title: r.report_title.clone(),
-                    report_url: r.report_url.clone(),
-                    indicator_kind: Some(r.parent_indicator_kind),
-                    indicator_value: Some(r.parent_indicator_value),
-                    detection_name: None,
-                    ruleset_fingerprint: None,
-                },
-                RelationshipEvidence {
-                    relation: EvidenceRelation::ReportReferencesCve,
-                    source: r.cve_source,
-                    confidence: r.cve_confidence,
-                    first_seen: r.cve_first_seen,
-                    last_seen: r.cve_last_seen,
-                    report_id: Some(r.report_id),
-                    report_title: r.report_title,
-                    report_url: r.report_url,
-                    indicator_kind: None,
-                    indicator_value: None,
-                    detection_name: None,
-                    ruleset_fingerprint: None,
-                },
-            ],
+                evidence,
+            }
         })
         .collect())
 }
@@ -736,6 +768,15 @@ struct CveViaDetectionRow {
     cve_first_seen: DateTime<Utc>,
     cve_last_seen: DateTime<Utc>,
     detection_name: String,
+    /// The *scanning rule's* current fingerprint (from the `scan` unnest
+    /// below), used for hop 1 -- always concrete, since hop 1 describes
+    /// what just happened in this live scan.
+    scan_rule_fingerprint: String,
+    /// The *coverage edge's own* stored fingerprint, used for hop 2 --
+    /// `""` is the edge's genuine "applies to any version" wildcard value,
+    /// preserved as-is rather than replaced with the current scan's
+    /// fingerprint. See the function doc comment, finding 3A.
+    edge_rule_fingerprint: String,
 }
 
 /// CVE relationships from a detection that fired against this *exact*
@@ -749,38 +790,57 @@ struct CveViaDetectionRow {
 ///
 /// Unlike the report path, hop 1 (`detects_indicator`) is *not*
 /// reconstructed from the database at all: `verdict::resolve` supplies it
-/// directly as `observed_at`, using `LOCAL_YARA_SOURCE`/
-/// `LOCAL_YARA_CONFIDENCE` -- the exact values it just persisted via
-/// `record_yara_hit` for this same scan. A review caught that reading it
-/// back via `ORDER BY ddi.last_seen DESC LIMIT 1` could select a different
-/// source's historical row for the same (detection, indicator) pair rather
-/// than the observation that just occurred; the live scan's own result is
-/// the one thing that cannot be stale or mis-attributed.
+/// directly as `observed_at`/`indicator_kind`/`indicator_value`, using
+/// `LOCAL_YARA_SOURCE`/`LOCAL_YARA_CONFIDENCE` -- the exact values it just
+/// persisted via `record_yara_hit` for this same scan. A review caught
+/// that reading it back via `ORDER BY ddi.last_seen DESC LIMIT 1` could
+/// select a different source's historical row for the same (detection,
+/// indicator) pair rather than the observation that just occurred; a
+/// follow-up round-6 review separately caught that this hop, even once
+/// fixed to use the live scan's own values, still omitted the indicator
+/// identity (`indicator_kind`/`indicator_value`) it obviously has
+/// available -- `indicator_kind`/`indicator_value` here are the caller's
+/// same scanned-hash values, so this hop is complete rather than a
+/// structurally-incomplete `Detection --detects--> ???`.
 ///
-/// `rule_names` restricts this to detections that actually fired in the
+/// `scanned_rules` restricts this to detections that actually fired in the
 /// *current* scan -- a review caught that without this filter, a hash
 /// already known to the bloom filter (from an unrelated earlier hash
 /// match, not this scan's YARA pass) could surface a CVE relationship
 /// whose explanation claims a detection "matched this exact file" when
-/// zero rules actually fired this scan.
+/// zero rules actually fired this scan. Each `(rule_name, rule_fingerprint)`
+/// pair is matched by name *and* scoped by that specific rule's own content
+/// fingerprint (see `YaraEngine::rule_fingerprint`) -- deliberately per
+/// rule, not one shared whole-ruleset value: a round-6 review caught an
+/// earlier version scoping by the whole compiled ruleset's fingerprint,
+/// which meant editing an entirely unrelated rule elsewhere in the
+/// directory would falsely invalidate *this* rule's own unchanged CVE
+/// coverage. `dcc.rule_fingerprint = '' OR dcc.rule_fingerprint = <this
+/// rule's own current fingerprint>` excludes only a coverage edge asserted
+/// against a genuinely different *content* of this same-named rule.
 ///
-/// `ruleset_fingerprint` additionally excludes any `detection_covers_cve`
-/// edge asserted against a *different* compiled ruleset than the one that
-/// just fired: `detection` rows are keyed by `(kind, name)`, so editing a
-/// rule's body while keeping its name reuses the same row, and a coverage
-/// edge attached to that row would otherwise silently carry over across
-/// rule-content revisions it was never actually asserted against. `NULL`
-/// on the edge is read as "applies to any version" (no real ingestion
-/// writes this table yet to assert a specific one).
+/// Hop 2's `rule_fingerprint` is the coverage edge's own stored value
+/// (`""` mapped to `None`, its real "applies to any version" meaning),
+/// never the current scan's fingerprint -- a round-6 review caught an
+/// earlier version presenting a wildcard/unscoped edge's evidence as
+/// though it had been asserted specifically against the rule that just
+/// fired, which is provenance fabrication: the edge never said that.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn cve_matches_via_detection(
     pool: &PgPool,
-    rule_names: &[String],
-    ruleset_fingerprint: &str,
+    scanned_rules: &[(String, String)],
     observed_source: &str,
     observed_confidence: i16,
     observed_at: DateTime<Utc>,
+    indicator_kind: IndicatorKind,
+    indicator_value: &str,
 ) -> Result<Vec<ThreatRelationship>> {
+    if scanned_rules.is_empty() {
+        return Ok(vec![]);
+    }
+    let rule_names: Vec<String> = scanned_rules.iter().map(|(n, _)| n.clone()).collect();
+    let rule_fingerprints: Vec<String> = scanned_rules.iter().map(|(_, f)| f.clone()).collect();
+
     let rows = sqlx::query_as!(
         CveViaDetectionRow,
         r#"
@@ -790,14 +850,18 @@ pub(crate) async fn cve_matches_via_detection(
             dcc.confidence AS cve_confidence,
             dcc.first_seen AS cve_first_seen,
             dcc.last_seen AS cve_last_seen,
-            d.name AS detection_name
+            d.name AS detection_name,
+            scan.rule_fingerprint AS "scan_rule_fingerprint!",
+            dcc.rule_fingerprint AS edge_rule_fingerprint
         FROM detection_covers_cve dcc
         JOIN detection d ON d.id = dcc.detection_id
-        WHERE d.kind = 'yara' AND d.name = ANY($1)
-          AND (dcc.ruleset_fingerprint IS NULL OR dcc.ruleset_fingerprint = $2)
+        JOIN UNNEST($1::text[], $2::text[]) AS scan(rule_name, rule_fingerprint)
+            ON scan.rule_name = d.name
+        WHERE d.kind = 'yara'
+          AND (dcc.rule_fingerprint = '' OR dcc.rule_fingerprint = scan.rule_fingerprint)
         "#,
-        rule_names,
-        ruleset_fingerprint,
+        &rule_names,
+        &rule_fingerprints,
     )
     .fetch_all(pool)
     .await?;
@@ -824,10 +888,11 @@ pub(crate) async fn cve_matches_via_detection(
                     report_id: None,
                     report_title: None,
                     report_url: None,
-                    indicator_kind: None,
-                    indicator_value: None,
+                    indicator_kind: Some(indicator_kind),
+                    indicator_value: Some(indicator_value.to_string()),
                     detection_name: Some(r.detection_name.clone()),
-                    ruleset_fingerprint: Some(ruleset_fingerprint.to_string()),
+                    rule_fingerprint: Some(r.scan_rule_fingerprint),
+                    timing: EvidenceTiming::Observed,
                 },
                 RelationshipEvidence {
                     relation: EvidenceRelation::DetectionCoversCve,
@@ -841,7 +906,12 @@ pub(crate) async fn cve_matches_via_detection(
                     indicator_kind: None,
                     indicator_value: None,
                     detection_name: Some(r.detection_name),
-                    ruleset_fingerprint: Some(ruleset_fingerprint.to_string()),
+                    rule_fingerprint: if r.edge_rule_fingerprint.is_empty() {
+                        None
+                    } else {
+                        Some(r.edge_rule_fingerprint)
+                    },
+                    timing: EvidenceTiming::Observed,
                 },
             ],
         })
@@ -899,7 +969,8 @@ pub async fn path_pattern_matches(pool: &PgPool, file_path: &str) -> Result<Vec<
             report_url: r.report_url,
             detection_name: None,
             indicator_kind: Some(IndicatorKind::Path),
-            ruleset_fingerprint: None,
+            rule_fingerprint: None,
+            timing: EvidenceTiming::Observed,
             matched_value: r.matched_value,
         })
         .collect())
@@ -949,20 +1020,26 @@ pub async fn contextual_matches(pool: &PgPool, file_name: &str) -> Result<Vec<Pr
                 tier: VerdictTier::Contextual,
                 source: r.source,
                 confidence: 25,
-                // The report's own `ingested_at`, not `Utc::now()` at query
-                // time -- a review caught the latter fabricating edge-style
-                // observation timing for a tier with no backing evidence
-                // edge at all; `ingested_at` is the one real, honest
-                // timestamp this match has (when Apollo actually learned
-                // about the report the filename came from).
+                // The report's own `ingested_at` -- a review caught an
+                // earlier version fabricating `Utc::now()` at query time as
+                // edge-style observation timing for a tier with no backing
+                // evidence edge at all. A round-6 review caught that even
+                // `ingested_at` is the wrong *label*, though it's the right
+                // *value*: it's when Apollo *received* this report, not any
+                // claimed first/last-observed window a source asserted --
+                // `timing: ReceivedOnly` below makes that distinction
+                // explicit on the wire instead of overloading
+                // `first_seen`/`last_seen` to mean two different things
+                // depending on which tier produced them.
                 first_seen: r.ingested_at,
                 last_seen: r.ingested_at,
+                timing: EvidenceTiming::ReceivedOnly,
                 report_id: Some(r.report_id),
                 report_title: r.report_title,
                 report_url: r.report_url,
                 detection_name: None,
                 indicator_kind: None,
-                ruleset_fingerprint: None,
+                rule_fingerprint: None,
                 matched_value,
             })
         })
