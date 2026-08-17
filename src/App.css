@@ -431,10 +431,18 @@ body {
   margin-top: 0.2rem;
 }
 
-.relationship-source {
+.relationship-evidence {
+  margin-top: 0.2rem;
+}
+
+.evidence-hop {
   color: #888;
   font-size: 0.72rem;
-  margin-top: 0.2rem;
+}
+
+.evidence-relation {
+  color: #666;
+  font-weight: 600;
 }
 
 .provenance-list {
@@ -663,8 +671,12 @@ button:disabled {
   }
 
   .relationship-group-label,
-  .relationship-source {
+  .evidence-hop {
     color: #999;
+  }
+
+  .evidence-relation {
+    color: #bbb;
   }
 
   .relationship-entry {

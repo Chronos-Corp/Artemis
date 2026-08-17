@@ -91,11 +91,15 @@ export const RELATIONSHIP_STRENGTH_ORDER: RelationshipStrength[] = [
   "weak",
 ];
 
-export interface ThreatRelationship {
-  kind: RelationshipKind;
-  strength: RelationshipStrength;
-  target: string;
-  explanation: string;
+// One hop of evidence supporting a ThreatRelationship. A single-hop
+// relationship (ioc/detection/risk_based/malware_family) carries exactly
+// one; a cve relationship carries the full multi-hop chain it was
+// inferred through, each hop with its own source/confidence/timestamps --
+// Postgres stores provenance per edge, not per relationship, so collapsing
+// this to one flat value would either pick the wrong edge's provenance or
+// silently discard a hop's evidence.
+export interface RelationshipEvidence {
+  relation: string;
   source: string;
   confidence: number;
   first_seen: string;
@@ -103,6 +107,16 @@ export interface ThreatRelationship {
   report_id: string | null;
   report_title: string | null;
   report_url: string | null;
+  detection_name: string | null;
+}
+
+export interface ThreatRelationship {
+  kind: RelationshipKind;
+  strength: RelationshipStrength;
+  target: string;
+  explanation: string;
+  // Ordered from the file outward; never empty.
+  evidence: RelationshipEvidence[];
 }
 
 export interface Verdict {

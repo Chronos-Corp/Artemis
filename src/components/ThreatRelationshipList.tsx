@@ -57,19 +57,33 @@ export function ThreatRelationshipList({ relationships }: Props) {
                   </span>
                 </div>
                 <div className="relationship-explanation">{r.explanation}</div>
-                <div className="relationship-source">
-                  {r.source} -- {r.confidence}% confidence
-                  {r.report_title &&
-                    (r.report_url ? (
-                      <>
-                        {" -- "}
-                        <a href={r.report_url} target="_blank" rel="noreferrer">
-                          {r.report_title}
-                        </a>
-                      </>
-                    ) : (
-                      ` -- ${r.report_title}`
-                    ))}
+                {/* One row per evidence hop -- a single-hop relationship
+                    (ioc/detection/risk_based/malware_family) renders one
+                    row; a multi-hop cve relationship renders its full
+                    chain, each hop labeled by the edge it came from, so
+                    the chain stays reconstructable rather than collapsed
+                    into one borrowed number. */}
+                <div className="relationship-evidence">
+                  {r.evidence.map((e, j) => (
+                    <div key={j} className="evidence-hop">
+                      {r.evidence.length > 1 && (
+                        <span className="evidence-relation">{e.relation}: </span>
+                      )}
+                      {e.source} -- {e.confidence}% confidence
+                      {e.detection_name && ` -- ${e.detection_name}`}
+                      {e.report_title &&
+                        (e.report_url ? (
+                          <>
+                            {" -- "}
+                            <a href={e.report_url} target="_blank" rel="noreferrer">
+                              {e.report_title}
+                            </a>
+                          </>
+                        ) : (
+                          ` -- ${e.report_title}`
+                        ))}
+                    </div>
+                  ))}
                 </div>
               </li>
             ))}

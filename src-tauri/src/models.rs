@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 /// `crate::models::X` call sites in this crate are unaffected.
 pub use nsic_core::models::{
     derive_relationships, DetectionKind, IndicatorKind, IntelSourceFreshness, ProvenanceEntry,
-    RelationshipKind, RelationshipStrength, ThreatRelationship, Verdict, VerdictTier,
+    RelationshipEvidence, RelationshipKind, RelationshipStrength, ThreatRelationship, Verdict,
+    VerdictTier,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

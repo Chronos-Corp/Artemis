@@ -105,20 +105,38 @@ What works today:
   reconstructed later -- reconstructing it via a join back to
   `indicator_observed_in_report` on `(indicator_id, source)` alone can
   cross-attribute or duplicate whenever a source has filed more than one
-  report for the same indicator. CVE relationships are read from their own
-  dedicated queries (`db::indicators::cve_matches_via_report` /
-  `cve_matches_via_detection`), each preserving the CVE-specific edge's own
-  `source`/`confidence`/timestamps rather than the parent edge's --
+  report for the same indicator.
+  Every `ThreatRelationship` carries an `evidence: RelationshipEvidence[]`
+  chain rather than one flat `source`/`confidence`/timestamp set: Postgres
+  stores provenance per *edge*, not per relationship, so a single-hop
+  relationship (IOC, Detection, RiskBased, MalwareFamily) carries exactly
+  one evidence item, while a CVE relationship carries the full multi-hop
+  chain it was inferred through, each hop with its own provenance. CVE
+  relationships come from two dedicated queries
+  (`db::indicators::cve_matches_via_report` / `cve_matches_via_detection`),
+  each anchored on the CVE-specific edge (not the parent indicator/detection
+  edge) with a `LATERAL` join picking exactly one supporting parent-hop row,
+  so one real `report -> cve` or `detection -> cve` assertion can't
+  materialize as two relationships just because the file has two hash
+  representations or multiple source rows for the same edge:
   `report_references_cve --> Contextual` (a two-hop report co-occurrence
   inference) and `detection_covers_cve --> Strong` (one hop tighter: the
   detection matched this exact file, though covering a CVE is still the
-  detection's own documented scope, not a per-file assertion). Threat-actor
-  and campaign relationship kinds are structurally supported (the graph
-  tables already existed) but correctly surface no data yet, since no
-  ingestion populates them until later hunt-pack work; ATT&amp;CK technique
-  has no data source at all yet and is declared in the vocabulary without a
-  code path, the same precedent `DetectionKind::Sigma` already sets for
-  detection content this codebase doesn't ingest either.
+  detection's own documented scope, not a per-file assertion).
+  `cve_matches_via_detection` and the YARA provenance query (`yara_matches`)
+  are both scoped to the detection names that actually fired in the
+  *current* scan, not any `detection_detects_indicator` edge ever
+  persisted for the hash -- a detection recorded historically (a rule that
+  has since changed, or one curated from another source) must not resurface
+  as though it matched this exact file just because a *different* rule
+  genuinely fired, or because the hash happens to be bloom-known for an
+  unrelated reason. Threat-actor and campaign relationship kinds are
+  structurally supported (the graph tables already existed) but correctly
+  surface no data yet, since no ingestion populates them until later
+  hunt-pack work; ATT&amp;CK technique has no data source at all yet and is
+  declared in the vocabulary without a code path, the same precedent
+  `DetectionKind::Sigma` already sets for detection content this codebase
+  doesn't ingest either.
 
 What's stubbed or deliberately not built yet, in build order (see
 [`docs/apollo-constitution.md`](docs/apollo-constitution.md#12-current-product-build-doctrine)

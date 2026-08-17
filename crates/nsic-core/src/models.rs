@@ -161,6 +161,41 @@ pub enum RelationshipStrength {
     Direct,
 }
 
+/// One hop of evidence supporting a `ThreatRelationship`. Postgres stores
+/// provenance per *edge*, not per relationship -- a single-hop relationship
+/// (`Ioc`, `Detection`, `RiskBased`, `MalwareFamily`) carries exactly one of
+/// these, but a CVE relationship carries the full chain it was inferred
+/// through (e.g. the `indicator_observed_in_report` hop *and* the
+/// `report_references_cve` hop), each with its own source/confidence/
+/// timestamps. A review caught an earlier version of this collapsing a
+/// two-hop CVE inference down to a single flat source/confidence -- either
+/// by copying the wrong edge's values entirely, or, once that was fixed, by
+/// keeping only the last hop's values and silently discarding the first
+/// hop's evidence. `target` and `explanation` on `ThreatRelationship` stay
+/// single per relationship (there's still exactly one concept a file is
+/// related to); `evidence` is what carries the possibly-multi-hop path that
+/// established it, ordered from the file outward, so PR #20's Hunt engine
+/// can walk the actual chain instead of parsing `explanation` prose to find
+/// the supporting report or detection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelationshipEvidence {
+    /// What this hop's edge asserts, named after the edge table it comes
+    /// from (`observed_in_report`, `report_references_cve`,
+    /// `detects_indicator`, `detection_covers_cve`,
+    /// `attributed_to_malware_family`, or `contextual_filename_match` for
+    /// the one tier with no backing edge table) so a hop is traceable to
+    /// its exact source, not just prose.
+    pub relation: String,
+    pub source: String,
+    pub confidence: i16,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    pub report_id: Option<Uuid>,
+    pub report_title: Option<String>,
+    pub report_url: Option<String>,
+    pub detection_name: Option<String>,
+}
+
 /// A single structured relationship between a file and a threat concept --
 /// the RELATE-stage object the Apollo Constitution's §6 calls for, distinct
 /// from `ProvenanceEntry`'s verdict-tier framing ("why did this file get
@@ -177,13 +212,11 @@ pub struct ThreatRelationship {
     /// indicator value -- whatever `kind` identifies.
     pub target: String,
     pub explanation: String,
-    pub source: String,
-    pub confidence: i16,
-    pub first_seen: DateTime<Utc>,
-    pub last_seen: DateTime<Utc>,
-    pub report_id: Option<Uuid>,
-    pub report_title: Option<String>,
-    pub report_url: Option<String>,
+    /// See `RelationshipEvidence`'s doc comment -- one item for a
+    /// single-hop relationship, the full chain for a multi-hop one. Never
+    /// empty: every relationship exists because at least one edge asserted
+    /// it.
+    pub evidence: Vec<RelationshipEvidence>,
 }
 
 /// Derives the structured relationship view from a verdict's existing
@@ -217,6 +250,20 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
     let mut relationships = Vec::new();
 
     for entry in entries {
+        let single_hop = |relation: &str| {
+            vec![RelationshipEvidence {
+                relation: relation.to_string(),
+                source: entry.source.clone(),
+                confidence: entry.confidence,
+                first_seen: entry.first_seen,
+                last_seen: entry.last_seen,
+                report_id: entry.report_id,
+                report_title: entry.report_title.clone(),
+                report_url: entry.report_url.clone(),
+                detection_name: entry.detection_name.clone(),
+            }]
+        };
+
         match entry.tier {
             VerdictTier::ExactHash => {
                 relationships.push(ThreatRelationship {
@@ -227,13 +274,7 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
                         "Exact hash match against a known indicator -- find other hosts or paths \
                          where this same indicator has been observed."
                             .to_string(),
-                    source: entry.source.clone(),
-                    confidence: entry.confidence,
-                    first_seen: entry.first_seen,
-                    last_seen: entry.last_seen,
-                    report_id: entry.report_id,
-                    report_title: entry.report_title.clone(),
-                    report_url: entry.report_url.clone(),
+                    evidence: single_hop("observed_in_report"),
                 });
             }
             VerdictTier::FuzzyHash => {
@@ -245,13 +286,7 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
                         "Fuzzy hash similarity to a known indicator -- a close but non-exact \
                          match worth corroborating with other evidence."
                             .to_string(),
-                    source: entry.source.clone(),
-                    confidence: entry.confidence,
-                    first_seen: entry.first_seen,
-                    last_seen: entry.last_seen,
-                    report_id: entry.report_id,
-                    report_title: entry.report_title.clone(),
-                    report_url: entry.report_url.clone(),
+                    evidence: single_hop("observed_in_report"),
                 });
             }
             VerdictTier::YaraHit => {
@@ -264,13 +299,7 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
                             "A local YARA rule fired against this exact file -- run the rule or \
                              trace its logic to see exactly what it matched on."
                                 .to_string(),
-                        source: entry.source.clone(),
-                        confidence: entry.confidence,
-                        first_seen: entry.first_seen,
-                        last_seen: entry.last_seen,
-                        report_id: entry.report_id,
-                        report_title: entry.report_title.clone(),
-                        report_url: entry.report_url.clone(),
+                        evidence: single_hop("detects_indicator"),
                     });
                 }
             }
@@ -283,13 +312,7 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
                         "Path or naming pattern matched a known indicator -- weaker than a \
                          content match, worth checking alongside other evidence."
                             .to_string(),
-                    source: entry.source.clone(),
-                    confidence: entry.confidence,
-                    first_seen: entry.first_seen,
-                    last_seen: entry.last_seen,
-                    report_id: entry.report_id,
-                    report_title: entry.report_title.clone(),
-                    report_url: entry.report_url.clone(),
+                    evidence: single_hop("observed_in_report"),
                 });
                 relationships.push(ThreatRelationship {
                     kind: RelationshipKind::RiskBased,
@@ -299,13 +322,7 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
                         "Location or naming association only, not a content match -- expand the \
                          contextual hunt without treating this as direct compromise evidence."
                             .to_string(),
-                    source: entry.source.clone(),
-                    confidence: entry.confidence,
-                    first_seen: entry.first_seen,
-                    last_seen: entry.last_seen,
-                    report_id: entry.report_id,
-                    report_title: entry.report_title.clone(),
-                    report_url: entry.report_url.clone(),
+                    evidence: single_hop("observed_in_report"),
                 });
             }
             VerdictTier::Contextual => {
@@ -318,13 +335,7 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
                          passed through the indicator table, so this is not itself a known IOC. \
                          The weakest signal here; corroborate before treating this as meaningful."
                             .to_string(),
-                    source: entry.source.clone(),
-                    confidence: entry.confidence,
-                    first_seen: entry.first_seen,
-                    last_seen: entry.last_seen,
-                    report_id: entry.report_id,
-                    report_title: entry.report_title.clone(),
-                    report_url: entry.report_url.clone(),
+                    evidence: single_hop("contextual_filename_match"),
                 });
             }
         }
@@ -458,6 +469,22 @@ mod tests {
             derive_relationships(&high_confidence_contextual)[0].strength,
             RelationshipStrength::Weak
         );
+    }
+
+    #[test]
+    fn single_hop_relationships_carry_exactly_one_evidence_item() {
+        // A review's finding: a relationship's `evidence` chain must
+        // preserve every hop that established it, not collapse to a flat
+        // source/confidence -- single-hop tiers (everything derive_relationships
+        // produces) still carry exactly one, named after the edge it came
+        // from, and pure-derived relationships are entirely defined by
+        // it, not a mix of stale flat fields.
+        let entries = vec![entry(VerdictTier::ExactHash, 90)];
+        let relationships = derive_relationships(&entries);
+        assert_eq!(relationships[0].evidence.len(), 1);
+        assert_eq!(relationships[0].evidence[0].relation, "observed_in_report");
+        assert_eq!(relationships[0].evidence[0].source, "test-source");
+        assert_eq!(relationships[0].evidence[0].confidence, 90);
     }
 
     #[test]

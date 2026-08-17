@@ -1,0 +1,77 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            dcc.cve_id,\n            dcc.source AS cve_source,\n            dcc.confidence AS cve_confidence,\n            dcc.first_seen AS cve_first_seen,\n            dcc.last_seen AS cve_last_seen,\n            d.name AS detection_name,\n            parent.source AS \"parent_source!\",\n            parent.confidence AS \"parent_confidence!\",\n            parent.first_seen AS \"parent_first_seen!\",\n            parent.last_seen AS \"parent_last_seen!\"\n        FROM detection_covers_cve dcc\n        JOIN detection d ON d.id = dcc.detection_id\n        JOIN LATERAL (\n            SELECT ddi.source, ddi.confidence, ddi.first_seen, ddi.last_seen\n            FROM detection_detects_indicator ddi\n            JOIN indicator i ON i.id = ddi.indicator_id\n            WHERE ddi.detection_id = d.id AND i.kind = 'sha256' AND i.value = $1\n            ORDER BY ddi.last_seen DESC\n            LIMIT 1\n        ) parent ON true\n        WHERE d.kind = 'yara' AND d.name = ANY($2)\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "cve_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "cve_source",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "cve_confidence",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 3,
+        "name": "cve_first_seen",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 4,
+        "name": "cve_last_seen",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "detection_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "parent_source!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "parent_confidence!",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 8,
+        "name": "parent_first_seen!",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "parent_last_seen!",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "3d4297f909938370dd60d0465b1ef01a716189bbb84bdafc0ddcdb3bb5312605"
+}

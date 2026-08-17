@@ -1,0 +1,89 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            rrc.cve_id,\n            rrc.source AS cve_source,\n            rrc.confidence AS cve_confidence,\n            rrc.first_seen AS cve_first_seen,\n            rrc.last_seen AS cve_last_seen,\n            r.id AS report_id,\n            r.title AS report_title,\n            r.url AS report_url,\n            parent.source AS \"parent_source!\",\n            parent.confidence AS \"parent_confidence!\",\n            parent.first_seen AS \"parent_first_seen!\",\n            parent.last_seen AS \"parent_last_seen!\"\n        FROM report_references_cve rrc\n        JOIN report r ON r.id = rrc.report_id\n        JOIN LATERAL (\n            SELECT iorr.source, iorr.confidence, iorr.first_seen, iorr.last_seen\n            FROM indicator_observed_in_report iorr\n            JOIN indicator i ON i.id = iorr.indicator_id\n            WHERE iorr.report_id = r.id\n              AND ((i.kind = 'sha256' AND i.value = $1) OR (i.kind = 'md5' AND i.value = $2))\n            ORDER BY (i.kind = 'sha256') DESC, iorr.last_seen DESC\n            LIMIT 1\n        ) parent ON true\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "cve_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "cve_source",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "cve_confidence",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 3,
+        "name": "cve_first_seen",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 4,
+        "name": "cve_last_seen",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "report_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 6,
+        "name": "report_title",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "report_url",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "parent_source!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "parent_confidence!",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 10,
+        "name": "parent_first_seen!",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "parent_last_seen!",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "c55437755eb42163d9f8579e52e4b88b694ea5593e8b381ce216d1837e2817e1"
+}
