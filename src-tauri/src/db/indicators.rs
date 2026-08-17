@@ -422,11 +422,16 @@ pub struct HashMatchRow {
     report_id: Uuid,
     report_title: Option<String>,
     report_url: Option<String>,
-    cve_ids: Vec<String>,
 }
 
 /// Tier 1 / Tier 2: exact and fuzzy hash matches, joined out to the reports
-/// that observed them and any CVEs those reports reference.
+/// that observed them. Deliberately does not also aggregate
+/// `report_references_cve.cve_id` onto this row -- an earlier version did,
+/// and a review caught that presenting those CVE IDs under *this* entry's
+/// `source`/`confidence` (the `indicator_observed_in_report` edge's own)
+/// told a second, conflicting provenance story about the same CVE next to
+/// the correctly-sourced one in `ThreatRelationship`
+/// (`cve_matches_via_report`). CVEs have exactly one presentation path now.
 pub async fn hash_matches(
     pool: &PgPool,
     kind: IndicatorKind,
@@ -443,18 +448,11 @@ pub async fn hash_matches(
             iorr.last_seen,
             r.id AS report_id,
             r.title AS report_title,
-            r.url AS report_url,
-            COALESCE(
-                array_agg(rrc.cve_id) FILTER (WHERE rrc.cve_id IS NOT NULL),
-                '{}'
-            ) AS "cve_ids!"
+            r.url AS report_url
         FROM indicator i
         JOIN indicator_observed_in_report iorr ON iorr.indicator_id = i.id
         JOIN report r ON r.id = iorr.report_id
-        LEFT JOIN report_references_cve rrc ON rrc.report_id = r.id
         WHERE i.kind = $1 AND i.value = $2
-        GROUP BY i.value, iorr.source, iorr.confidence, iorr.first_seen, iorr.last_seen,
-                 r.id, r.title, r.url
         "#,
         kind as IndicatorKind,
         value,
@@ -480,7 +478,6 @@ pub fn hash_matches_to_provenance(
             report_url: r.report_url,
             detection_name: None,
             matched_value: r.matched_value,
-            cve_ids: r.cve_ids,
         })
         .collect()
 }
@@ -491,11 +488,13 @@ struct YaraMatchRow {
     confidence: i16,
     first_seen: DateTime<Utc>,
     last_seen: DateTime<Utc>,
-    cve_ids: Vec<String>,
 }
 
 /// Tier 3: YARA rule hits recorded against this hash's indicator, whether
-/// from a live local scan or a previously ingested detection.
+/// from a live local scan or a previously ingested detection. Deliberately
+/// does not also aggregate `detection_covers_cve.cve_id` onto this row --
+/// see `hash_matches`'s doc comment for why; `cve_matches_via_detection` is
+/// the one correctly-sourced presentation path for that CVE data now.
 pub async fn yara_matches(pool: &PgPool, sha256: &str) -> Result<Vec<ProvenanceEntry>> {
     let rows = sqlx::query_as!(
         YaraMatchRow,
@@ -505,17 +504,11 @@ pub async fn yara_matches(pool: &PgPool, sha256: &str) -> Result<Vec<ProvenanceE
             ddi.source,
             ddi.confidence,
             ddi.first_seen,
-            ddi.last_seen,
-            COALESCE(
-                array_agg(dcc.cve_id) FILTER (WHERE dcc.cve_id IS NOT NULL),
-                '{}'
-            ) AS "cve_ids!"
+            ddi.last_seen
         FROM indicator i
         JOIN detection_detects_indicator ddi ON ddi.indicator_id = i.id
         JOIN detection d ON d.id = ddi.detection_id
-        LEFT JOIN detection_covers_cve dcc ON dcc.detection_id = d.id
         WHERE i.kind = 'sha256' AND i.value = $1 AND d.kind = 'yara'
-        GROUP BY d.name, ddi.source, ddi.confidence, ddi.first_seen, ddi.last_seen
         "#,
         sha256,
     )
@@ -535,7 +528,6 @@ pub async fn yara_matches(pool: &PgPool, sha256: &str) -> Result<Vec<ProvenanceE
             report_url: None,
             detection_name: Some(r.detection_name),
             matched_value: sha256.to_string(),
-            cve_ids: r.cve_ids,
         })
         .collect())
 }
@@ -644,7 +636,13 @@ struct CveViaReportRow {
 /// direct per-file CVE assertion. `strength` is `Contextual` specifically
 /// to keep that two-hop inference honest, distinct from the one-hop
 /// `cve_matches_via_detection` case below.
-async fn cve_matches_via_report(
+///
+/// `pub(crate)` rather than private: `verdict::resolve` calls this and
+/// `cve_matches_via_detection` separately rather than through a combined
+/// wrapper, since the two run at different points in `resolve` -- see the
+/// doc comment where `cve_matches_via_detection` is called in
+/// `verdict.rs` for why.
+pub(crate) async fn cve_matches_via_report(
     pool: &PgPool,
     sha256: &str,
     md5: &str,
@@ -698,6 +696,7 @@ async fn cve_matches_via_report(
 
 struct CveViaDetectionRow {
     cve_id: String,
+    detection_name: String,
     source: String,
     confidence: i16,
     first_seen: DateTime<Utc>,
@@ -713,12 +712,22 @@ struct CveViaDetectionRow {
 /// `Contextual` -- still not `Direct`, since covering a CVE is the
 /// detection's own documented scope, not a per-file assertion the way
 /// malware-family attribution is.
-async fn cve_matches_via_detection(pool: &PgPool, sha256: &str) -> Result<Vec<ThreatRelationship>> {
+///
+/// Selects the detection's own name and names it in the explanation: a
+/// review caught an earlier version of this query dropping `d.name`
+/// entirely, so when two detections hit the same file, or two detections
+/// cover the same CVE, an analyst had no way to tell *which* detection
+/// forms the `file -> detection -> cve` path this relationship asserts.
+pub(crate) async fn cve_matches_via_detection(
+    pool: &PgPool,
+    sha256: &str,
+) -> Result<Vec<ThreatRelationship>> {
     let rows = sqlx::query_as!(
         CveViaDetectionRow,
         r#"
         SELECT
             dcc.cve_id,
+            d.name AS detection_name,
             dcc.source,
             dcc.confidence,
             dcc.first_seen,
@@ -740,10 +749,11 @@ async fn cve_matches_via_detection(pool: &PgPool, sha256: &str) -> Result<Vec<Th
             kind: RelationshipKind::Cve,
             strength: RelationshipStrength::Strong,
             target: r.cve_id,
-            explanation:
-                "A local detection that matched this exact file is documented to cover this CVE \
-                 -- assess exposure and hunt for exploitation evidence."
-                    .to_string(),
+            explanation: format!(
+                "The local detection \"{}\", which matched this exact file, is documented to \
+                 cover this CVE -- assess exposure and hunt for exploitation evidence.",
+                r.detection_name
+            ),
             source: r.source,
             confidence: r.confidence,
             first_seen: r.first_seen,
@@ -753,21 +763,6 @@ async fn cve_matches_via_detection(pool: &PgPool, sha256: &str) -> Result<Vec<Th
             report_url: None,
         })
         .collect())
-}
-
-/// Both CVE relationship paths, combined. Kept as two separate queries
-/// rather than one UNION so each keeps its own row shape and its own
-/// `strength` reasoning (see each function's doc comment) instead of
-/// forcing a shared column set that would blur the two-hop/one-hop
-/// distinction back together.
-pub async fn cve_matches(
-    pool: &PgPool,
-    sha256: &str,
-    md5: &str,
-) -> Result<Vec<ThreatRelationship>> {
-    let mut relationships = cve_matches_via_report(pool, sha256, md5).await?;
-    relationships.extend(cve_matches_via_detection(pool, sha256).await?);
-    Ok(relationships)
 }
 
 struct PathPatternRow {
@@ -821,7 +816,6 @@ pub async fn path_pattern_matches(pool: &PgPool, file_path: &str) -> Result<Vec<
             report_url: r.report_url,
             detection_name: None,
             matched_value: r.matched_value,
-            cve_ids: vec![],
         })
         .collect())
 }
@@ -875,7 +869,6 @@ pub async fn contextual_matches(pool: &PgPool, file_name: &str) -> Result<Vec<Pr
                 report_url: r.report_url,
                 detection_name: None,
                 matched_value,
-                cve_ids: vec![],
             })
         })
         .collect())

@@ -146,11 +146,6 @@ export function VerdictPanel({
                         )}
                       </div>
                     )}
-                    {entry.cve_ids.length > 0 && (
-                      <div>
-                        <strong>CVEs:</strong> {entry.cve_ids.join(", ")}
-                      </div>
-                    )}
                     <div className="provenance-dates">
                       First seen {formatDate(entry.first_seen)}, last seen{" "}
                       {formatDate(entry.last_seen)}

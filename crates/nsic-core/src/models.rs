@@ -64,7 +64,6 @@ pub struct ProvenanceEntry {
     pub report_url: Option<String>,
     pub detection_name: Option<String>,
     pub matched_value: String,
-    pub cve_ids: Vec<String>,
 }
 
 /// How current the local copy of one intel feed is, as of the moment a
@@ -206,10 +205,14 @@ pub struct ThreatRelationship {
 /// lookups (the Constitution's own IOC examples explicitly include path
 /// indicators), so those three still produce an `Ioc` relationship;
 /// `YaraHit` produces `Detection` only, and `Contextual` produces
-/// `RiskBased` only. CVE IDs are deliberately not read from
-/// `entry.cve_ids` here at all -- see `db::indicators::cve_matches`'s doc
-/// comment for why that data has already lost the provenance a
-/// `ThreatRelationship` needs by the time it reaches a `ProvenanceEntry`.
+/// `RiskBased` only. CVE relationships are never derived from a
+/// `ProvenanceEntry` at all -- `ProvenanceEntry` no longer carries CVE IDs
+/// in the first place (a review caught that field flattening the CVE
+/// edge's own provenance into the parent indicator/detection edge's, and
+/// the analyst UI rendering both, telling two conflicting stories about
+/// the same CVE); see `db::indicators::cve_matches_via_report` /
+/// `cve_matches_via_detection` for the dedicated, provenance-correct
+/// source.
 pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationship> {
     let mut relationships = Vec::new();
 
@@ -334,7 +337,7 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
 mod tests {
     use super::*;
 
-    fn entry(tier: VerdictTier, confidence: i16, cve_ids: Vec<String>) -> ProvenanceEntry {
+    fn entry(tier: VerdictTier, confidence: i16) -> ProvenanceEntry {
         let now = Utc::now();
         ProvenanceEntry {
             tier,
@@ -347,7 +350,6 @@ mod tests {
             report_url: None,
             detection_name: Some("Test_Rule".to_string()),
             matched_value: "deadbeef".to_string(),
-            cve_ids,
         }
     }
 
@@ -372,7 +374,7 @@ mod tests {
 
     #[test]
     fn exact_hash_entry_becomes_a_direct_ioc_relationship() {
-        let entries = vec![entry(VerdictTier::ExactHash, 90, vec![])];
+        let entries = vec![entry(VerdictTier::ExactHash, 90)];
         let relationships = derive_relationships(&entries);
         assert_eq!(relationships.len(), 1);
         assert_eq!(relationships[0].kind, RelationshipKind::Ioc);
@@ -382,7 +384,7 @@ mod tests {
 
     #[test]
     fn fuzzy_hash_entry_becomes_a_strong_ioc_relationship() {
-        let entries = vec![entry(VerdictTier::FuzzyHash, 70, vec![])];
+        let entries = vec![entry(VerdictTier::FuzzyHash, 70)];
         let relationships = derive_relationships(&entries);
         assert_eq!(relationships.len(), 1);
         assert_eq!(relationships[0].kind, RelationshipKind::Ioc);
@@ -391,7 +393,7 @@ mod tests {
 
     #[test]
     fn yara_hit_becomes_a_detection_relationship_only_not_an_ioc() {
-        let entries = vec![entry(VerdictTier::YaraHit, 65, vec![])];
+        let entries = vec![entry(VerdictTier::YaraHit, 65)];
         let relationships = derive_relationships(&entries);
         assert_eq!(
             relationships.len(),
@@ -410,7 +412,7 @@ mod tests {
         // Constitution's own IOC examples explicitly include path
         // indicators), so PathPattern is the one tier that legitimately
         // produces both.
-        let entries = vec![entry(VerdictTier::PathPattern, 50, vec![])];
+        let entries = vec![entry(VerdictTier::PathPattern, 50)];
         let relationships = derive_relationships(&entries);
         assert_eq!(relationships.len(), 2);
         let ioc = relationships
@@ -427,7 +429,7 @@ mod tests {
 
     #[test]
     fn contextual_becomes_a_risk_based_relationship_only_not_an_ioc() {
-        let entries = vec![entry(VerdictTier::Contextual, 25, vec![])];
+        let entries = vec![entry(VerdictTier::Contextual, 25)];
         let relationships = derive_relationships(&entries);
         assert_eq!(
             relationships.len(),
@@ -445,37 +447,17 @@ mod tests {
         // evidence mechanism, not the source's confidence number. A
         // low-confidence exact match is still Direct; a high-confidence
         // contextual match is still Weak.
-        let low_confidence_exact = vec![entry(VerdictTier::ExactHash, 10, vec![])];
+        let low_confidence_exact = vec![entry(VerdictTier::ExactHash, 10)];
         assert_eq!(
             derive_relationships(&low_confidence_exact)[0].strength,
             RelationshipStrength::Direct
         );
 
-        let high_confidence_contextual = vec![entry(VerdictTier::Contextual, 99, vec![])];
+        let high_confidence_contextual = vec![entry(VerdictTier::Contextual, 99)];
         assert_eq!(
             derive_relationships(&high_confidence_contextual)[0].strength,
             RelationshipStrength::Weak
         );
-    }
-
-    #[test]
-    fn cve_ids_on_the_entry_do_not_produce_relationships_here() {
-        // CVE relationships are deliberately not derived from
-        // ProvenanceEntry.cve_ids at all -- that field has already lost
-        // the CVE edge's own provenance by the time it reaches this pure
-        // function (see db::indicators::cve_matches's doc comment, which
-        // is where CVE relationships actually come from, with the real
-        // per-edge source/confidence/timestamps intact).
-        let entries = vec![entry(
-            VerdictTier::ExactHash,
-            90,
-            vec!["CVE-2024-1234".to_string()],
-        )];
-        let relationships = derive_relationships(&entries);
-        assert_eq!(relationships.len(), 1);
-        assert!(!relationships
-            .iter()
-            .any(|r| r.kind == RelationshipKind::Cve));
     }
 
     #[test]

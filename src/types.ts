@@ -40,7 +40,6 @@ export interface ProvenanceEntry {
   report_url: string | null;
   detection_name: string | null;
   matched_value: string;
-  cve_ids: string[];
 }
 
 export interface IntelSourceFreshness {

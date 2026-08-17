@@ -77,18 +77,25 @@ pub async fn resolve(
             VerdictTier::ExactHash,
         ));
 
-        // Malware-family attribution and CVE relationships can only exist
-        // for a hash the bloom filter already knows about: both edge
-        // tables foreign-key onto the same `indicator` row
+        // Malware-family attribution and CVE-via-report relationships can
+        // only exist for a hash the bloom filter already knows about: both
+        // edge tables foreign-key onto the same `indicator` row
         // `all_known_bad_hashes` (the bloom filter's own source) is built
-        // from. A bloom miss therefore provably means neither kind of edge
-        // exists either, so both stay inside the same skip-the-round-trip
-        // path as the hash matches above rather than always running.
-        // Checked against both hash kinds -- ThreatFox can source an MD5
-        // indicator with its own family/CVE edges, and checking sha256
-        // alone would silently omit them.
+        // from, and both are populated exclusively by feed ingestion (which
+        // always runs before the bloom filter is rebuilt from that same
+        // table) -- never created live during `resolve` itself. A bloom
+        // miss therefore provably means neither kind of edge exists either,
+        // so both stay inside this skip-the-round-trip path. Checked
+        // against both hash kinds -- ThreatFox can source an MD5 indicator
+        // with its own family/CVE edges, and checking sha256 alone would
+        // silently omit them.
+        //
+        // CVE-via-*detection* is deliberately NOT fetched here -- see the
+        // comment below, after the YARA tier, for why that one can't reuse
+        // this same bloom-gated fast path.
         dedicated_relationships = db::malware_family_matches(pool, &hash.sha256, &hash.md5).await?;
-        dedicated_relationships.extend(db::cve_matches(pool, &hash.sha256, &hash.md5).await?);
+        dedicated_relationships
+            .extend(db::cve_matches_via_report(pool, &hash.sha256, &hash.md5).await?);
     }
 
     // Tier 3: YARA is orthogonal to known-bad hash status, always runs.
@@ -109,6 +116,24 @@ pub async fn resolve(
     }
     if !yara_hits.is_empty() {
         entries.extend(db::yara_matches(pool, &hash.sha256).await?);
+    }
+
+    // CVE-via-detection has to be checked *after* the YARA tier above, not
+    // folded into the bloom-gated block before it: a review caught that on
+    // a file whose hash was never seen before this call (`bloom_hit` false
+    // at the top), a YARA rule firing right here creates this file's first
+    // `indicator` row and its `detection_detects_indicator` edge live, via
+    // `record_yara_hit`. If a pre-existing `detection_covers_cve` edge
+    // already documents that rule as covering a CVE, the relationship must
+    // surface on this exact call -- the analyst's first look at a freshly
+    // discovered file is exactly when it matters most, not on a second
+    // click after `record_yara_hit`'s bloom insert makes the fast path
+    // above start firing. `bloom_hit || !yara_hits.is_empty()` covers both
+    // "already known" and "just became known via this call's YARA hit";
+    // report/family lookups don't need the same treatment since ingestion,
+    // not `resolve`, is the only thing that ever creates those edges.
+    if bloom_hit || !yara_hits.is_empty() {
+        dedicated_relationships.extend(db::cve_matches_via_detection(pool, &hash.sha256).await?);
     }
 
     // Tier 4: path/naming pattern.
@@ -727,6 +752,43 @@ mod tests {
             "report co-occurrence is a two-hop inference, not a direct per-file assertion"
         );
 
+        // Review finding 2, folded into this same fixture: `ProvenanceEntry`
+        // no longer carries a `cve_ids` field at all (it used to aggregate
+        // `report_references_cve.cve_id` under the *parent*
+        // `indicator_observed_in_report` edge's source/confidence, telling
+        // a second, conflicting story about the same CVE next to the
+        // correctly-sourced `ThreatRelationship` above). That the type has
+        // no such field is enforced at compile time; this asserts the
+        // surfaced `ExactHash` entry only ever carries its own parent
+        // edge's values ("parent-edge-source" / 20), never the CVE edge's
+        // ("cve-edge-source" / 77) -- there is no path left, structurally
+        // or in this data, for the two to blend.
+        let exact_hash_entry = verdict_report
+            .entries
+            .iter()
+            .find(|e| e.tier == VerdictTier::ExactHash)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected an ExactHash provenance entry, got: {:?}",
+                    verdict_report.entries
+                )
+            });
+        assert_eq!(exact_hash_entry.source, "parent-edge-source");
+        assert_eq!(exact_hash_entry.confidence, 20);
+        // Checked at the wire-serialization level, not just against known
+        // field names: this is what `VerdictPanel` actually receives and
+        // renders, so it catches a reintroduction of CVE data on this
+        // entry even via a differently-named field, not just a literal
+        // `cve_ids` field with this exact name.
+        let exact_hash_entry_json =
+            serde_json::to_string(exact_hash_entry).expect("serialize provenance entry");
+        assert!(
+            !exact_hash_entry_json.contains(&cve_via_report_id),
+            "the ExactHash provenance entry (what VerdictPanel renders) must not mention the \
+             CVE ID at all -- that would resurrect the two-conflicting-provenance-stories bug \
+             even if ProvenanceEntry gained a new field carrying it, got: {exact_hash_entry_json}"
+        );
+
         // --- One-hop path: detection --detects--> indicator, detection --covers--> cve ---
         let mut tmp_detection = tempfile::NamedTempFile::new().expect("create temp file");
         let marker_detection = uuid::Uuid::new_v4();
@@ -822,6 +884,226 @@ mod tests {
             "a detection matching this exact file is one hop tighter than report \
              co-occurrence, but covering a CVE is still the detection's own documented \
              scope, not a per-file assertion, so this must not be Direct"
+        );
+        assert!(
+            via_detection
+                .explanation
+                .contains(&format!("TestRule-{marker_detection}")),
+            "the explanation must name the specific detection that forms the \
+             file -> detection -> cve path, not just assert a detection did, got: {:?}",
+            via_detection.explanation
+        );
+    }
+
+    /// Review finding 1: `cve_matches_via_detection` must surface on the
+    /// *first* `resolve()` call against a previously unseen file, not just
+    /// on a second click once the bloom filter has been warmed by the
+    /// first. Deliberately uses a fresh, empty `BloomState` and the real
+    /// bundled EICAR YARA rule (not a manually seeded detection edge) so
+    /// the `detection_detects_indicator` edge is created live, inside this
+    /// very `resolve()` call, by `record_yara_hit` -- exactly the sequence
+    /// the review described: a pre-existing `detection_covers_cve` edge
+    /// (e.g. from a hunt pack) plus a fresh YARA hit on an unseen file must
+    /// combine into a CVE relationship without requiring a second scan.
+    #[tokio::test]
+    #[ignore]
+    async fn cve_via_detection_surfaces_on_the_first_scan_of_a_previously_unseen_file() {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://nsic:nsic@localhost:5432/nsic".to_string());
+        let pool = crate::db::connect_and_migrate(&database_url)
+            .await
+            .expect("connect to test database");
+
+        let rules_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("yara-rules");
+        let yara = Arc::new(YaraEngine::load(&rules_dir).expect("load yara rules"));
+        // Deliberately empty, not seeded: this call must not depend on the
+        // bloom filter already knowing this file's hash.
+        let bloom = BloomState::empty();
+        let recent_yara_hits = RecentYaraHits::new();
+
+        // A hunt pack has already documented the bundled EICAR rule as
+        // covering a CVE, *before* this file is ever scanned.
+        let detection_id = crate::db::indicators::upsert_detection(
+            &pool,
+            DetectionKind::Yara,
+            "Example_EICAR_Test_File",
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("seed detection");
+        let unique_marker = uuid::Uuid::new_v4();
+        let cve_id = format!("CVE-TEST-{}", unique_marker.simple());
+        crate::db::indicators::upsert_cve(&pool, &cve_id, None, None, None)
+            .await
+            .expect("seed cve");
+        let now = Utc::now();
+        crate::db::indicators::upsert_detection_covers_cve(
+            &pool,
+            detection_id,
+            &cve_id,
+            "test-source",
+            80,
+            now,
+            now,
+        )
+        .await
+        .expect("seed detection covers cve");
+
+        let mut tmp = tempfile_eicar();
+        tmp.flush().unwrap();
+
+        // First-ever resolve() call against this exact file/hash pairing
+        // in this test's bloom -- the sha256 indicator and its
+        // detection_detects_indicator edge do not exist in this bloom's
+        // view of the world until record_yara_hit persists them partway
+        // through this very call.
+        let verdict = resolve(&pool, &bloom, &yara, &recent_yara_hits, tmp.path())
+            .await
+            .expect("resolve verdict");
+
+        assert!(
+            verdict
+                .threat_relationships
+                .iter()
+                .any(|r| r.kind == crate::models::RelationshipKind::Cve && r.target == cve_id),
+            "expected the CVE relationship to surface on the first scan of this file, not \
+             require a second click after the bloom filter warms up, got: {:?}",
+            verdict.threat_relationships
+        );
+    }
+
+    /// Review finding 3: when two detections both matched a hash but only
+    /// one is documented to cover a CVE, the surfaced CVE relationship must
+    /// identify *which* detection supports it -- not just that some
+    /// detection does. Without this, an analyst with two YARA hits on one
+    /// file cannot tell which rule the `file -> detection -> cve` path
+    /// actually runs through.
+    #[tokio::test]
+    #[ignore]
+    async fn cve_via_detection_identifies_the_correct_supporting_detection_among_several() {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://nsic:nsic@localhost:5432/nsic".to_string());
+        let pool = crate::db::connect_and_migrate(&database_url)
+            .await
+            .expect("connect to test database");
+
+        let rules_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("yara-rules");
+        let yara = Arc::new(YaraEngine::load(&rules_dir).expect("load yara rules"));
+        let bloom = BloomState::empty();
+        let recent_yara_hits = RecentYaraHits::new();
+
+        let mut tmp = tempfile::NamedTempFile::new().expect("create temp file");
+        let marker = uuid::Uuid::new_v4();
+        tmp.write_all(format!("two detections test content {marker}").as_bytes())
+            .unwrap();
+        tmp.flush().unwrap();
+        let hash = crate::hashing::hash_file_cached(&pool, tmp.path())
+            .await
+            .expect("hash temp file");
+
+        let (indicator_id, _) =
+            crate::db::indicators::upsert_indicator(&pool, IndicatorKind::Sha256, &hash.sha256)
+                .await
+                .expect("seed indicator");
+        let now = Utc::now();
+
+        let detection_a_name = format!("RuleA-{marker}");
+        let detection_b_name = format!("RuleB-{marker}");
+        let detection_a_id = crate::db::indicators::upsert_detection(
+            &pool,
+            DetectionKind::Yara,
+            &detection_a_name,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("seed detection A");
+        let detection_b_id = crate::db::indicators::upsert_detection(
+            &pool,
+            DetectionKind::Yara,
+            &detection_b_name,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("seed detection B");
+
+        // Both detections hit this hash.
+        crate::db::indicators::upsert_detection_detects_indicator(
+            &pool,
+            detection_a_id,
+            indicator_id,
+            "test-source",
+            50,
+            now,
+            now,
+        )
+        .await
+        .expect("seed detection A detects indicator");
+        crate::db::indicators::upsert_detection_detects_indicator(
+            &pool,
+            detection_b_id,
+            indicator_id,
+            "test-source",
+            50,
+            now,
+            now,
+        )
+        .await
+        .expect("seed detection B detects indicator");
+
+        // Only detection B is documented to cover the CVE.
+        let cve_id = format!("CVE-TEST-{}", marker.simple());
+        crate::db::indicators::upsert_cve(&pool, &cve_id, None, None, None)
+            .await
+            .expect("seed cve");
+        crate::db::indicators::upsert_detection_covers_cve(
+            &pool,
+            detection_b_id,
+            &cve_id,
+            "test-source",
+            80,
+            now,
+            now,
+        )
+        .await
+        .expect("seed detection B covers cve");
+
+        bloom.insert(&hash.sha256).await;
+        let verdict = resolve(&pool, &bloom, &yara, &recent_yara_hits, tmp.path())
+            .await
+            .expect("resolve verdict");
+
+        let relationship = verdict
+            .threat_relationships
+            .iter()
+            .find(|r| r.kind == crate::models::RelationshipKind::Cve && r.target == cve_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a Cve relationship for {cve_id}, got: {:?}",
+                    verdict.threat_relationships
+                )
+            });
+        assert!(
+            relationship.explanation.contains(&detection_b_name),
+            "expected the explanation to identify the supporting detection ({detection_b_name}), \
+             got: {:?}",
+            relationship.explanation
+        );
+        assert!(
+            !relationship.explanation.contains(&detection_a_name),
+            "must not implicate detection A, which does not cover this CVE, got: {:?}",
+            relationship.explanation
         );
     }
 

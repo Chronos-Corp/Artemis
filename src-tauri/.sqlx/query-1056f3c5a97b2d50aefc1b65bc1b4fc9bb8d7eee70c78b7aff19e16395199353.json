@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            dcc.cve_id,\n            d.name AS detection_name,\n            dcc.source,\n            dcc.confidence,\n            dcc.first_seen,\n            dcc.last_seen\n        FROM indicator i\n        JOIN detection_detects_indicator ddi ON ddi.indicator_id = i.id\n        JOIN detection d ON d.id = ddi.detection_id\n        JOIN detection_covers_cve dcc ON dcc.detection_id = d.id\n        WHERE i.kind = 'sha256' AND i.value = $1 AND d.kind = 'yara'\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "cve_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "detection_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "source",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "confidence",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 4,
+        "name": "first_seen",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "last_seen",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "1056f3c5a97b2d50aefc1b65bc1b4fc9bb8d7eee70c78b7aff19e16395199353"
+}

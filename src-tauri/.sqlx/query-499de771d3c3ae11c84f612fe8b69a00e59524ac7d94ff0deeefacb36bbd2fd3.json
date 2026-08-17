@@ -1,11 +1,11 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            dcc.cve_id,\n            dcc.source,\n            dcc.confidence,\n            dcc.first_seen,\n            dcc.last_seen\n        FROM indicator i\n        JOIN detection_detects_indicator ddi ON ddi.indicator_id = i.id\n        JOIN detection d ON d.id = ddi.detection_id\n        JOIN detection_covers_cve dcc ON dcc.detection_id = d.id\n        WHERE i.kind = 'sha256' AND i.value = $1 AND d.kind = 'yara'\n        ",
+  "query": "\n        SELECT\n            d.name AS detection_name,\n            ddi.source,\n            ddi.confidence,\n            ddi.first_seen,\n            ddi.last_seen\n        FROM indicator i\n        JOIN detection_detects_indicator ddi ON ddi.indicator_id = i.id\n        JOIN detection d ON d.id = ddi.detection_id\n        WHERE i.kind = 'sha256' AND i.value = $1 AND d.kind = 'yara'\n        ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "cve_id",
+        "name": "detection_name",
         "type_info": "Text"
       },
       {
@@ -42,5 +42,5 @@
       false
     ]
   },
-  "hash": "1b77233ea05ab0511e1d0354344eac48c5fa7a9db83abd936f9cde646c0c8f43"
+  "hash": "499de771d3c3ae11c84f612fe8b69a00e59524ac7d94ff0deeefacb36bbd2fd3"
 }
