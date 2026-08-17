@@ -1,12 +1,39 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
+
+/// Maximum number of YARA matches the desktop verdict path will materialize,
+/// persist, and expose as relationship pivots for one file. The active
+/// ruleset itself is bounded separately below, so this is not a cap applied
+/// only after unbounded work has already happened.
+pub const MAX_YARA_MATCHES_PER_VERDICT: usize = 200;
+
+/// Resource ceilings for an attacker-influenced rules directory. Apollo runs
+/// on live hosts that may already be compromised, so the local rules tree is
+/// input, not a trusted build artifact. These limits turn that input into a
+/// finite amount of parsing/compilation/scan work.
+const MAX_YARA_RULE_FILES: usize = 1024;
+const MAX_YARA_RULE_FILE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_YARA_RULESET_BYTES: usize = 16 * 1024 * 1024;
+const MAX_YARA_RULES: usize = 2048;
 
 #[derive(Debug, Clone)]
 pub struct YaraMatch {
     pub rule_name: String,
+}
+
+/// A bounded current-scan result. `truncated` is about distinct rule hits,
+/// not byte reads or database rows: when true, additional rules fired on the
+/// same bytes but were intentionally not materialized by the caller-facing
+/// verdict path.
+#[derive(Debug, Clone)]
+pub struct BoundedYaraMatches {
+    pub matches: Vec<YaraMatch>,
+    pub truncated: bool,
 }
 
 /// Wraps a compiled set of YARA rules loaded from a rules directory.
@@ -15,6 +42,10 @@ pub struct YaraMatch {
 pub struct YaraEngine {
     rules: Option<yara::Rules>,
     pub rules_dir: PathBuf,
+    /// Number of parsed rule declarations, not number of files. Earlier
+    /// versions incremented this once per file, which happened to be equal
+    /// for the bundled one-rule-per-file fixtures but under-reported a file
+    /// containing several rules and made the scan-coverage field ambiguous.
     pub rule_count: usize,
     /// SHA-256, hex-encoded, over a canonical manifest of every rule file
     /// that went into this compiled ruleset: for each file, in sorted
@@ -83,23 +114,38 @@ impl YaraEngine {
     /// directory is not an error: Phase 0 ships with no bundled rules, and
     /// callers should still work with hash-only verdicts until an analyst
     /// drops rules in.
+    ///
+    /// The tree, each individual source file, the aggregate source bytes,
+    /// and the parsed declaration count are all bounded before compilation.
+    /// A round-9 review caught that bounding only the *returned* YARA hits
+    /// would still allow an attacker-controlled rules directory to make
+    /// libyara compile and materialize an arbitrarily large match vector
+    /// first. The active ruleset therefore has its own independent ceilings.
     pub fn load(rules_dir: &Path) -> Result<Self> {
         if !rules_dir.exists() {
             return Ok(Self::empty(rules_dir));
         }
 
-        let mut rule_files: Vec<PathBuf> = WalkDir::new(rules_dir)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-            .filter(|e| {
-                matches!(
-                    e.path().extension().and_then(|s| s.to_str()),
-                    Some("yar") | Some("yara")
-                )
-            })
-            .map(|e| e.path().to_path_buf())
-            .collect();
+        let mut rule_files: Vec<PathBuf> = Vec::new();
+        for entry in WalkDir::new(rules_dir) {
+            let entry = entry.with_context(|| format!("walking YARA rules directory {}", rules_dir.display()))?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            if !matches!(
+                entry.path().extension().and_then(|s| s.to_str()),
+                Some("yar") | Some("yara")
+            ) {
+                continue;
+            }
+            if rule_files.len() >= MAX_YARA_RULE_FILES {
+                bail!(
+                    "YARA rules directory contains more than {MAX_YARA_RULE_FILES} rule files; refusing unbounded ruleset"
+                );
+            }
+            rule_files.push(entry.path().to_path_buf());
+        }
+
         // Sorted so both the compile order and the fingerprint below are
         // deterministic; WalkDir's own iteration order is not guaranteed.
         rule_files.sort();
@@ -125,10 +171,20 @@ impl YaraEngine {
         let mut compiler = yara::Compiler::new().context("initializing YARA compiler")?;
         let mut fingerprint = Sha256::new();
         let mut rule_fingerprints = HashMap::new();
-        let mut loaded = 0usize;
+        let mut loaded_rules = 0usize;
+        let mut total_rule_bytes = 0usize;
+
         for file in &rule_files {
-            let bytes = std::fs::read(file)
-                .with_context(|| format!("reading YARA rule file {}", file.display()))?;
+            let bytes = read_rule_file_bounded(file)?;
+            total_rule_bytes = total_rule_bytes
+                .checked_add(bytes.len())
+                .context("YARA ruleset byte count overflow")?;
+            if total_rule_bytes > MAX_YARA_RULESET_BYTES {
+                bail!(
+                    "YARA ruleset exceeds {MAX_YARA_RULESET_BYTES} bytes of source; refusing unbounded ruleset"
+                );
+            }
+
             let file_fingerprint = hex::encode(Sha256::digest(&bytes));
 
             let relative = file.strip_prefix(rules_dir).unwrap_or(file);
@@ -139,20 +195,28 @@ impl YaraEngine {
 
             let source = std::str::from_utf8(&bytes)
                 .with_context(|| format!("YARA rule file {} is not valid UTF-8", file.display()))?;
-            for rule_name in extract_rule_names(source) {
+            let rule_names = extract_rule_names(source);
+            loaded_rules = loaded_rules
+                .checked_add(rule_names.len())
+                .context("YARA rule declaration count overflow")?;
+            if loaded_rules > MAX_YARA_RULES {
+                bail!(
+                    "YARA ruleset contains more than {MAX_YARA_RULES} rule declarations; refusing unbounded ruleset"
+                );
+            }
+            for rule_name in rule_names {
                 rule_fingerprints.insert(rule_name, file_fingerprint.clone());
             }
             compiler = compiler
                 .add_rules_str(source)
                 .with_context(|| format!("loading YARA rule file {}", file.display()))?;
-            loaded += 1;
         }
 
         let rules = compiler.compile_rules().context("compiling YARA rules")?;
         Ok(Self {
             rules: Some(rules),
             rules_dir: rules_dir.to_path_buf(),
-            rule_count: loaded,
+            rule_count: loaded_rules,
             ruleset_fingerprint: hex::encode(fingerprint.finalize()),
             rule_fingerprints,
         })
@@ -184,6 +248,38 @@ impl YaraEngine {
             .context("scanning in-memory buffer")?;
         Ok(to_matches(results))
     }
+
+    /// Verdict-oriented scan: deterministic and explicitly bounded.
+    ///
+    /// The raw libyara result can contain at most `MAX_YARA_RULES` matches
+    /// because `load` refuses a larger active ruleset. We then sort by rule
+    /// identifier, deduplicate defensively, and keep the first
+    /// `MAX_YARA_MATCHES_PER_VERDICT`. The caller receives a truncation bit
+    /// so omitted detections cannot look like an exhaustive relationship set.
+    pub fn scan_bytes_bounded(&self, data: &[u8]) -> Result<BoundedYaraMatches> {
+        let mut matches = self.scan_bytes(data)?;
+        matches.sort_by(|a, b| a.rule_name.cmp(&b.rule_name));
+        matches.dedup_by(|a, b| a.rule_name == b.rule_name);
+        let truncated = matches.len() > MAX_YARA_MATCHES_PER_VERDICT;
+        matches.truncate(MAX_YARA_MATCHES_PER_VERDICT);
+        Ok(BoundedYaraMatches { matches, truncated })
+    }
+}
+
+fn read_rule_file_bounded(path: &Path) -> Result<Vec<u8>> {
+    let file = File::open(path)
+        .with_context(|| format!("opening YARA rule file {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_YARA_RULE_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading YARA rule file {}", path.display()))?;
+    if bytes.len() > MAX_YARA_RULE_FILE_BYTES {
+        bail!(
+            "YARA rule file {} exceeds the {MAX_YARA_RULE_FILE_BYTES}-byte limit",
+            path.display()
+        );
+    }
+    Ok(bytes)
 }
 
 /// Extracts every `rule <identifier>` declaration from a YARA source file,
@@ -401,6 +497,61 @@ mod tests {
                 .iter()
                 .any(|m| m.rule_name == "Example_EICAR_Test_File"),
             "expected a match for the bundled EICAR rule, got: {matches:?}"
+        );
+    }
+
+    #[test]
+    fn bounded_scan_is_deterministic_and_reports_truncation() {
+        let dir = tempfile::tempdir().expect("create temp rules dir");
+        let mut source = String::new();
+        for n in 0..(MAX_YARA_MATCHES_PER_VERDICT + 5) {
+            source.push_str(&format!("rule Rule_{n:04} {{ condition: true }}\n"));
+        }
+        std::fs::write(dir.path().join("many.yar"), source).expect("write many rules");
+
+        let engine = YaraEngine::load(dir.path()).expect("load many rules");
+        assert_eq!(engine.rule_count, MAX_YARA_MATCHES_PER_VERDICT + 5);
+        let bounded = engine
+            .scan_bytes_bounded(b"irrelevant")
+            .expect("bounded scan");
+        assert!(bounded.truncated, "expected the hit budget to fire");
+        assert_eq!(bounded.matches.len(), MAX_YARA_MATCHES_PER_VERDICT);
+        assert_eq!(bounded.matches.first().unwrap().rule_name, "Rule_0000");
+        assert_eq!(
+            bounded.matches.last().unwrap().rule_name,
+            format!("Rule_{:04}", MAX_YARA_MATCHES_PER_VERDICT - 1)
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_rule_file_before_buffering_it_in_full() {
+        let dir = tempfile::tempdir().expect("create temp rules dir");
+        std::fs::write(
+            dir.path().join("too-big.yar"),
+            vec![b' '; MAX_YARA_RULE_FILE_BYTES + 1],
+        )
+        .expect("write oversized rule file");
+
+        let err = YaraEngine::load(dir.path()).expect_err("oversized rule file must be rejected");
+        assert!(
+            err.to_string().contains("exceeds"),
+            "expected a size-bound error, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn rejects_ruleset_with_too_many_rule_declarations() {
+        let dir = tempfile::tempdir().expect("create temp rules dir");
+        let mut source = String::new();
+        for n in 0..=MAX_YARA_RULES {
+            source.push_str(&format!("rule TooMany_{n:04} {{ condition: false }}\n"));
+        }
+        std::fs::write(dir.path().join("too-many.yar"), source).expect("write oversized ruleset");
+
+        let err = YaraEngine::load(dir.path()).expect_err("too many rules must be rejected");
+        assert!(
+            err.to_string().contains("rule declarations"),
+            "expected a rule-count bound error, got: {err:#}"
         );
     }
 
