@@ -59,7 +59,7 @@ fn resolve_indicator(ioc_type: &str, ioc: &str) -> Option<(IndicatorKind, String
 /// malware-family attribution edge when the IOC carries one (PR #19's
 /// Threat Relationship Model).
 pub async fn sync(pool: &PgPool, api_key: &str) -> Result<SyncSummary> {
-    let client = reqwest::Client::new();
+    let client = super::feed_client()?;
     let resp = client
         .post(API_URL)
         .header("Auth-Key", api_key)
@@ -68,7 +68,7 @@ pub async fn sync(pool: &PgPool, api_key: &str) -> Result<SyncSummary> {
         .await
         .context("requesting ThreatFox recent IOCs")?;
 
-    let body: TfResponse = resp.json().await.context("parsing ThreatFox response")?;
+    let body: TfResponse = super::decode_bounded_json(resp, "ThreatFox").await?;
 
     if body.query_status != "ok" {
         bail!("ThreatFox query_status: {}", body.query_status);

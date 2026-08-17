@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 pub use nsic_core::models::{
     derive_relationships, DetectionKind, EvidenceRelation, EvidenceTiming, IndicatorKind,
     IntelSourceFreshness, ProvenanceEntry, RelationshipEvidence, RelationshipKind,
-    RelationshipStrength, ThreatRelationship, Verdict, VerdictTier,
+    RelationshipStrength, ThreatRelationship, Verdict, VerdictBounds, VerdictTier,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

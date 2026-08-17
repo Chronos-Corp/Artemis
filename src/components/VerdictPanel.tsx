@@ -1,6 +1,7 @@
 import type { FileEntry, FileIntelligence, IntelSourceFreshness, Verdict } from "../types";
 import { TIER_LABELS } from "../types";
 import { formatDate, formatRelativeTime } from "../format";
+import { safeExternalUrl } from "../lib/safeUrl";
 import { FileIntelPanel } from "./FileIntelPanel";
 import { ThreatRelationshipList } from "./ThreatRelationshipList";
 
@@ -104,7 +105,25 @@ export function VerdictPanel({
 
           <IntelCoverage sources={verdict.intel_freshness} />
 
-          <ThreatRelationshipList relationships={verdict.threat_relationships} />
+          <ThreatRelationshipList
+            relationships={verdict.threat_relationships}
+            relationshipsTruncated={verdict.bounds.relationships_truncated}
+          />
+
+          {verdict.bounds.truncated_entry_tiers.length > 0 && (
+            // A capped result must not read as an exhaustive one. Named per
+            // tier because that is what the backend actually knows -- saying
+            // "some evidence omitted" would be vaguer than the data.
+            <div className="verdict-truncated" role="status">
+              <strong>Partial evidence.</strong> More matching evidence exists
+              than is shown for:{" "}
+              {verdict.bounds.truncated_entry_tiers
+                .map((tier) => TIER_LABELS[tier])
+                .join(", ")}
+              . This list is bounded, not complete -- treat it as a sample
+              rather than the full picture.
+            </div>
+          )}
 
           {verdict.entries.length === 0 ? (
             <div className="verdict-no-match">
@@ -137,8 +156,15 @@ export function VerdictPanel({
                     {entry.report_title && (
                       <div>
                         <strong>Report:</strong>{" "}
-                        {entry.report_url ? (
-                          <a href={entry.report_url} target="_blank" rel="noreferrer">
+                        {/* Revalidated at the sink, never trusted from the
+                            wire object -- see lib/safeUrl.ts (TB-3). A
+                            rejected URL renders the title as plain text. */}
+                        {safeExternalUrl(entry.report_url) ? (
+                          <a
+                            href={safeExternalUrl(entry.report_url)!}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
                             {entry.report_title}
                           </a>
                         ) : (

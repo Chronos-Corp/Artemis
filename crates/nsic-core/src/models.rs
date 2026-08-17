@@ -142,6 +142,38 @@ pub struct Verdict {
     pub entries: Vec<ProvenanceEntry>,
     pub intel_freshness: Vec<IntelSourceFreshness>,
     pub threat_relationships: Vec<ThreatRelationship>,
+    /// Which parts of this verdict were bounded rather than exhaustive. See
+    /// `VerdictBounds` -- a safe bound must not look identical to a
+    /// complete result.
+    pub bounds: VerdictBounds,
+}
+
+/// Says, explicitly, which parts of a `Verdict` are partial.
+///
+/// Row caps exist so one file cannot produce an unbounded payload (see
+/// `db::indicators`' cap constants). A review caught that having the caps
+/// without this struct made a bounded result byte-for-byte identical to an
+/// exhaustive one: the analyst had no way to know evidence was omitted, and
+/// neither did PR #20's hunt engine, which is specified to treat
+/// `threat_relationships` as the authoritative pivot set. That directly
+/// contradicts two of this PR's own promises -- that provenance is never
+/// silently discarded, and that this object is authoritative.
+///
+/// `Default` is "nothing was truncated", so a verdict built from an
+/// exhaustive result says so rather than being silent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerdictBounds {
+    /// Tiers whose `entries` hit the per-query row cap, so matching
+    /// evidence of that tier exists that this verdict does not carry.
+    /// Per-tier rather than one flag because the tiers come from separate
+    /// queries with separate caps: "exact-hash evidence is partial" and
+    /// "contextual evidence is partial" are different facts, and collapsing
+    /// them would overstate one and hide the other.
+    pub truncated_entry_tiers: Vec<VerdictTier>,
+    /// True when the *conceptual relationship* cap fired -- i.e. distinct
+    /// related concepts (a CVE, a malware family) exist for this file that
+    /// `threat_relationships` does not list at all.
+    pub relationships_truncated: bool,
 }
 
 // ---------------------------------------------------------------------
@@ -325,6 +357,18 @@ pub struct ThreatRelationship {
     /// exists because at least one edge asserted it, and every path
     /// reaches `target` by construction.
     pub evidence_paths: Vec<Vec<RelationshipEvidence>>,
+    /// True when this relationship has more supporting evidence paths than
+    /// `evidence_paths` carries, because the per-relationship evidence cap
+    /// fired.
+    ///
+    /// Separate from `VerdictBounds::relationships_truncated`, and
+    /// deliberately so: "there are more CVEs than we listed" and "this CVE
+    /// has more supporting observations than we listed" are different
+    /// claims with different consequences for a hunt. A review caught that a
+    /// single row budget shared across both let one heavily-supported edge
+    /// consume the whole allowance and silently drop an entirely distinct
+    /// edge -- so the two are now bounded, and reported, independently.
+    pub has_more_evidence: bool,
 }
 
 /// Derives the structured relationship view from a verdict's existing
@@ -387,6 +431,9 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
                          where this same indicator has been observed."
                             .to_string(),
                     evidence_paths: vec![single_hop(EvidenceRelation::ObservedInReport)],
+                    // Derived from exactly one provenance entry, so there is
+                    // never further evidence a cap withheld.
+                    has_more_evidence: false,
                 });
             }
             VerdictTier::FuzzyHash => {
@@ -399,6 +446,9 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
                          match worth corroborating with other evidence."
                             .to_string(),
                     evidence_paths: vec![single_hop(EvidenceRelation::ObservedInReport)],
+                    // Derived from exactly one provenance entry, so there is
+                    // never further evidence a cap withheld.
+                    has_more_evidence: false,
                 });
             }
             VerdictTier::YaraHit => {
@@ -412,6 +462,9 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
                              trace its logic to see exactly what it matched on."
                                 .to_string(),
                         evidence_paths: vec![single_hop(EvidenceRelation::DetectsIndicator)],
+                        // Derived from exactly one provenance entry, so there is
+                        // never further evidence a cap withheld.
+                        has_more_evidence: false,
                     });
                 }
             }
@@ -425,6 +478,9 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
                          content match, worth checking alongside other evidence."
                             .to_string(),
                     evidence_paths: vec![single_hop(EvidenceRelation::ObservedInReport)],
+                    // Derived from exactly one provenance entry, so there is
+                    // never further evidence a cap withheld.
+                    has_more_evidence: false,
                 });
                 relationships.push(ThreatRelationship {
                     kind: RelationshipKind::RiskBased,
@@ -435,6 +491,9 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
                          contextual hunt without treating this as direct compromise evidence."
                             .to_string(),
                     evidence_paths: vec![single_hop(EvidenceRelation::ObservedInReport)],
+                    // Derived from exactly one provenance entry, so there is
+                    // never further evidence a cap withheld.
+                    has_more_evidence: false,
                 });
             }
             VerdictTier::Contextual => {
@@ -448,6 +507,9 @@ pub fn derive_relationships(entries: &[ProvenanceEntry]) -> Vec<ThreatRelationsh
                          The weakest signal here; corroborate before treating this as meaningful."
                             .to_string(),
                     evidence_paths: vec![single_hop(EvidenceRelation::ContextualFilenameMatch)],
+                    // Derived from exactly one provenance entry, so there is
+                    // never further evidence a cap withheld.
+                    has_more_evidence: false,
                 });
             }
         }

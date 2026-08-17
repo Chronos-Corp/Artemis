@@ -57,9 +57,24 @@ anyone who can submit an IOC.
 - Feed-claimed timestamps and confidences are claims, not facts; store
   them as the source's own values on the edge, never merged into Apollo's.
 
-*Current controls:* `nsic_core::sanitize::safe_external_url` at both
-ingest sites; `escape_like_pattern` in `db::indicators`; per-edge
-provenance columns.
+*Current controls:* `nsic_core::sanitize::safe_external_url` at both ingest
+sites, and `sanitize_stored_url` on every read path (ingest validation alone
+does not cover rows written before it existed or by other producers);
+per-edge provenance columns.
+
+LIKE-pattern escaping is worth stating precisely, because a review noted the
+earlier wording invited a wrong conclusion. Two separate things exist:
+
+- `sanitize::escape_like_pattern` — escapes a value being passed *as a bind
+  parameter* into a LIKE pattern. Tested, and available for callers in that
+  situation. **It is not the control used by `path_pattern_matches`.**
+- `path_pattern_matches` — the pattern operand there is a *column*
+  (`i.value`), not a bind parameter, so no Rust-side helper can reach it.
+  That query does the equivalent escaping SQL-side with nested `replace`
+  (backslash first, then `%` and `_`).
+
+Both must exist, and a future reviewer should not assume the Rust helper is
+what protects that query.
 
 ### TB-3: Intel graph → analyst UI (Tauri webview)
 The webview holds Tauri's IPC bridge, so script execution there can invoke
@@ -105,6 +120,18 @@ history shows single instances get fixed while siblings survive.
 - [ ] Every new read of attacker-influenced data: size-capped?
 - [ ] Every new query returning rows to the UI: `LIMIT`ed?
 - [ ] Every new in-memory accumulation: bounded by something an attacker can't inflate?
+- [ ] Every outbound request: does it have an explicit total timeout? (No
+      library's default can be assumed -- reqwest's is *no* timeout.)
+- [ ] Is any lock or guard held across a network round trip?
+
+*Added after R8-1 and R8-4: a cap is only half a control.*
+- [ ] Does the cap bound the thing the *caller* counts (conceptual results),
+      or just the rows the database happened to return before grouping?
+- [ ] Can one item's volume consume another item's budget?
+- [ ] Does the result say when a cap fired, or does a bounded result look
+      byte-for-byte identical to a complete one?
+- [ ] Is there a total `ORDER BY`, so *which* rows survive the cap is
+      deterministic rather than plan-dependent?
 
 **Races and TOCTOU**
 - [ ] Any check-then-use on a path: does the use operate on the *same handle* that was checked?
@@ -182,3 +209,43 @@ covering one scheme -- with no CSP behind it, no validation at the
 boundary, and the raw value persisted for other consumers (the Phase 1
 console renders with maud, and PR #20's hunt engine will read these
 programmatically). The control belongs at the boundary; it is there now.
+
+## Findings from round 8 review
+
+The pattern in this round is worth naming, because it is different from the
+earlier rounds: every finding was an *interaction between two controls that
+were each individually reasonable*. Adding a control is not the same as
+finishing it, and a new control's edges are now themselves on the checklist.
+
+| # | Finding | Boundary | Disposition |
+|---|---|---|---|
+| R8-1 | Row caps turned resource bounds into silently incomplete evidence: `LIMIT` applied to *joined* rows before Rust grouped them, so one heavily-supported CVE edge could starve an entirely distinct edge, with nothing on the wire saying so. Four of five capped queries also had no `ORDER BY`, making *which* evidence survived plan-dependent | resource bounds / provenance integrity | Fixed: separate relationship vs evidence budgets enforced in SQL via window functions, `Bounded<T>` + `VerdictBounds` + `has_more_evidence` on the wire and in the UI, total ordering on every capped query |
+| R8-2 | `safe_external_url` guarded ingest but not the render boundary or legacy rows -- TB-3's claimed "re-checked at render" control did not exist | TB-3 | Fixed: `sanitize_stored_url` on every read path, `safeExternalUrl` at both `href` sinks, plus a guard test that fails if a raw dynamic `href` is reintroduced |
+| R8-3 | `ABUSECH_API_KEY` sat in job-level `env`, exposed to every step including third-party actions referenced by mutable tags | CI/CD | Fixed: secret scoped to the one step that needs it (the presence check gets a boolean, not the value); all third-party actions pinned to verified commit SHAs |
+| R8-4 | Feed HTTP requests had **no** timeout, so `IntelGate`'s write guard could be held indefinitely and block every verdict; response bodies were unbounded | availability | Fixed: explicit total/connect timeouts and a streamed 64 MiB body ceiling |
+
+R8-4 is a correction, not just a fix. The review classified the `IntelGate`
+lock as non-blocking *on the premise* that "with reqwest 0.12 there is a
+default request timeout, so this is bounded rather than an indefinite
+deadlock." That premise is false: reqwest 0.12.28 defaults both `timeout`
+and `read_timeout` to `None`, and `ClientBuilder::timeout`'s own
+documentation says "Default is no timeout." The Linux-only 30s
+`tcp_user_timeout` default bounds unacknowledged TCP writes, not an
+application-layer peer that keeps a connection healthy while sending almost
+nothing. So the deadlock really was unbounded. Explicit timeouts now make
+the premise true; whether the fetch/parse-vs-mutation split is still worth
+doing is a live question rather than a settled deferral.
+
+### Deferred, with reasons
+
+- **`IntelGate` holds its write guard across fetch/parse as well as the
+  local mutation.** Now bounded by `FEED_REQUEST_TIMEOUT` (60s) rather than
+  unbounded, but a slow feed still pauses all verdicts for up to that long.
+  Splitting the remote work out of the critical section is the real fix.
+  Deferred as a Phase-0 tradeoff, not forgotten.
+- **`(kind, target)` aggregation for the PR #20 handoff.** Multiple
+  independently-sourced relationship objects can share a `(kind, target)`
+  pair (the same malware family attributed by two reports, say). Those are
+  genuinely separate assertions with separate provenance, and must not
+  become duplicate Hunt pivots. Belongs in the PR #20 interface contract,
+  where the consumer's aggregation semantics are actually decided.

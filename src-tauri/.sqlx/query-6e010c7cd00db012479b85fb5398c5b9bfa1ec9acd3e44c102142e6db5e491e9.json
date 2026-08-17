@@ -1,11 +1,11 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            mf.name AS family_name,\n            iamf.source,\n            iamf.confidence,\n            iamf.first_seen,\n            iamf.last_seen,\n            r.id AS report_id,\n            r.title AS report_title,\n            r.url AS report_url,\n            i.kind AS \"indicator_kind: IndicatorKind\",\n            i.value AS indicator_value\n        FROM indicator i\n        JOIN indicator_attributed_to_malware_family iamf ON iamf.indicator_id = i.id\n        JOIN malware_family mf ON mf.id = iamf.malware_family_id\n        JOIN report r ON r.id = iamf.report_id\n        WHERE (i.kind = 'sha256' AND i.value = $1) OR (i.kind = 'md5' AND i.value = $2)\n        LIMIT $3\n        ",
+  "query": "\n        SELECT\n            i.value AS matched_value,\n            iorr.source,\n            iorr.confidence,\n            iorr.first_seen,\n            iorr.last_seen,\n            r.id AS report_id,\n            r.title AS report_title,\n            r.url AS report_url\n        FROM indicator i\n        JOIN indicator_observed_in_report iorr ON iorr.indicator_id = i.id\n        JOIN report r ON r.id = iorr.report_id\n        WHERE i.kind = $1 AND i.value = $2\n        ORDER BY iorr.last_seen DESC, iorr.first_seen DESC, r.id, iorr.source\n        LIMIT $3\n        ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "family_name",
+        "name": "matched_value",
         "type_info": "Text"
       },
       {
@@ -42,11 +42,11 @@
         "ordinal": 7,
         "name": "report_url",
         "type_info": "Text"
-      },
-      {
-        "ordinal": 8,
-        "name": "indicator_kind: IndicatorKind",
-        "type_info": {
+      }
+    ],
+    "parameters": {
+      "Left": [
+        {
           "Custom": {
             "name": "indicator_kind",
             "kind": {
@@ -65,17 +65,7 @@
               ]
             }
           }
-        }
-      },
-      {
-        "ordinal": 9,
-        "name": "indicator_value",
-        "type_info": "Text"
-      }
-    ],
-    "parameters": {
-      "Left": [
-        "Text",
+        },
         "Text",
         "Int8"
       ]
@@ -88,10 +78,8 @@
       false,
       false,
       true,
-      true,
-      false,
-      false
+      true
     ]
   },
-  "hash": "77f5d1ecb0924130740994264dadf2cdf4adaad969e21afff82b7a70d742768d"
+  "hash": "6e010c7cd00db012479b85fb5398c5b9bfa1ec9acd3e44c102142e6db5e491e9"
 }

@@ -1,11 +1,97 @@
 pub mod malwarebazaar;
 pub mod threatfox;
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use sqlx::PgPool;
+use std::time::Duration;
 
 use crate::models::SyncSummary;
+
+/// Total deadline for one feed request, connect through last body byte.
+///
+/// Explicit because `reqwest::Client::new()` has **no** request timeout:
+/// verified against reqwest 0.12.28, whose `ClientConfig` defaults both
+/// `timeout` and `read_timeout` to `None` (`ClientBuilder::timeout`'s own
+/// docs say "Default is no timeout"). A round-8 review assumed a default
+/// existed and, on that basis, treated `IntelGate` holding its write guard
+/// across the feed fetch as bounded. It was not: a feed endpoint that
+/// accepted the connection and then trickled or withheld bytes could stall
+/// the request indefinitely, and because `sync_feeds` holds the `IntelGate`
+/// write guard across `run_all`, every concurrent verdict would block for
+/// exactly as long.
+///
+/// The Linux-only `tcp_user_timeout` default (30s) does not cover this: it
+/// bounds unacknowledged TCP writes, not an application-layer server that
+/// keeps a connection healthy while sending almost nothing.
+///
+/// 60s is generous for these endpoints while still guaranteeing the lock is
+/// released.
+const FEED_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Deadline for establishing the connection specifically, so an
+/// unreachable-but-not-refusing host fails fast rather than consuming the
+/// whole request budget.
+const FEED_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Ceiling on a decoded feed response body.
+///
+/// `Response::json()` materializes the entire body in memory before
+/// deserializing, and the body length is chosen by the remote feed, not by
+/// Apollo -- so an unexpectedly (or maliciously) large response is an
+/// availability problem on the analyst's workstation. Enforced while
+/// streaming, so an oversized body is abandoned partway rather than fully
+/// buffered and then rejected.
+///
+/// 64 MiB is far above either feed's real payload (a few MiB at most) and
+/// far below a size that would threaten the host.
+const MAX_FEED_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// The shared HTTP client for feed requests: bounded, and identically
+/// bounded for every feed rather than each module choosing its own.
+pub(crate) fn feed_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(FEED_REQUEST_TIMEOUT)
+        .connect_timeout(FEED_CONNECT_TIMEOUT)
+        .build()
+        .context("building the feed HTTP client")
+}
+
+/// Reads a response body with an enforced size ceiling, then deserializes.
+///
+/// Streams via `chunk()` and aborts as soon as the accumulated size would
+/// exceed `MAX_FEED_BODY_BYTES`, which is the point: checking
+/// `content_length()` alone would be advisory (a server can omit or
+/// understate it), and `json()`/`bytes()` would buffer the whole thing
+/// first.
+pub(crate) async fn decode_bounded_json<T: serde::de::DeserializeOwned>(
+    mut resp: reqwest::Response,
+    what: &str,
+) -> Result<T> {
+    // Cheap pre-check when the server does declare an oversized body: no
+    // reason to start streaming something already known to be too big.
+    if let Some(declared) = resp.content_length() {
+        if declared > MAX_FEED_BODY_BYTES as u64 {
+            bail!(
+                "{what}: response declares {declared} bytes, over the {MAX_FEED_BODY_BYTES}-byte limit"
+            );
+        }
+    }
+
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .with_context(|| format!("reading {what} response body"))?
+    {
+        if body.len() + chunk.len() > MAX_FEED_BODY_BYTES {
+            bail!("{what}: response exceeded the {MAX_FEED_BODY_BYTES}-byte limit");
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    serde_json::from_slice(&body).with_context(|| format!("parsing {what} response"))
+}
 
 /// abuse.ch feeds format timestamps as naive `YYYY-MM-DD HH:MM:SS` strings
 /// (implicitly UTC); shared by every feed module rather than duplicated.
@@ -35,7 +121,10 @@ pub(crate) const CONFIGURED_SOURCES: &[&str] = &[malwarebazaar::SOURCE, threatfo
 /// to the analyst, not hidden.
 pub async fn run_all(pool: &PgPool, api_key: &str) -> Vec<(&'static str, Result<SyncSummary>)> {
     vec![
-        (malwarebazaar::SOURCE, malwarebazaar::sync(pool, api_key).await),
+        (
+            malwarebazaar::SOURCE,
+            malwarebazaar::sync(pool, api_key).await,
+        ),
         (threatfox::SOURCE, threatfox::sync(pool, api_key).await),
     ]
 }
@@ -55,8 +144,8 @@ mod live_tests {
     #[tokio::test]
     #[ignore]
     async fn live_abusech_sync_works() {
-        let api_key = std::env::var("ABUSECH_API_KEY")
-            .expect("ABUSECH_API_KEY must be set to run this test");
+        let api_key =
+            std::env::var("ABUSECH_API_KEY").expect("ABUSECH_API_KEY must be set to run this test");
         let database_url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgres://nsic:nsic@localhost:5432/nsic".to_string());
         let pool = crate::db::connect_and_migrate(&database_url)

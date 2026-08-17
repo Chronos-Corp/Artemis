@@ -56,6 +56,31 @@ pub fn safe_external_url(candidate: &str) -> Option<&str> {
         .then_some(trimmed)
 }
 
+/// Read-side counterpart to `safe_external_url`, for a URL already stored
+/// in the graph. Returns the trimmed URL when it passes the allowlist, and
+/// `None` when it does not -- so a value that fails cannot be handed to any
+/// consumer as a link target.
+///
+/// This exists because validating at ingest is necessary but not
+/// sufficient, which a review caught: `safe_external_url` guards the two
+/// current feed writers, but rows written *before* that control existed
+/// were never backfilled, ThreatFox rows outside the recent-sync window may
+/// never be rewritten, and the graph can acquire other writers. A consumer
+/// should not have to prove which historical writer produced a row before
+/// deciding whether its URL is safe to render. The stored value is
+/// therefore treated as untrusted on the way out as well as on the way in.
+///
+/// A rejected URL becomes `None` rather than being passed through with a
+/// flag: callers already render a report title as plain text when there is
+/// no URL (see `VerdictPanel`/`ThreatRelationshipList`), so the analyst
+/// still sees the report, just not as a clickable link. The rejected string
+/// itself is deliberately not forwarded for display -- it is attacker-chosen
+/// text whose only purpose here was to be a link target.
+pub fn sanitize_stored_url(stored: Option<String>) -> Option<String> {
+    let value = stored?;
+    safe_external_url(&value).map(str::to_string)
+}
+
 /// Escapes a value for safe use inside a SQL `LIKE`/`ILIKE` pattern that
 /// the caller wraps in `%`.
 ///
@@ -137,6 +162,43 @@ mod tests {
         assert_eq!(safe_external_url("java\nscript:alert(1)"), None);
         assert_eq!(safe_external_url("https://ok.test/\u{0}evil"), None);
         assert_eq!(safe_external_url("\tjavascript:alert(1)"), None);
+    }
+
+    /// The read-side control: a row that predates ingest validation, or was
+    /// written by some other producer, must not become a link target.
+    #[test]
+    fn sanitize_stored_url_drops_legacy_unsafe_values() {
+        for legacy in [
+            "javascript:alert(document.cookie)",
+            "JavaScript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "file:///etc/passwd",
+            "vbscript:msgbox(1)",
+            "tauri://localhost/",
+            "not-a-url",
+            "",
+            "   ",
+        ] {
+            assert_eq!(
+                sanitize_stored_url(Some(legacy.to_string())),
+                None,
+                "expected stored value {legacy:?} to be dropped on read"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_stored_url_preserves_legitimate_stored_values() {
+        assert_eq!(
+            sanitize_stored_url(Some("https://bazaar.abuse.ch/sample/abc/".to_string())),
+            Some("https://bazaar.abuse.ch/sample/abc/".to_string())
+        );
+        // Trimmed on the way out, matching the ingest-side behavior.
+        assert_eq!(
+            sanitize_stored_url(Some("  https://example.test/x  ".to_string())),
+            Some("https://example.test/x".to_string())
+        );
+        assert_eq!(sanitize_stored_url(None), None);
     }
 
     #[test]

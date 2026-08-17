@@ -4,24 +4,106 @@ use serde_json::Value as Json;
 use sqlx::{PgExecutor, PgPool};
 use uuid::Uuid;
 
+use nsic_core::sanitize::sanitize_stored_url;
+
 use crate::models::{
     DetectionKind, EvidenceRelation, EvidenceTiming, IndicatorKind, IntelSourceFreshness,
     ProvenanceEntry, RelationshipEvidence, RelationshipKind, RelationshipStrength,
     ThreatRelationship, VerdictTier,
 };
 
-/// Ceiling on rows any single verdict lookup returns to the UI.
+/// Ceiling on `ProvenanceEntry` rows any single verdict lookup returns.
 ///
 /// Not real pagination (there is no cursor) -- a bound, so one file can't
-/// produce an unbounded provenance list or relationship set. The intel
-/// graph is populated from third-party feeds, so "how many reports observe
-/// this one hash" is not a number Apollo controls; without a cap, a hash
-/// that many reports reference inflates the IPC payload to the webview and
-/// the list an analyst has to scroll. `contextual_matches` already capped
-/// itself at 20; the other lookups did not, which was an inconsistency
-/// rather than a deliberate choice. 200 is far past what is readable and
-/// still safely bounded. See `docs/threat-model.md` (resource bounds).
-const MAX_VERDICT_ROWS: i64 = 200;
+/// produce an unbounded provenance list. The intel graph is populated from
+/// third-party feeds, so "how many reports observe this one hash" is not a
+/// number Apollo controls; without a cap, a hash that many reports
+/// reference inflates the IPC payload to the webview and the list an
+/// analyst has to scroll. `contextual_matches` already capped itself at 20;
+/// the other lookups did not, which was an inconsistency rather than a
+/// deliberate choice. 200 is far past what is readable and still safely
+/// bounded.
+///
+/// Every capped query reports whether its cap fired, via `Bounded`, and
+/// `Verdict::bounds` carries that to the analyst and to PR #20 -- see
+/// `VerdictBounds`. See `docs/threat-model.md` (resource bounds).
+pub(crate) const MAX_VERDICT_ROWS: i64 = 200;
+
+/// Ceiling on distinct *conceptual relationships* one query returns -- one
+/// per real related concept (a CVE edge, a malware-family attribution), not
+/// one per supporting row.
+///
+/// Deliberately a different budget from `MAX_EVIDENCE_PER_RELATIONSHIP`. A
+/// review caught that a single row cap applied to the *joined* rows let one
+/// heavily-supported edge consume the entire allowance: with 200 matching
+/// parent observations for CVE edge A, an entirely distinct and equally
+/// real CVE edge B never reached the grouping code at all, and nothing on
+/// the wire object said so. Bounding the two dimensions separately means a
+/// relationship can never be lost to another relationship's evidence
+/// volume.
+const MAX_RELATIONSHIPS: i64 = 200;
+
+/// Ceiling on supporting evidence paths carried per conceptual
+/// relationship. Exceeding it sets `ThreatRelationship::has_more_evidence`
+/// rather than silently shortening the list.
+///
+/// Lower than the relationship cap on purpose: past a handful, additional
+/// parallel observations of the *same* relationship add little for an
+/// analyst judging it, whereas an entirely missing relationship is a
+/// different concept absent from the pivot set.
+pub(crate) const MAX_EVIDENCE_PER_RELATIONSHIP: i64 = 20;
+
+/// The contextual tier's own row cap. Tighter than `MAX_VERDICT_ROWS`
+/// because this is the weakest evidence Apollo produces (a filename
+/// coincidence), so a long list of it is the least worth an analyst's
+/// scrolling. This was already 20 as a bare literal in the query; naming it
+/// keeps it visible alongside the other budgets.
+const MAX_CONTEXTUAL_ROWS: i64 = 20;
+
+/// A result that was bounded by a cap, plus whether the cap actually fired.
+///
+/// Exists so "we found 12 things" and "we found 200 things and stopped
+/// counting" cannot be represented identically. Every capped query returns
+/// one of these; `verdict::resolve` folds `truncated` into
+/// `Verdict::bounds`.
+///
+/// The detection technique throughout is fetch-one-past-the-cap: query
+/// `LIMIT n + 1`, and if the extra row materializes, more data exists.
+/// Cheaper than a second `COUNT(*)` and immune to drifting from it.
+#[derive(Debug, Clone)]
+pub struct Bounded<T> {
+    pub items: Vec<T>,
+    pub truncated: bool,
+}
+
+impl<T> Bounded<T> {
+    /// Splits a `limit + 1` fetch into the capped items plus the truncation
+    /// flag.
+    fn from_overfetch(mut rows: Vec<T>, limit: i64) -> Self {
+        let limit = limit.max(0) as usize;
+        let truncated = rows.len() > limit;
+        rows.truncate(limit);
+        Self {
+            items: rows,
+            truncated,
+        }
+    }
+
+    /// For a result that was never capped in the first place.
+    fn exhaustive(items: Vec<T>) -> Self {
+        Self {
+            items,
+            truncated: false,
+        }
+    }
+
+    pub fn map<U>(self, f: impl FnMut(T) -> U) -> Bounded<U> {
+        Bounded {
+            items: self.items.into_iter().map(f).collect(),
+            truncated: self.truncated,
+        }
+    }
+}
 
 /// Returns (report_id, was_inserted). was_inserted uses the `xmax = 0` trick
 /// so callers can report accurate added-vs-updated counts after a sync.
@@ -462,11 +544,22 @@ pub struct HashMatchRow {
 /// told a second, conflicting provenance story about the same CVE next to
 /// the correctly-sourced one in `ThreatRelationship`
 /// (`cve_matches_via_report`). CVEs have exactly one presentation path now.
+/// Ordered most-recently-observed first, then by stable identity
+/// (`report_id`, `source`) -- the `indicator_observed_in_report` primary key
+/// components, so the order is total rather than merely mostly-determined.
+///
+/// The `ORDER BY` is load-bearing, not cosmetic: a review caught that this
+/// query (and three of its siblings) applied `LIMIT` with no ordering at
+/// all, which in Postgres means an arbitrary subset. Two runs against
+/// identical data could therefore keep *different* evidence, and the
+/// evidence an analyst saw would depend on the plan rather than on
+/// recency. A cap that chooses among equally valid rows must choose
+/// deterministically.
 pub async fn hash_matches(
     pool: &PgPool,
     kind: IndicatorKind,
     value: &str,
-) -> Result<Vec<HashMatchRow>> {
+) -> Result<Bounded<HashMatchRow>> {
     let rows = sqlx::query_as!(
         HashMatchRow,
         r#"
@@ -483,15 +576,16 @@ pub async fn hash_matches(
         JOIN indicator_observed_in_report iorr ON iorr.indicator_id = i.id
         JOIN report r ON r.id = iorr.report_id
         WHERE i.kind = $1 AND i.value = $2
+        ORDER BY iorr.last_seen DESC, iorr.first_seen DESC, r.id, iorr.source
         LIMIT $3
         "#,
         kind as IndicatorKind,
         value,
-        MAX_VERDICT_ROWS,
+        MAX_VERDICT_ROWS + 1,
     )
     .fetch_all(pool)
     .await?;
-    Ok(rows)
+    Ok(Bounded::from_overfetch(rows, MAX_VERDICT_ROWS))
 }
 
 pub fn hash_matches_to_provenance(
@@ -508,7 +602,7 @@ pub fn hash_matches_to_provenance(
             last_seen: r.last_seen,
             report_id: Some(r.report_id),
             report_title: r.report_title,
-            report_url: r.report_url,
+            report_url: sanitize_stored_url(r.report_url),
             detection_name: None,
             indicator_kind: Some(kind),
             rule_fingerprint: None,
@@ -567,7 +661,7 @@ pub async fn malware_family_matches(
     pool: &PgPool,
     sha256: &str,
     md5: &str,
-) -> Result<Vec<ThreatRelationship>> {
+) -> Result<Bounded<ThreatRelationship>> {
     let rows = sqlx::query_as!(
         MalwareFamilyMatchRow,
         r#"
@@ -587,18 +681,18 @@ pub async fn malware_family_matches(
         JOIN malware_family mf ON mf.id = iamf.malware_family_id
         JOIN report r ON r.id = iamf.report_id
         WHERE (i.kind = 'sha256' AND i.value = $1) OR (i.kind = 'md5' AND i.value = $2)
+        ORDER BY iamf.last_seen DESC, mf.name, r.id, iamf.source, i.kind
         LIMIT $3
         "#,
         sha256,
         md5,
-        MAX_VERDICT_ROWS,
+        MAX_RELATIONSHIPS + 1,
     )
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(|r| ThreatRelationship {
+    Ok(
+        Bounded::from_overfetch(rows, MAX_RELATIONSHIPS).map(|r| ThreatRelationship {
             kind: RelationshipKind::MalwareFamily,
             strength: RelationshipStrength::Direct,
             target: r.family_name,
@@ -614,15 +708,19 @@ pub async fn malware_family_matches(
                 last_seen: r.last_seen,
                 report_id: Some(r.report_id),
                 report_title: r.report_title,
-                report_url: r.report_url,
+                report_url: sanitize_stored_url(r.report_url),
                 indicator_kind: Some(r.indicator_kind),
                 indicator_value: Some(r.indicator_value),
                 detection_name: None,
                 rule_fingerprint: None,
                 timing: EvidenceTiming::Observed,
             }]],
-        })
-        .collect())
+            // One row *is* one attribution edge here, so a relationship's
+            // evidence is never itself capped -- unlike the CVE-via-report
+            // path, where many parent observations support one edge.
+            has_more_evidence: false,
+        }),
+    )
 }
 
 struct CveViaReportRow {
@@ -640,6 +738,15 @@ struct CveViaReportRow {
     parent_last_seen: DateTime<Utc>,
     parent_indicator_kind: IndicatorKind,
     parent_indicator_value: String,
+    /// This row's conceptual edge's position in the deterministic edge
+    /// ordering. The query fetches one edge past the cap, so an
+    /// `edge_rank > MAX_RELATIONSHIPS` row is the sentinel proving more
+    /// distinct edges exist; it is counted and then dropped.
+    edge_rank: i64,
+    /// How many supporting parent observations this row's edge has in total,
+    /// independent of how many were returned -- the source of
+    /// `has_more_evidence`.
+    parent_total: i64,
 }
 
 /// CVE relationships inferred through report co-occurrence: this file's
@@ -680,43 +787,130 @@ struct CveViaReportRow {
 /// wrapper, since the two run at different points in `resolve` -- see the
 /// doc comment where `cve_matches_via_detection` is called in
 /// `verdict.rs` for why.
+/// ## Bounding
+///
+/// The two dimensions here -- how many distinct CVE edges, and how many
+/// parent observations support each -- are capped separately, in SQL, using
+/// window functions rather than a single `LIMIT` on the joined rows.
+///
+/// A review caught why a joined-row `LIMIT` is wrong for this shape: the
+/// rows are grouped into conceptual relationships *after* the database
+/// returns them, so a single row budget is spent before grouping happens.
+/// With 200 matching `indicator_observed_in_report` rows for CVE edge A,
+/// the ordered result consumed the entire budget on A and an entirely
+/// distinct, equally real CVE edge B never reached the grouping code -- and
+/// nothing on the returned object said the relationship set was partial.
+/// That breaks both the promise that provenance is not silently discarded
+/// and the promise that PR #20 can treat this as the authoritative pivot
+/// set. Even at unusual cardinality, a bounded graph API has to represent
+/// its bounds honestly.
+///
+/// So: `ranked_edges` numbers the distinct `(report_id, cve_id, cve_source)`
+/// edges and keeps `MAX_RELATIONSHIPS + 1` of them (the extra one is the
+/// sentinel that proves more exist); `ranked_parents` independently numbers
+/// each kept edge's parents and keeps `MAX_EVIDENCE_PER_RELATIONSHIP`, while
+/// `parent_total` counts them all so `has_more_evidence` can be set without
+/// a second query. Both orderings are total, so which evidence survives a
+/// cap is deterministic rather than plan-dependent.
 pub(crate) async fn cve_matches_via_report(
     pool: &PgPool,
     sha256: &str,
     md5: &str,
-) -> Result<Vec<ThreatRelationship>> {
+) -> Result<Bounded<ThreatRelationship>> {
     let rows = sqlx::query_as!(
         CveViaReportRow,
         r#"
+        WITH matched AS (
+            SELECT
+                rrc.cve_id,
+                rrc.source AS cve_source,
+                rrc.confidence AS cve_confidence,
+                rrc.first_seen AS cve_first_seen,
+                rrc.last_seen AS cve_last_seen,
+                r.id AS report_id,
+                r.title AS report_title,
+                r.url AS report_url,
+                iorr.source AS parent_source,
+                iorr.confidence AS parent_confidence,
+                iorr.first_seen AS parent_first_seen,
+                iorr.last_seen AS parent_last_seen,
+                i.kind AS parent_indicator_kind,
+                i.value AS parent_indicator_value
+            FROM report_references_cve rrc
+            JOIN report r ON r.id = rrc.report_id
+            JOIN indicator_observed_in_report iorr ON iorr.report_id = r.id
+            JOIN indicator i ON i.id = iorr.indicator_id
+            WHERE (i.kind = 'sha256' AND i.value = $1) OR (i.kind = 'md5' AND i.value = $2)
+        ),
+        ranked_edges AS (
+            SELECT
+                report_id,
+                cve_id,
+                cve_source,
+                ROW_NUMBER() OVER (ORDER BY cve_id, cve_source, report_id) AS edge_rank
+            FROM (SELECT DISTINCT report_id, cve_id, cve_source FROM matched) e
+        ),
+        kept_edges AS (
+            SELECT * FROM ranked_edges WHERE edge_rank <= $3::bigint + 1
+        ),
+        ranked_parents AS (
+            SELECT
+                m.*,
+                ke.edge_rank,
+                ROW_NUMBER() OVER (
+                    PARTITION BY m.report_id, m.cve_id, m.cve_source
+                    ORDER BY (m.parent_indicator_kind = 'sha256') DESC,
+                             m.parent_last_seen DESC,
+                             m.parent_source,
+                             m.parent_indicator_value
+                ) AS parent_rank,
+                COUNT(*) OVER (
+                    PARTITION BY m.report_id, m.cve_id, m.cve_source
+                ) AS parent_total
+            FROM matched m
+            JOIN kept_edges ke
+              ON ke.report_id = m.report_id
+             AND ke.cve_id = m.cve_id
+             AND ke.cve_source = m.cve_source
+        )
         SELECT
-            rrc.cve_id,
-            rrc.source AS cve_source,
-            rrc.confidence AS cve_confidence,
-            rrc.first_seen AS cve_first_seen,
-            rrc.last_seen AS cve_last_seen,
-            r.id AS report_id,
-            r.title AS report_title,
-            r.url AS report_url,
-            iorr.source AS parent_source,
-            iorr.confidence AS parent_confidence,
-            iorr.first_seen AS parent_first_seen,
-            iorr.last_seen AS parent_last_seen,
-            i.kind AS "parent_indicator_kind: IndicatorKind",
-            i.value AS parent_indicator_value
-        FROM report_references_cve rrc
-        JOIN report r ON r.id = rrc.report_id
-        JOIN indicator_observed_in_report iorr ON iorr.report_id = r.id
-        JOIN indicator i ON i.id = iorr.indicator_id
-        WHERE (i.kind = 'sha256' AND i.value = $1) OR (i.kind = 'md5' AND i.value = $2)
-        ORDER BY rrc.cve_id, rrc.source, (i.kind = 'sha256') DESC, iorr.last_seen DESC
-        LIMIT $3
+            cve_id,
+            cve_source,
+            cve_confidence,
+            cve_first_seen,
+            cve_last_seen,
+            report_id,
+            report_title,
+            report_url,
+            parent_source,
+            parent_confidence,
+            parent_first_seen,
+            parent_last_seen,
+            parent_indicator_kind AS "parent_indicator_kind: IndicatorKind",
+            parent_indicator_value,
+            edge_rank AS "edge_rank!",
+            parent_total AS "parent_total!"
+        FROM ranked_parents
+        WHERE parent_rank <= $4::bigint
+        ORDER BY edge_rank, parent_rank
         "#,
         sha256,
         md5,
-        MAX_VERDICT_ROWS,
+        MAX_RELATIONSHIPS,
+        MAX_EVIDENCE_PER_RELATIONSHIP,
     )
     .fetch_all(pool)
     .await?;
+
+    // The query deliberately fetched one edge past the cap. If that
+    // sentinel edge came back, more distinct CVE edges exist than this
+    // result can carry -- recorded here, then dropped, so the sentinel is
+    // never itself presented as a relationship.
+    let relationships_truncated = rows.iter().any(|r| r.edge_rank > MAX_RELATIONSHIPS);
+    let rows: Vec<CveViaReportRow> = rows
+        .into_iter()
+        .filter(|r| r.edge_rank <= MAX_RELATIONSHIPS)
+        .collect();
 
     // Group by the specific report_references_cve edge each row's parent
     // hop supports -- (report_id, cve_id, cve_source) identifies exactly
@@ -734,7 +928,7 @@ pub(crate) async fn cve_matches_via_report(
             last_seen: r.parent_last_seen,
             report_id: Some(r.report_id),
             report_title: r.report_title.clone(),
-            report_url: r.report_url.clone(),
+            report_url: sanitize_stored_url(r.report_url.clone()),
             indicator_kind: Some(r.parent_indicator_kind),
             indicator_value: Some(r.parent_indicator_value.clone()),
             detection_name: None,
@@ -747,7 +941,7 @@ pub(crate) async fn cve_matches_via_report(
         }
     }
 
-    Ok(groups
+    let items = groups
         .into_iter()
         .map(|(_, r, parent_hops)| {
             let cve_hop = RelationshipEvidence {
@@ -758,7 +952,7 @@ pub(crate) async fn cve_matches_via_report(
                 last_seen: r.cve_last_seen,
                 report_id: Some(r.report_id),
                 report_title: r.report_title,
-                report_url: r.report_url,
+                report_url: sanitize_stored_url(r.report_url),
                 indicator_kind: None,
                 indicator_value: None,
                 detection_name: None,
@@ -789,9 +983,18 @@ pub(crate) async fn cve_matches_via_report(
                      treating this as confirmed."
                     .to_string(),
                 evidence_paths,
+                // `parent_total` counted every supporting observation this
+                // edge has, not just the ones returned, so this is exact
+                // without a second query.
+                has_more_evidence: r.parent_total > MAX_EVIDENCE_PER_RELATIONSHIP,
             }
         })
-        .collect())
+        .collect();
+
+    Ok(Bounded {
+        items,
+        truncated: relationships_truncated,
+    })
 }
 
 struct CveViaDetectionRow {
@@ -867,9 +1070,9 @@ pub(crate) async fn cve_matches_via_detection(
     observed_at: DateTime<Utc>,
     indicator_kind: IndicatorKind,
     indicator_value: &str,
-) -> Result<Vec<ThreatRelationship>> {
+) -> Result<Bounded<ThreatRelationship>> {
     if scanned_rules.is_empty() {
-        return Ok(vec![]);
+        return Ok(Bounded::exhaustive(vec![]));
     }
     let rule_names: Vec<String> = scanned_rules.iter().map(|(n, _)| n.clone()).collect();
     let rule_fingerprints: Vec<String> = scanned_rules.iter().map(|(_, f)| f.clone()).collect();
@@ -892,18 +1095,18 @@ pub(crate) async fn cve_matches_via_detection(
             ON scan.rule_name = d.name
         WHERE d.kind = 'yara'
           AND (dcc.rule_fingerprint = '' OR dcc.rule_fingerprint = scan.rule_fingerprint)
+        ORDER BY dcc.cve_id, dcc.source, d.name, dcc.rule_fingerprint
         LIMIT $3
         "#,
         &rule_names,
         &rule_fingerprints,
-        MAX_VERDICT_ROWS,
+        MAX_RELATIONSHIPS + 1,
     )
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(|r| ThreatRelationship {
+    Ok(
+        Bounded::from_overfetch(rows, MAX_RELATIONSHIPS).map(|r| ThreatRelationship {
             kind: RelationshipKind::Cve,
             strength: RelationshipStrength::Strong,
             target: r.cve_id,
@@ -949,8 +1152,11 @@ pub(crate) async fn cve_matches_via_detection(
                     timing: EvidenceTiming::Observed,
                 },
             ]],
-        })
-        .collect())
+            // One `detection_covers_cve` row is one complete two-hop path,
+            // so this relationship's evidence is never itself capped.
+            has_more_evidence: false,
+        }),
+    )
 }
 
 struct PathPatternRow {
@@ -986,7 +1192,10 @@ struct PathPatternRow {
 /// live one -- but Phase 2's hunt packs are specified to curate exactly
 /// this indicator kind, and the same escaping is needed for plain
 /// correctness on any legitimate path containing `%` or `_`.
-pub async fn path_pattern_matches(pool: &PgPool, file_path: &str) -> Result<Vec<ProvenanceEntry>> {
+pub async fn path_pattern_matches(
+    pool: &PgPool,
+    file_path: &str,
+) -> Result<Bounded<ProvenanceEntry>> {
     let rows = sqlx::query_as!(
         PathPatternRow,
         r#"
@@ -1004,17 +1213,17 @@ pub async fn path_pattern_matches(pool: &PgPool, file_path: &str) -> Result<Vec<
         JOIN report r ON r.id = iorr.report_id
         WHERE i.kind = 'path'
           AND $1 ILIKE '%' || replace(replace(replace(i.value, '\', '\\'), '%', '\%'), '_', '\_') || '%'
+        ORDER BY iorr.last_seen DESC, iorr.first_seen DESC, i.value, r.id, iorr.source
         LIMIT $2
         "#,
         file_path,
-        MAX_VERDICT_ROWS,
+        MAX_VERDICT_ROWS + 1,
     )
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(|r| ProvenanceEntry {
+    Ok(
+        Bounded::from_overfetch(rows, MAX_VERDICT_ROWS).map(|r| ProvenanceEntry {
             tier: VerdictTier::PathPattern,
             source: r.source,
             confidence: r.confidence,
@@ -1022,14 +1231,14 @@ pub async fn path_pattern_matches(pool: &PgPool, file_path: &str) -> Result<Vec<
             last_seen: r.last_seen,
             report_id: r.report_id,
             report_title: r.report_title,
-            report_url: r.report_url,
+            report_url: sanitize_stored_url(r.report_url),
             detection_name: None,
             indicator_kind: Some(IndicatorKind::Path),
             rule_fingerprint: None,
             timing: EvidenceTiming::Observed,
             matched_value: r.matched_value,
-        })
-        .collect())
+        }),
+    )
 }
 
 struct ContextualRow {
@@ -1045,9 +1254,22 @@ struct ContextualRow {
 /// name recorded in a report's raw payload (e.g. a MalwareBazaar sample
 /// name) without a direct hash or YARA match. Weakest tier; always shown
 /// with its source so an analyst can judge it on sight.
-pub async fn contextual_matches(pool: &PgPool, file_name: &str) -> Result<Vec<ProvenanceEntry>> {
+/// Capped at `MAX_CONTEXTUAL_ROWS` (this tier's own, tighter budget -- it is
+/// the weakest evidence, so a long list of it is the least useful), ordered
+/// most-recently-received first with `r.id` as the tiebreak so the cap is
+/// deterministic.
+///
+/// Note the cap applies to *rows*, while the returned entries are filtered
+/// (a row whose `raw->>'file_name'` is NULL produces no entry). The
+/// truncation flag therefore comes from the row count before filtering,
+/// which is the honest reading: more matching rows existed than were
+/// examined.
+pub async fn contextual_matches(
+    pool: &PgPool,
+    file_name: &str,
+) -> Result<Bounded<ProvenanceEntry>> {
     if file_name.trim().is_empty() {
-        return Ok(vec![]);
+        return Ok(Bounded::exhaustive(vec![]));
     }
     let rows = sqlx::query_as!(
         ContextualRow,
@@ -1061,43 +1283,51 @@ pub async fn contextual_matches(pool: &PgPool, file_name: &str) -> Result<Vec<Pr
             r.ingested_at
         FROM report r
         WHERE lower(r.raw ->> 'file_name') = lower($1)
-        LIMIT 20
+        ORDER BY r.ingested_at DESC, r.id
+        LIMIT $2
         "#,
         file_name,
+        MAX_CONTEXTUAL_ROWS + 1,
     )
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .filter_map(|r| {
-            let matched_value = r.matched_value?;
-            Some(ProvenanceEntry {
-                tier: VerdictTier::Contextual,
-                source: r.source,
-                confidence: 25,
-                // The report's own `ingested_at` -- a review caught an
-                // earlier version fabricating `Utc::now()` at query time as
-                // edge-style observation timing for a tier with no backing
-                // evidence edge at all. A round-6 review caught that even
-                // `ingested_at` is the wrong *label*, though it's the right
-                // *value*: it's when Apollo *received* this report, not any
-                // claimed first/last-observed window a source asserted --
-                // `timing: ReceivedOnly` below makes that distinction
-                // explicit on the wire instead of overloading
-                // `first_seen`/`last_seen` to mean two different things
-                // depending on which tier produced them.
-                first_seen: r.ingested_at,
-                last_seen: r.ingested_at,
-                timing: EvidenceTiming::ReceivedOnly,
-                report_id: Some(r.report_id),
-                report_title: r.report_title,
-                report_url: r.report_url,
-                detection_name: None,
-                indicator_kind: None,
-                rule_fingerprint: None,
-                matched_value,
+    let bounded = Bounded::from_overfetch(rows, MAX_CONTEXTUAL_ROWS);
+    let truncated = bounded.truncated;
+    Ok(Bounded {
+        truncated,
+        items: bounded
+            .items
+            .into_iter()
+            .filter_map(|r| {
+                let matched_value = r.matched_value?;
+                Some(ProvenanceEntry {
+                    tier: VerdictTier::Contextual,
+                    source: r.source,
+                    confidence: 25,
+                    // The report's own `ingested_at` -- a review caught an
+                    // earlier version fabricating `Utc::now()` at query time as
+                    // edge-style observation timing for a tier with no backing
+                    // evidence edge at all. A round-6 review caught that even
+                    // `ingested_at` is the wrong *label*, though it's the right
+                    // *value*: it's when Apollo *received* this report, not any
+                    // claimed first/last-observed window a source asserted --
+                    // `timing: ReceivedOnly` below makes that distinction
+                    // explicit on the wire instead of overloading
+                    // `first_seen`/`last_seen` to mean two different things
+                    // depending on which tier produced them.
+                    first_seen: r.ingested_at,
+                    last_seen: r.ingested_at,
+                    timing: EvidenceTiming::ReceivedOnly,
+                    report_id: Some(r.report_id),
+                    report_title: r.report_title,
+                    report_url: sanitize_stored_url(r.report_url),
+                    detection_name: None,
+                    indicator_kind: None,
+                    rule_fingerprint: None,
+                    matched_value,
+                })
             })
-        })
-        .collect())
+            .collect(),
+    })
 }

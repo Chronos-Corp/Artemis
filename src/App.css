@@ -228,6 +228,28 @@ body {
   border-radius: 6px;
 }
 
+/* Truncation notices. Amber rather than the green of .verdict-no-match:
+   this is a caveat about completeness, not a reassuring result, and an
+   analyst skimming should not read "partial evidence" in the same visual
+   register as "nothing found". */
+.verdict-truncated,
+.relationships-truncated {
+  font-size: 0.85rem;
+  color: #7a4b00;
+  background: #fdf0d5;
+  border-left: 3px solid #d79a1e;
+  padding: 0.6rem 0.75rem;
+  border-radius: 6px;
+  margin-bottom: 0.75rem;
+}
+
+.evidence-truncated {
+  font-size: 0.75rem;
+  color: #7a4b00;
+  font-style: italic;
+  margin-top: 0.3rem;
+}
+
 .file-intel {
   font-size: 0.8rem;
   margin-bottom: 1rem;

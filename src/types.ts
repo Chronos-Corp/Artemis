@@ -181,6 +181,27 @@ export interface ThreatRelationship {
   // shared-tail shape look like a single linear chain. Never empty, and no
   // inner path is ever empty.
   evidence_paths: RelationshipEvidence[][];
+  // True when this relationship has more supporting evidence paths than
+  // `evidence_paths` carries, because the per-relationship evidence cap
+  // fired. Distinct from VerdictBounds.relationships_truncated: "this CVE
+  // has more supporting observations than shown" and "there are more CVEs
+  // than shown" are different claims.
+  has_more_evidence: boolean;
+}
+
+// Which parts of a verdict were bounded rather than exhaustive. Row caps
+// keep one file from producing an unbounded payload, but a review caught
+// that without this, a capped result was indistinguishable from a complete
+// one -- so neither the analyst nor PR #20's hunt engine could tell that
+// evidence had been withheld. A safe bound must not look like an
+// exhaustive result.
+export interface VerdictBounds {
+  // Tiers whose entries hit the per-query row cap. Per-tier rather than one
+  // flag because the tiers come from separate queries with separate caps.
+  truncated_entry_tiers: VerdictTier[];
+  // True when distinct related concepts exist that `threat_relationships`
+  // does not list at all.
+  relationships_truncated: boolean;
 }
 
 export interface Verdict {
@@ -190,6 +211,7 @@ export interface Verdict {
   entries: ProvenanceEntry[];
   intel_freshness: IntelSourceFreshness[];
   threat_relationships: ThreatRelationship[];
+  bounds: VerdictBounds;
 }
 
 export interface SyncSummary {

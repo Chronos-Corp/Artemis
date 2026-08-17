@@ -5,9 +5,15 @@ import {
   RELATIONSHIP_STRENGTH_LABELS,
   RELATIONSHIP_STRENGTH_ORDER,
 } from "../types";
+import { safeExternalUrl } from "../lib/safeUrl";
 
 interface Props {
   relationships: ThreatRelationship[];
+  // True when distinct related concepts exist that `relationships` does not
+  // list at all (VerdictBounds.relationships_truncated). Rendered rather
+  // than ignored: PR #20 treats this set as the authoritative pivot set, so
+  // an analyst comparing against it needs to know when it is a subset.
+  relationshipsTruncated?: boolean;
 }
 
 function strengthClass(strength: RelationshipStrength): string {
@@ -21,8 +27,13 @@ function strengthClass(strength: RelationshipStrength): string {
 // first within each group -- the Constitution's Open·3 concern is exactly
 // this: "related to" must not flatten into an unbounded, unordered list an
 // analyst has to triage by hand.
-export function ThreatRelationshipList({ relationships }: Props) {
-  if (relationships.length === 0) {
+export function ThreatRelationshipList({
+  relationships,
+  relationshipsTruncated = false,
+}: Props) {
+  // Still render when the list is empty but truncation fired -- "nothing to
+  // show" and "we stopped looking" must not collapse into the same silence.
+  if (relationships.length === 0 && !relationshipsTruncated) {
     return null;
   }
 
@@ -43,6 +54,13 @@ export function ThreatRelationshipList({ relationships }: Props) {
   return (
     <div className="threat-relationships">
       <div className="threat-relationships-label">Threat relationships</div>
+      {relationshipsTruncated && (
+        <div className="relationships-truncated" role="status">
+          <strong>Partial relationship set.</strong> This file has more
+          distinct related concepts than are listed here. Do not treat this as
+          the complete pivot set.
+        </div>
+      )}
       {Array.from(byKind.entries()).map(([kind, group]) => (
         <div key={kind} className="relationship-group">
           <div className="relationship-group-label">
@@ -85,11 +103,18 @@ export function ThreatRelationshipList({ relationships }: Props) {
                           {e.source} -- {e.confidence}% confidence
                           {e.detection_name && ` -- ${e.detection_name}`}
                           {e.indicator_value && ` -- ${e.indicator_value}`}
+                          {/* Revalidated at the sink, never trusted from the
+                              wire object -- see lib/safeUrl.ts (TB-3). A
+                              rejected URL renders the title as plain text. */}
                           {e.report_title &&
-                            (e.report_url ? (
+                            (safeExternalUrl(e.report_url) ? (
                               <>
                                 {" -- "}
-                                <a href={e.report_url} target="_blank" rel="noreferrer">
+                                <a
+                                  href={safeExternalUrl(e.report_url)!}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                >
                                   {e.report_title}
                                 </a>
                               </>
@@ -100,6 +125,12 @@ export function ThreatRelationshipList({ relationships }: Props) {
                       ))}
                     </div>
                   ))}
+                  {r.has_more_evidence && (
+                    <div className="evidence-truncated" role="status">
+                      More supporting evidence exists for this relationship
+                      than is shown.
+                    </div>
+                  )}
                 </div>
               </li>
             ))}

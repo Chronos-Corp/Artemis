@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            dcc.cve_id,\n            dcc.source AS cve_source,\n            dcc.confidence AS cve_confidence,\n            dcc.first_seen AS cve_first_seen,\n            dcc.last_seen AS cve_last_seen,\n            d.name AS detection_name,\n            scan.rule_fingerprint AS \"scan_rule_fingerprint!\",\n            dcc.rule_fingerprint AS edge_rule_fingerprint\n        FROM detection_covers_cve dcc\n        JOIN detection d ON d.id = dcc.detection_id\n        JOIN UNNEST($1::text[], $2::text[]) AS scan(rule_name, rule_fingerprint)\n            ON scan.rule_name = d.name\n        WHERE d.kind = 'yara'\n          AND (dcc.rule_fingerprint = '' OR dcc.rule_fingerprint = scan.rule_fingerprint)\n        LIMIT $3\n        ",
+  "query": "\n        SELECT\n            dcc.cve_id,\n            dcc.source AS cve_source,\n            dcc.confidence AS cve_confidence,\n            dcc.first_seen AS cve_first_seen,\n            dcc.last_seen AS cve_last_seen,\n            d.name AS detection_name,\n            scan.rule_fingerprint AS \"scan_rule_fingerprint!\",\n            dcc.rule_fingerprint AS edge_rule_fingerprint\n        FROM detection_covers_cve dcc\n        JOIN detection d ON d.id = dcc.detection_id\n        JOIN UNNEST($1::text[], $2::text[]) AS scan(rule_name, rule_fingerprint)\n            ON scan.rule_name = d.name\n        WHERE d.kind = 'yara'\n          AND (dcc.rule_fingerprint = '' OR dcc.rule_fingerprint = scan.rule_fingerprint)\n        ORDER BY dcc.cve_id, dcc.source, d.name, dcc.rule_fingerprint\n        LIMIT $3\n        ",
   "describe": {
     "columns": [
       {
@@ -62,5 +62,5 @@
       false
     ]
   },
-  "hash": "7ef6a6a89cc1dac24310deb2a94798f29b219c455711ac97b1b55b9103b86c49"
+  "hash": "1055673220ac0ac34cbb5c2ab8c6fa40a0b1af3cad826566c10cd1ce1094e595"
 }
