@@ -10,6 +10,19 @@ use crate::models::{
     ThreatRelationship, VerdictTier,
 };
 
+/// Ceiling on rows any single verdict lookup returns to the UI.
+///
+/// Not real pagination (there is no cursor) -- a bound, so one file can't
+/// produce an unbounded provenance list or relationship set. The intel
+/// graph is populated from third-party feeds, so "how many reports observe
+/// this one hash" is not a number Apollo controls; without a cap, a hash
+/// that many reports reference inflates the IPC payload to the webview and
+/// the list an analyst has to scroll. `contextual_matches` already capped
+/// itself at 20; the other lookups did not, which was an inconsistency
+/// rather than a deliberate choice. 200 is far past what is readable and
+/// still safely bounded. See `docs/threat-model.md` (resource bounds).
+const MAX_VERDICT_ROWS: i64 = 200;
+
 /// Returns (report_id, was_inserted). was_inserted uses the `xmax = 0` trick
 /// so callers can report accurate added-vs-updated counts after a sync.
 ///
@@ -470,9 +483,11 @@ pub async fn hash_matches(
         JOIN indicator_observed_in_report iorr ON iorr.indicator_id = i.id
         JOIN report r ON r.id = iorr.report_id
         WHERE i.kind = $1 AND i.value = $2
+        LIMIT $3
         "#,
         kind as IndicatorKind,
         value,
+        MAX_VERDICT_ROWS,
     )
     .fetch_all(pool)
     .await?;
@@ -572,9 +587,11 @@ pub async fn malware_family_matches(
         JOIN malware_family mf ON mf.id = iamf.malware_family_id
         JOIN report r ON r.id = iamf.report_id
         WHERE (i.kind = 'sha256' AND i.value = $1) OR (i.kind = 'md5' AND i.value = $2)
+        LIMIT $3
         "#,
         sha256,
         md5,
+        MAX_VERDICT_ROWS,
     )
     .fetch_all(pool)
     .await?;
@@ -692,9 +709,11 @@ pub(crate) async fn cve_matches_via_report(
         JOIN indicator i ON i.id = iorr.indicator_id
         WHERE (i.kind = 'sha256' AND i.value = $1) OR (i.kind = 'md5' AND i.value = $2)
         ORDER BY rrc.cve_id, rrc.source, (i.kind = 'sha256') DESC, iorr.last_seen DESC
+        LIMIT $3
         "#,
         sha256,
         md5,
+        MAX_VERDICT_ROWS,
     )
     .fetch_all(pool)
     .await?;
@@ -873,9 +892,11 @@ pub(crate) async fn cve_matches_via_detection(
             ON scan.rule_name = d.name
         WHERE d.kind = 'yara'
           AND (dcc.rule_fingerprint = '' OR dcc.rule_fingerprint = scan.rule_fingerprint)
+        LIMIT $3
         "#,
         &rule_names,
         &rule_fingerprints,
+        MAX_VERDICT_ROWS,
     )
     .fetch_all(pool)
     .await?;
@@ -947,6 +968,24 @@ struct PathPatternRow {
 /// contains. Patterns are stored as plain substrings in Phase 0. Inner
 /// joins here are deliberate: a path indicator with no observed_in_report
 /// edge has no provenance to show and should not surface a verdict.
+///
+/// The indicator value is escaped for LIKE before use. Postgres treats
+/// `%` and `_` as wildcards inside a LIKE pattern, so an unescaped
+/// indicator value of just `%` matches *every* scanned file -- one
+/// poisoned or malformed intel row becoming a universal false positive
+/// that would look, to an analyst, like a genuine path-indicator hit on
+/// everything they click. Confirmed against Postgres directly
+/// (`'/any/path' ILIKE '%' || '%' || '%'` is `true`). The escaping is done
+/// SQL-side with `replace` rather than via `sanitize::escape_like_pattern`
+/// because the value is a *column*, not a bind parameter -- backslash
+/// first so it can't be used to escape the `%` delimiters this query adds.
+/// See `docs/threat-model.md`, TB-2.
+///
+/// No feed currently writes path indicators (neither MalwareBazaar nor
+/// ThreatFox produces them), so this is a latent defect rather than a
+/// live one -- but Phase 2's hunt packs are specified to curate exactly
+/// this indicator kind, and the same escaping is needed for plain
+/// correctness on any legitimate path containing `%` or `_`.
 pub async fn path_pattern_matches(pool: &PgPool, file_path: &str) -> Result<Vec<ProvenanceEntry>> {
     let rows = sqlx::query_as!(
         PathPatternRow,
@@ -963,9 +1002,12 @@ pub async fn path_pattern_matches(pool: &PgPool, file_path: &str) -> Result<Vec<
         FROM indicator i
         JOIN indicator_observed_in_report iorr ON iorr.indicator_id = i.id
         JOIN report r ON r.id = iorr.report_id
-        WHERE i.kind = 'path' AND $1 ILIKE '%' || i.value || '%'
+        WHERE i.kind = 'path'
+          AND $1 ILIKE '%' || replace(replace(replace(i.value, '\', '\\'), '%', '\%'), '_', '\_') || '%'
+        LIMIT $2
         "#,
         file_path,
+        MAX_VERDICT_ROWS,
     )
     .fetch_all(pool)
     .await?;

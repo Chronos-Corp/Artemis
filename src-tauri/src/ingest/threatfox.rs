@@ -95,10 +95,23 @@ pub async fn sync(pool: &PgPool, api_key: &str) -> Result<SyncSummary> {
             .malware_printable
             .clone()
             .unwrap_or_else(|| "ThreatFox IOC".to_string());
+        // `reference` is supplied by whoever submitted this IOC to
+        // ThreatFox -- community-submitted attacker-influenceable text,
+        // not abuse.ch's own data. It ends up stored on `report.url` and
+        // rendered to the analyst as a clickable provenance link in a
+        // Tauri webview that holds the IPC bridge, so it is scheme-checked
+        // here at the trust boundary (docs/threat-model.md, TB-2) rather
+        // than relying on whichever renderer happens to consume it. A
+        // rejected reference falls back to ThreatFox's own canonical IOC
+        // URL, built from the feed's ID -- so the analyst still gets a
+        // working provenance link, just not the attacker's chosen one.
+        let canonical_url = format!("https://threatfox.abuse.ch/ioc/{}/", ioc.id);
         let url = ioc
             .reference
-            .clone()
-            .unwrap_or_else(|| format!("https://threatfox.abuse.ch/ioc/{}/", ioc.id));
+            .as_deref()
+            .and_then(nsic_core::sanitize::safe_external_url)
+            .unwrap_or(&canonical_url)
+            .to_string();
 
         let (report_id, report_inserted) = db::upsert_report(
             &mut *tx,

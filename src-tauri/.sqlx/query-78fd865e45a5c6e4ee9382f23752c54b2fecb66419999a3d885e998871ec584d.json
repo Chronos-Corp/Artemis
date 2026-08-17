@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            rrc.cve_id,\n            rrc.source AS cve_source,\n            rrc.confidence AS cve_confidence,\n            rrc.first_seen AS cve_first_seen,\n            rrc.last_seen AS cve_last_seen,\n            r.id AS report_id,\n            r.title AS report_title,\n            r.url AS report_url,\n            iorr.source AS parent_source,\n            iorr.confidence AS parent_confidence,\n            iorr.first_seen AS parent_first_seen,\n            iorr.last_seen AS parent_last_seen,\n            i.kind AS \"parent_indicator_kind: IndicatorKind\",\n            i.value AS parent_indicator_value\n        FROM report_references_cve rrc\n        JOIN report r ON r.id = rrc.report_id\n        JOIN indicator_observed_in_report iorr ON iorr.report_id = r.id\n        JOIN indicator i ON i.id = iorr.indicator_id\n        WHERE (i.kind = 'sha256' AND i.value = $1) OR (i.kind = 'md5' AND i.value = $2)\n        ORDER BY rrc.cve_id, rrc.source, (i.kind = 'sha256') DESC, iorr.last_seen DESC\n        ",
+  "query": "\n        SELECT\n            rrc.cve_id,\n            rrc.source AS cve_source,\n            rrc.confidence AS cve_confidence,\n            rrc.first_seen AS cve_first_seen,\n            rrc.last_seen AS cve_last_seen,\n            r.id AS report_id,\n            r.title AS report_title,\n            r.url AS report_url,\n            iorr.source AS parent_source,\n            iorr.confidence AS parent_confidence,\n            iorr.first_seen AS parent_first_seen,\n            iorr.last_seen AS parent_last_seen,\n            i.kind AS \"parent_indicator_kind: IndicatorKind\",\n            i.value AS parent_indicator_value\n        FROM report_references_cve rrc\n        JOIN report r ON r.id = rrc.report_id\n        JOIN indicator_observed_in_report iorr ON iorr.report_id = r.id\n        JOIN indicator i ON i.id = iorr.indicator_id\n        WHERE (i.kind = 'sha256' AND i.value = $1) OR (i.kind = 'md5' AND i.value = $2)\n        ORDER BY rrc.cve_id, rrc.source, (i.kind = 'sha256') DESC, iorr.last_seen DESC\n        LIMIT $3\n        ",
   "describe": {
     "columns": [
       {
@@ -96,7 +96,8 @@
     "parameters": {
       "Left": [
         "Text",
-        "Text"
+        "Text",
+        "Int8"
       ]
     },
     "nullable": [
@@ -116,5 +117,5 @@
       false
     ]
   },
-  "hash": "75b2a55dd648dbb991e6caa29a277a92645bc3d9ba225a710b5c3eaa10491e47"
+  "hash": "78fd865e45a5c6e4ee9382f23752c54b2fecb66419999a3d885e998871ec584d"
 }

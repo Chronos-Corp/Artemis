@@ -2002,6 +2002,110 @@ mod tests {
         );
     }
 
+    /// Self-review finding (threat model TB-2, pattern injection): a path
+    /// indicator's value is interpolated into an `ILIKE` pattern, and
+    /// Postgres treats `%`/`_` as wildcards there. An unescaped `%`
+    /// indicator therefore matches *every* file the analyst clicks --
+    /// one poisoned or malformed intel row presenting as a genuine
+    /// path-indicator hit on everything, which is exactly the kind of
+    /// silent trust failure the Constitution's provenance rules exist to
+    /// prevent.
+    ///
+    /// Seeds a literal `%` path indicator (with real report provenance, so
+    /// it would otherwise surface) against a scanned file whose path has
+    /// nothing to do with it, and asserts it does not match. The companion
+    /// assertion -- that a *legitimate* indicator containing a literal `%`
+    /// still matches a path genuinely containing it -- guards the obvious
+    /// wrong fix of stripping the characters instead of escaping them.
+    #[tokio::test]
+    #[ignore]
+    async fn a_wildcard_path_indicator_does_not_match_every_scanned_file() {
+        let database_url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://nsic:nsic@localhost:5432/nsic".to_string());
+        let pool = crate::db::connect_and_migrate(&database_url)
+            .await
+            .expect("connect to test database");
+
+        let marker = uuid::Uuid::new_v4();
+        let now = Utc::now();
+        let (report_id, _) = crate::db::indicators::upsert_report(
+            &pool,
+            "test-source",
+            Some(&format!("wildcard-{marker}")),
+            Some("Test report"),
+            None,
+            Some(now),
+            &serde_json::json!({}),
+        )
+        .await
+        .expect("seed report");
+
+        // The hostile shape: a bare `%`, which as an unescaped LIKE
+        // pattern matches anything at all.
+        let (wildcard_id, _) =
+            crate::db::indicators::upsert_indicator(&pool, IndicatorKind::Path, "%")
+                .await
+                .expect("seed wildcard path indicator");
+        crate::db::indicators::upsert_indicator_observed_in_report(
+            &pool,
+            wildcard_id,
+            report_id,
+            "test-source",
+            90,
+            now,
+            now,
+        )
+        .await
+        .expect("seed observation for the wildcard indicator");
+
+        // A legitimate indicator that happens to contain a literal `%`,
+        // seeded with a unique marker so it can only match the second
+        // file below.
+        let literal_value = format!("lit%{}", marker.simple());
+        let (literal_id, _) =
+            crate::db::indicators::upsert_indicator(&pool, IndicatorKind::Path, &literal_value)
+                .await
+                .expect("seed literal-percent path indicator");
+        crate::db::indicators::upsert_indicator_observed_in_report(
+            &pool,
+            literal_id,
+            report_id,
+            "test-source",
+            90,
+            now,
+            now,
+        )
+        .await
+        .expect("seed observation for the literal indicator");
+
+        let unrelated = crate::db::indicators::path_pattern_matches(
+            &pool,
+            &format!("/home/analyst/unrelated-{marker}.txt"),
+        )
+        .await
+        .expect("path pattern lookup");
+        assert!(
+            !unrelated.iter().any(|e| e.matched_value == "%"),
+            "a `%` path indicator must not match an unrelated file -- LIKE wildcards in an \
+             indicator value have to be escaped, got: {unrelated:?}"
+        );
+
+        let genuinely_matching = crate::db::indicators::path_pattern_matches(
+            &pool,
+            &format!("/opt/{literal_value}/payload.bin"),
+        )
+        .await
+        .expect("path pattern lookup");
+        assert!(
+            genuinely_matching
+                .iter()
+                .any(|e| e.matched_value == literal_value),
+            "escaping must not break a legitimate indicator that contains a literal `%` -- it \
+             should still match a path genuinely containing that text, got: \
+             {genuinely_matching:?}"
+        );
+    }
+
     /// Review finding 1 (round 4), second requested regression shape: a
     /// rule historically recorded as having matched this hash must not
     /// resurrect as a *current* `YaraHit`/`Detection` relationship just

@@ -8,6 +8,7 @@
 pub mod hashing;
 pub mod models;
 pub mod proto;
+pub mod sanitize;
 
 #[cfg(feature = "db")]
 pub mod db;

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            mf.name AS family_name,\n            iamf.source,\n            iamf.confidence,\n            iamf.first_seen,\n            iamf.last_seen,\n            r.id AS report_id,\n            r.title AS report_title,\n            r.url AS report_url,\n            i.kind AS \"indicator_kind: IndicatorKind\",\n            i.value AS indicator_value\n        FROM indicator i\n        JOIN indicator_attributed_to_malware_family iamf ON iamf.indicator_id = i.id\n        JOIN malware_family mf ON mf.id = iamf.malware_family_id\n        JOIN report r ON r.id = iamf.report_id\n        WHERE (i.kind = 'sha256' AND i.value = $1) OR (i.kind = 'md5' AND i.value = $2)\n        ",
+  "query": "\n        SELECT\n            mf.name AS family_name,\n            iamf.source,\n            iamf.confidence,\n            iamf.first_seen,\n            iamf.last_seen,\n            r.id AS report_id,\n            r.title AS report_title,\n            r.url AS report_url,\n            i.kind AS \"indicator_kind: IndicatorKind\",\n            i.value AS indicator_value\n        FROM indicator i\n        JOIN indicator_attributed_to_malware_family iamf ON iamf.indicator_id = i.id\n        JOIN malware_family mf ON mf.id = iamf.malware_family_id\n        JOIN report r ON r.id = iamf.report_id\n        WHERE (i.kind = 'sha256' AND i.value = $1) OR (i.kind = 'md5' AND i.value = $2)\n        LIMIT $3\n        ",
   "describe": {
     "columns": [
       {
@@ -76,7 +76,8 @@
     "parameters": {
       "Left": [
         "Text",
-        "Text"
+        "Text",
+        "Int8"
       ]
     },
     "nullable": [
@@ -92,5 +93,5 @@
       false
     ]
   },
-  "hash": "d7513dbfa0d337ce4ca1902ad889f23c482265c9cbdb439600578d174f1589ab"
+  "hash": "77f5d1ecb0924130740994264dadf2cdf4adaad969e21afff82b7a70d742768d"
 }

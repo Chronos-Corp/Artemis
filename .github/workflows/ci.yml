@@ -130,3 +130,27 @@ jobs:
       - run: npm ci
       - run: npx tsc --noEmit
       - run: npm run build
+      - name: npm audit (production dependencies)
+        run: npm audit --omit=dev
+
+  # Supply-chain check, per docs/threat-model.md. Added after an open
+  # Dependabot alert went unread across seven review rounds on PR #19:
+  # a advisory scan nobody is required to look at is not a control.
+  # Triaged exceptions live in .cargo/audit.toml, each with a written
+  # reason and a re-check condition -- never a blanket suppression.
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: cargo audit
+        run: cargo audit

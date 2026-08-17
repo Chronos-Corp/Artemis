@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            i.value AS matched_value,\n            iorr.source,\n            iorr.confidence,\n            iorr.first_seen,\n            iorr.last_seen,\n            r.id AS \"report_id?\",\n            r.title AS report_title,\n            r.url AS report_url\n        FROM indicator i\n        JOIN indicator_observed_in_report iorr ON iorr.indicator_id = i.id\n        JOIN report r ON r.id = iorr.report_id\n        WHERE i.kind = 'path' AND $1 ILIKE '%' || i.value || '%'\n        ",
+  "query": "\n        SELECT\n            i.value AS matched_value,\n            iorr.source,\n            iorr.confidence,\n            iorr.first_seen,\n            iorr.last_seen,\n            r.id AS \"report_id?\",\n            r.title AS report_title,\n            r.url AS report_url\n        FROM indicator i\n        JOIN indicator_observed_in_report iorr ON iorr.indicator_id = i.id\n        JOIN report r ON r.id = iorr.report_id\n        WHERE i.kind = 'path'\n          AND $1 ILIKE '%' || replace(replace(replace(i.value, '\\', '\\\\'), '%', '\\%'), '_', '\\_') || '%'\n        LIMIT $2\n        ",
   "describe": {
     "columns": [
       {
@@ -46,7 +46,8 @@
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "Text",
+        "Int8"
       ]
     },
     "nullable": [
@@ -60,5 +61,5 @@
       true
     ]
   },
-  "hash": "3d6f93c2098dfc40e0fe466c3c8d3a74da831b9e1a3a1fc24d721bfbbc84cfa5"
+  "hash": "5c9e60b9ebc619a98d935ccf35dd62ab7b584486d0d64f220905f1dcc6e65778"
 }
