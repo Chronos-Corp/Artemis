@@ -15,3 +15,18 @@ pub mod db;
 
 #[cfg(feature = "yara-scan")]
 pub mod yara_scan;
+
+// `yara::Rules` itself does not expose a useful Debug implementation, but
+// callers and tests can still benefit from seeing the safe, public identity
+// of an engine when a Result assertion fails. Keep the compiled rule object
+// opaque while exposing the fields that actually identify the loaded set.
+#[cfg(feature = "yara-scan")]
+impl std::fmt::Debug for yara_scan::YaraEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("YaraEngine")
+            .field("rules_dir", &self.rules_dir)
+            .field("rule_count", &self.rule_count)
+            .field("ruleset_fingerprint", &self.ruleset_fingerprint)
+            .finish_non_exhaustive()
+    }
+}
