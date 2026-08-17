@@ -1,11 +1,15 @@
 use anyhow::{bail, Context, Result};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+// The inner module deliberately retains a few helper/test-only items from
+// the scanner implementation. They are private implementation detail behind
+// this facade, so keep lint exceptions scoped here rather than weakening the
+// crate/workspace lint policy.
+#[allow(dead_code, unused_imports)]
 #[path = "yara_scan_inner.rs"]
 mod inner;
 
