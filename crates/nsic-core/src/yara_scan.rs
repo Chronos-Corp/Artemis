@@ -11,6 +11,21 @@ mod inner;
 
 pub use inner::{BoundedYaraMatches, YaraMatch, MAX_YARA_MATCHES_PER_VERDICT};
 
+// `yara::Rules` does not implement Debug. The preserved inner scanner's own
+// unit tests use `Result::expect_err`, which requires the success type to be
+// debuggable even though the compiled rule object should remain opaque.
+// Mirror the public facade's safe Debug view rather than dropping those tests
+// or exposing libyara internals.
+impl std::fmt::Debug for inner::YaraEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("YaraEngine")
+            .field("rules_dir", &self.rules_dir)
+            .field("rule_count", &self.rule_count)
+            .field("ruleset_fingerprint", &self.ruleset_fingerprint)
+            .finish_non_exhaustive()
+    }
+}
+
 // These mirror the inner loader's hard ceilings. The facade performs a
 // security preflight before libyara sees any source so an `include` cannot
 // escape those ceilings; the inner loader then enforces the same bounds again
