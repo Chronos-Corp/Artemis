@@ -296,6 +296,18 @@ where
 
 /// Mirrors `src-tauri`'s `upsert_detection_detects_indicator` verbatim
 /// (see `upsert_indicator`'s doc comment for why this isn't shared code).
+///
+/// PR #19 (desktop) added a `rule_fingerprint` column to this table and
+/// made it part of the primary key, so a rule-content version gets its own
+/// row instead of an `ON CONFLICT` silently overwriting an earlier
+/// version's history -- see `src-tauri/migrations/0010_rule_fingerprint.sql`.
+/// This console path always writes the wildcard (`''`, "applies to any
+/// rule version"): a fleet sighting's per-rule content identity is already
+/// fully captured on `host_sighted_indicator.ruleset_fingerprint` (the
+/// authenticated, per-host claim), and fabricating a specific
+/// `rule_fingerprint` value here -- one this endpoint has no independent
+/// way to verify -- would repeat the exact provenance-fabrication mistake
+/// PR #19's round 6 review caught and fixed on the desktop side.
 #[allow(clippy::too_many_arguments)]
 async fn upsert_detection_detects_indicator<'e, E>(
     executor: E,
@@ -311,9 +323,9 @@ where
 {
     sqlx::query(
         "INSERT INTO detection_detects_indicator \
-            (detection_id, indicator_id, source, confidence, first_seen, last_seen) \
-         VALUES ($1, $2, $3, $4, $5, $6) \
-         ON CONFLICT (detection_id, indicator_id, source) DO UPDATE SET \
+            (detection_id, indicator_id, source, confidence, first_seen, last_seen, rule_fingerprint) \
+         VALUES ($1, $2, $3, $4, $5, $6, '') \
+         ON CONFLICT (detection_id, indicator_id, source, rule_fingerprint) DO UPDATE SET \
             confidence = EXCLUDED.confidence, \
             first_seen = LEAST(detection_detects_indicator.first_seen, EXCLUDED.first_seen), \
             last_seen = GREATEST(detection_detects_indicator.last_seen, EXCLUDED.last_seen)",
