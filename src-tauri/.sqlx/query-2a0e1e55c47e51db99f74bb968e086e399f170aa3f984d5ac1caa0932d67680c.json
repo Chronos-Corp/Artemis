@@ -1,0 +1,65 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            dcc.cve_id,\n            dcc.source AS cve_source,\n            dcc.confidence AS cve_confidence,\n            dcc.first_seen AS cve_first_seen,\n            dcc.last_seen AS cve_last_seen,\n            d.name AS detection_name,\n            scan.rule_fingerprint AS \"scan_rule_fingerprint!\",\n            dcc.rule_fingerprint AS edge_rule_fingerprint\n        FROM detection_covers_cve dcc\n        JOIN detection d ON d.id = dcc.detection_id\n        JOIN UNNEST($1::text[], $2::text[]) AS scan(rule_name, rule_fingerprint)\n            ON scan.rule_name = d.name\n        WHERE d.kind = 'yara'\n          AND (dcc.rule_fingerprint = '' OR dcc.rule_fingerprint = scan.rule_fingerprint)\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "cve_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "cve_source",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "cve_confidence",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 3,
+        "name": "cve_first_seen",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 4,
+        "name": "cve_last_seen",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "detection_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "scan_rule_fingerprint!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "edge_rule_fingerprint",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      null,
+      false
+    ]
+  },
+  "hash": "2a0e1e55c47e51db99f74bb968e086e399f170aa3f984d5ac1caa0932d67680c"
+}
