@@ -1,5 +1,7 @@
 use crate::db::indicators::MAX_EVIDENCE_PER_RELATIONSHIP;
-use crate::models::{RelationshipKind, RelationshipStrength, ThreatRelationship, Verdict};
+use crate::models::{
+    EvidenceRelation, RelationshipKind, RelationshipStrength, ThreatRelationship, Verdict,
+};
 
 /// Finalizes the analyst-facing RELATE contract before it crosses Tauri IPC.
 ///
@@ -12,10 +14,13 @@ use crate::models::{RelationshipKind, RelationshipStrength, ThreatRelationship, 
 /// paths. Orion/Execute cannot safely consume a threshold-dependent object.
 ///
 /// The wire contract is therefore normalized here at every cardinality:
-/// one `(kind, target, strength)` object represents one relationship concept
-/// reached by one evidence mechanism/strength class, and every supporting
-/// assertion is carried as an independently-walkable evidence path (bounded
-/// separately). Strong and contextual routes to the same target remain
+/// one `(kind, target, strength, evidence-route shape)` object represents one
+/// relationship concept reached by one evidence mechanism/strength class,
+/// and every supporting assertion is carried as an independently-walkable
+/// evidence path (bounded separately). The route shape is part of identity so
+/// a future pair of different mechanisms that happen to receive the same
+/// strength cannot be silently collapsed merely because they reach the same
+/// target. Strong and contextual routes to the same target likewise remain
 /// separate because they make materially different evidentiary claims.
 pub fn finalize_verdict(mut verdict: Verdict) -> Verdict {
     verdict.threat_relationships = coalesce_relationships(verdict.threat_relationships);
@@ -34,11 +39,10 @@ pub fn coalesce_relationships(
             relationship.has_more_evidence = true;
         }
 
-        if let Some(existing) = normalized.iter_mut().find(|candidate| {
-            candidate.kind == relationship.kind
-                && candidate.target == relationship.target
-                && candidate.strength == relationship.strength
-        }) {
+        if let Some(existing) = normalized
+            .iter_mut()
+            .find(|candidate| same_semantic_relationship(candidate, &relationship))
+        {
             let incoming_has_more = relationship.has_more_evidence;
             for path in relationship.evidence_paths {
                 if existing.evidence_paths.len() < evidence_limit {
@@ -57,6 +61,11 @@ pub fn coalesce_relationships(
             // the exact rule identities for inspection and machine use.
             if existing.kind == RelationshipKind::Cve
                 && existing.strength == RelationshipStrength::Strong
+                && route_shape(existing)
+                    == Some(vec![
+                        EvidenceRelation::DetectsIndicator,
+                        EvidenceRelation::DetectionCoversCve,
+                    ])
             {
                 existing.explanation =
                     "One or more local detections that matched this exact file in the current scan are documented to cover this CVE -- inspect the evidence paths for the supporting rules, assess exposure, and hunt for exploitation evidence."
@@ -70,19 +79,45 @@ pub fn coalesce_relationships(
     normalized
 }
 
+fn same_semantic_relationship(left: &ThreatRelationship, right: &ThreatRelationship) -> bool {
+    left.kind == right.kind
+        && left.target == right.target
+        && left.strength == right.strength
+        && route_shape(left) == route_shape(right)
+}
+
+/// The relation sequence of one complete path is the relationship's
+/// mechanism identity. Constructors for one relationship object are required
+/// to emit paths with the same route shape; if a malformed object ever mixes
+/// shapes, returning `None` prevents it from being coalesced with another
+/// object and therefore fails conservatively rather than losing distinctions.
+fn route_shape(relationship: &ThreatRelationship) -> Option<Vec<EvidenceRelation>> {
+    let first = relationship.evidence_paths.first()?;
+    let shape: Vec<EvidenceRelation> = first.iter().map(|hop| hop.relation).collect();
+    if relationship.evidence_paths.iter().all(|path| {
+        path.len() == shape.len()
+            && path
+                .iter()
+                .zip(shape.iter())
+                .all(|(hop, relation)| hop.relation == *relation)
+    }) {
+        Some(shape)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Utc;
 
-    use crate::models::{
-        EvidenceRelation, EvidenceTiming, IndicatorKind, RelationshipEvidence,
-    };
+    use crate::models::{EvidenceTiming, IndicatorKind, RelationshipEvidence};
 
-    fn evidence(source: &str) -> Vec<RelationshipEvidence> {
+    fn evidence(source: &str, relation: EvidenceRelation) -> Vec<RelationshipEvidence> {
         let now = Utc::now();
         vec![RelationshipEvidence {
-            relation: EvidenceRelation::ObservedInReport,
+            relation,
             source: source.to_string(),
             confidence: 70,
             first_seen: now,
@@ -102,13 +137,14 @@ mod tests {
         target: &str,
         strength: RelationshipStrength,
         source: &str,
+        relation: EvidenceRelation,
     ) -> ThreatRelationship {
         ThreatRelationship {
             kind: RelationshipKind::Cve,
             strength,
             target: target.to_string(),
             explanation: format!("assertion from {source}"),
-            evidence_paths: vec![evidence(source)],
+            evidence_paths: vec![evidence(source, relation)],
             has_more_evidence: false,
         }
     }
@@ -116,8 +152,18 @@ mod tests {
     #[test]
     fn normal_cardinality_assertions_emit_one_stable_concept_object() {
         let normalized = coalesce_relationships(vec![
-            relationship("CVE-2099-0001", RelationshipStrength::Contextual, "report-a"),
-            relationship("CVE-2099-0001", RelationshipStrength::Contextual, "report-b"),
+            relationship(
+                "CVE-2099-0001",
+                RelationshipStrength::Contextual,
+                "report-a",
+                EvidenceRelation::ObservedInReport,
+            ),
+            relationship(
+                "CVE-2099-0001",
+                RelationshipStrength::Contextual,
+                "report-b",
+                EvidenceRelation::ObservedInReport,
+            ),
         ]);
 
         assert_eq!(normalized.len(), 1);
@@ -132,13 +178,26 @@ mod tests {
             "CVE-2099-0002",
             RelationshipStrength::Contextual,
             "report-a",
+            EvidenceRelation::ObservedInReport,
         );
-        grouped.evidence_paths.push(evidence("report-b"));
+        grouped
+            .evidence_paths
+            .push(evidence("report-b", EvidenceRelation::ObservedInReport));
 
         let from_grouped = coalesce_relationships(vec![grouped]);
         let from_assertions = coalesce_relationships(vec![
-            relationship("CVE-2099-0002", RelationshipStrength::Contextual, "report-a"),
-            relationship("CVE-2099-0002", RelationshipStrength::Contextual, "report-b"),
+            relationship(
+                "CVE-2099-0002",
+                RelationshipStrength::Contextual,
+                "report-a",
+                EvidenceRelation::ObservedInReport,
+            ),
+            relationship(
+                "CVE-2099-0002",
+                RelationshipStrength::Contextual,
+                "report-b",
+                EvidenceRelation::ObservedInReport,
+            ),
         ]);
 
         assert_eq!(from_grouped.len(), 1);
@@ -160,6 +219,7 @@ mod tests {
                     "CVE-2099-0003",
                     RelationshipStrength::Contextual,
                     &format!("report-{n}"),
+                    EvidenceRelation::ObservedInReport,
                 )
             })
             .collect();
@@ -173,8 +233,18 @@ mod tests {
     #[test]
     fn materially_different_strength_routes_are_not_collapsed() {
         let normalized = coalesce_relationships(vec![
-            relationship("CVE-2099-0004", RelationshipStrength::Contextual, "report"),
-            relationship("CVE-2099-0004", RelationshipStrength::Strong, "detection"),
+            relationship(
+                "CVE-2099-0004",
+                RelationshipStrength::Contextual,
+                "report",
+                EvidenceRelation::ObservedInReport,
+            ),
+            relationship(
+                "CVE-2099-0004",
+                RelationshipStrength::Strong,
+                "detection",
+                EvidenceRelation::DetectionCoversCve,
+            ),
         ]);
 
         assert_eq!(normalized.len(), 2);
@@ -184,5 +254,25 @@ mod tests {
         assert!(normalized
             .iter()
             .any(|r| r.strength == RelationshipStrength::Strong));
+    }
+
+    #[test]
+    fn different_evidence_mechanisms_with_same_strength_are_not_collapsed() {
+        let normalized = coalesce_relationships(vec![
+            relationship(
+                "CVE-2099-0005",
+                RelationshipStrength::Strong,
+                "mechanism-a",
+                EvidenceRelation::ObservedInReport,
+            ),
+            relationship(
+                "CVE-2099-0005",
+                RelationshipStrength::Strong,
+                "mechanism-b",
+                EvidenceRelation::DetectionCoversCve,
+            ),
+        ]);
+
+        assert_eq!(normalized.len(), 2);
     }
 }
