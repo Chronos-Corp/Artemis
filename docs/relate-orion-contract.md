@@ -124,6 +124,12 @@ Before First Useful Trace treats RELATE as traversal input, Orion must:
 4. preserve observed-versus-inferred/possible-path distinctions;
 5. honor `has_more_evidence` and verdict relationship partiality rather than treating bounded results as exhaustive.
 
+## 9. Validation discipline
+
+Issue #20 hardening is implemented outside PR #19's frozen scope. The stacked implementation must receive exact-head Rust, frontend, database-migration, and supply-chain checks before it can be retargeted to `main` after PR #19 merges.
+
+Regression tests should protect semantic boundaries rather than only implementation branches: case-insensitive contextual identity, YARA source-versus-effective identity, fail-closed version identity, and stable proof-chain semantics are contract tests for Orion's future consumer boundary.
+
 The governing rule remains:
 
 > **Artemis observes and structures evidence. Orion traces relationships. Evidence proves.**
