@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 import { FileList } from "./components/FileList";
@@ -35,6 +35,13 @@ function App() {
   const [syncing, setSyncing] = useState(false);
   const [lastSyncResults, setLastSyncResults] = useState<FeedSyncResult[] | null>(null);
 
+  // Every file selection/navigation invalidates all older asynchronous detail
+  // requests. Without this epoch, click A then B quickly and A's slower
+  // response can land last, rendering A's evidence under B's selected name.
+  // Evidence attribution must follow the request that produced it, not the
+  // order promises happen to resolve.
+  const analysisRequestEpoch = useRef(0);
+
   const refreshStatus = useCallback(async () => {
     const [db, yara, sync] = await Promise.all([
       invoke<DbStatus>("db_status"),
@@ -70,16 +77,22 @@ function App() {
 
   useEffect(() => {
     if (currentDir) {
+      analysisRequestEpoch.current += 1;
       loadDir(currentDir);
       setSelectedFile(null);
       setVerdict(null);
       setVerdictError(null);
+      setVerdictLoading(false);
       setFileIntel(null);
       setFileIntelError(null);
+      setFileIntelLoading(false);
     }
   }, [currentDir, loadDir]);
 
   function handleSelectFile(entry: FileEntry) {
+    const requestEpoch = ++analysisRequestEpoch.current;
+    const isCurrentRequest = () => analysisRequestEpoch.current === requestEpoch;
+
     setSelectedFile(entry);
     setVerdict(null);
     setVerdictError(null);
@@ -92,15 +105,29 @@ function App() {
     // never touches the database (see its Rust doc comment), so it can
     // succeed even when get_verdict fails because Postgres is
     // unreachable, and neither should block or hide the other's result.
+    // Each completion is request-scoped so a superseded file can never
+    // overwrite the detail state of the currently selected file.
     invoke<VerdictWithCoverage>("get_verdict", { path: entry.path })
-      .then(setVerdict)
-      .catch((e) => setVerdictError(String(e)))
-      .finally(() => setVerdictLoading(false));
+      .then((result) => {
+        if (isCurrentRequest()) setVerdict(result);
+      })
+      .catch((e) => {
+        if (isCurrentRequest()) setVerdictError(String(e));
+      })
+      .finally(() => {
+        if (isCurrentRequest()) setVerdictLoading(false);
+      });
 
     invoke<FileIntelligence>("get_file_intelligence", { path: entry.path })
-      .then(setFileIntel)
-      .catch((e) => setFileIntelError(String(e)))
-      .finally(() => setFileIntelLoading(false));
+      .then((result) => {
+        if (isCurrentRequest()) setFileIntel(result);
+      })
+      .catch((e) => {
+        if (isCurrentRequest()) setFileIntelError(String(e));
+      })
+      .finally(() => {
+        if (isCurrentRequest()) setFileIntelLoading(false);
+      });
   }
 
   async function handleSync() {
