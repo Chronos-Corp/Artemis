@@ -1,8 +1,8 @@
 use serde::Serialize;
 use tauri::State;
 
-use crate::analysis_coverage::{YaraCoverage, YaraCoverageState};
-use crate::models::{FileEntry, SyncSummary, Verdict};
+use crate::analysis_coverage::YaraCoverageState;
+use crate::models::{FileEntry, SyncSummary};
 use crate::AppState;
 
 fn db_unavailable() -> String {
@@ -24,48 +24,28 @@ pub async fn list_directory(state: State<'_, AppState>, path: String) -> Result<
         .map_err(|e| e.to_string())
 }
 
-/// Analyst-facing verdict wire shape.
-///
-/// `Verdict` remains the shared core evidence object. YARA coverage is kept
-/// beside it here because the configured ruleset is runtime/application
-/// state, not evidence stored in the intel graph. `serde(flatten)` preserves
-/// the existing JSON shape while adding a machine-readable `yara_coverage`
-/// field, so a failed ruleset cannot be normalized into a healthy empty
-/// verdict.
-#[derive(Debug, Serialize)]
-pub struct VerdictResponse {
-    #[serde(flatten)]
-    pub verdict: Verdict,
-    pub yara_coverage: YaraCoverage,
-}
-
 #[tauri::command]
 pub async fn get_verdict(
     state: State<'_, AppState>,
     path: String,
-) -> Result<VerdictResponse, String> {
+) -> Result<crate::relationship_contract::ResolvedVerdict, String> {
     let pool = state.pool.as_ref().ok_or_else(db_unavailable)?;
-    let verdict = crate::verdict::resolve(
+
+    // The relationship-contract module owns the only exposed resolver. It
+    // returns an already-normalized RELATE result with YARA coverage attached,
+    // so this Tauri adapter cannot be the only place Orion-critical semantics
+    // become true.
+    crate::relationship_contract::resolve(
         pool,
         &state.bloom,
         &state.intel_gate,
         &state.yara,
+        &state.yara_coverage,
         &state.recent_yara_hits,
         std::path::Path::new(&path),
     )
     .await
-    .map_err(|e| e.to_string())?;
-
-    // This is the authoritative external RELATE contract. Lower-level DB
-    // helpers may preserve assertion-shaped rows for query efficiency, but
-    // the object Orion/Execute receives never changes meaning merely because
-    // relationship cardinality crossed a resource-bound threshold.
-    let verdict = crate::relationship_contract::finalize_verdict(verdict);
-
-    Ok(VerdictResponse {
-        verdict,
-        yara_coverage: state.yara_coverage.clone(),
-    })
+    .map_err(|e| e.to_string())
 }
 
 /// FILE/UNDERSTAND-stage intelligence, independent of `get_verdict`'s

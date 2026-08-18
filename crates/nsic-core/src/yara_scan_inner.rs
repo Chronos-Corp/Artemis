@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -126,17 +127,34 @@ impl YaraEngine {
 
             let source = std::str::from_utf8(&bytes)
                 .with_context(|| format!("YARA rule file {} is not valid UTF-8", file.display()))?;
-            let names = extract_rule_names(source);
+            let rule_spans = extract_rule_spans(source)
+                .with_context(|| format!("parsing YARA rule boundaries in {}", file.display()))?;
             loaded_rules = loaded_rules
-                .checked_add(names.len())
+                .checked_add(rule_spans.len())
                 .context("YARA rule declaration count overflow")?;
             if loaded_rules > MAX_YARA_RULES {
                 bail!(
                     "YARA ruleset contains more than {MAX_YARA_RULES} rule declarations; refusing unbounded ruleset"
                 );
             }
-            for name in names {
-                rule_fingerprints.insert(name, file_fingerprint.clone());
+
+            // Round 11: rule version identity must be scoped to the exact
+            // declaration/body for that rule, not to the whole file that
+            // happens to contain it. A single .yar file often contains many
+            // rules; hashing the whole file made editing RuleB invalidate an
+            // unchanged RuleA -> CVE coverage assertion. The span parser below
+            // finds each rule's own source block while ignoring braces/tokens
+            // inside comments, strings, and regex literals, then hashes only
+            // that exact slice of the bytes also handed to libyara.
+            for rule in rule_spans {
+                let rule_fingerprint =
+                    hex::encode(Sha256::digest(&bytes[rule.source_range.clone()]));
+                if rule_fingerprints
+                    .insert(rule.name.clone(), rule_fingerprint)
+                    .is_some()
+                {
+                    bail!("duplicate YARA rule identifier: {}", rule.name);
+                }
             }
 
             // The same `source` bytes above feed both the fingerprints and
@@ -242,112 +260,235 @@ fn read_rule_file_bounded(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn extract_rule_names(source: &str) -> Vec<String> {
-    let cleaned = strip_comments_and_strings(source);
-    let tokens: Vec<&str> = cleaned
-        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .filter(|s| !s.is_empty())
-        .collect();
-    let mut names = Vec::new();
-    let mut i = 0;
-    while i < tokens.len() {
-        if tokens[i] == "rule" && i + 1 < tokens.len() {
-            names.push(tokens[i + 1].to_string());
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-    names
+#[derive(Debug, Clone)]
+struct RuleSourceSpan {
+    name: String,
+    source_range: Range<usize>,
 }
 
-/// Blanks comments, quoted strings, and regex literals before the lightweight
-/// rule-declaration scan. This prevents rule-shaped text in patterns from
-/// claiming another file's rule fingerprint.
-fn strip_comments_and_strings(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
-    let mut chars = source.chars().peekable();
+/// Finds the exact source range for every YARA rule in one source file.
+///
+/// This is deliberately a small lexical boundary scanner rather than a
+/// second YARA parser. It only needs two facts: where a real `rule <name>`
+/// declaration begins, and where that declaration's outer brace closes. The
+/// byte mask blanks comments, quoted strings, and regex literals *without
+/// changing offsets*, so rule-shaped text and brace quantifiers inside those
+/// regions cannot affect either decision. Hex-string braces remain visible;
+/// they are balanced nested braces and therefore compose correctly with the
+/// outer rule body depth.
+fn extract_rule_spans(source: &str) -> Result<Vec<RuleSourceSpan>> {
+    let bytes = source.as_bytes();
+    let masked = mask_non_code_preserving_offsets(source);
+    let mut rules = Vec::new();
+    let mut i = 0usize;
 
-    while let Some(c) = chars.next() {
-        if c == '/' && chars.peek() == Some(&'/') {
-            chars.next();
-            out.push_str("  ");
-            for c2 in chars.by_ref() {
-                if c2 == '\n' {
-                    out.push('\n');
-                    break;
-                }
-                out.push(' ');
-            }
+    while i < masked.len() {
+        if !word_at(&masked, i, b"rule") {
+            i += 1;
             continue;
         }
-        if c == '/' && chars.peek() == Some(&'*') {
-            chars.next();
-            out.push_str("  ");
-            let mut prev = ' ';
-            for c2 in chars.by_ref() {
-                if prev == '*' && c2 == '/' {
-                    out.push(' ');
-                    break;
-                }
-                out.push(if c2 == '\n' { '\n' } else { ' ' });
-                prev = c2;
-            }
-            continue;
+
+        let declaration_start = include_rule_modifiers(&masked, i);
+        let mut cursor = i + b"rule".len();
+        skip_ascii_whitespace(&masked, &mut cursor);
+        let name_start = cursor;
+        while cursor < masked.len() && is_identifier_byte(masked[cursor]) {
+            cursor += 1;
         }
-        if c == '/' {
-            out.push(' ');
-            let mut escaped = false;
-            for c2 in chars.by_ref() {
-                if escaped {
-                    escaped = false;
-                    out.push(' ');
-                    continue;
-                }
-                if c2 == '\\' {
-                    escaped = true;
-                    out.push(' ');
-                    continue;
-                }
-                out.push(' ');
-                if c2 == '/' {
-                    break;
-                }
-            }
-            while let Some(&next) = chars.peek() {
-                if next.is_ascii_alphabetic() {
-                    out.push(' ');
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            continue;
+        if cursor == name_start {
+            bail!("YARA rule declaration at byte {i} has no identifier");
         }
-        if c == '"' {
-            out.push(' ');
-            let mut escaped = false;
-            for c2 in chars.by_ref() {
-                if escaped {
-                    escaped = false;
-                    out.push(' ');
-                    continue;
-                }
-                if c2 == '\\' {
-                    escaped = true;
-                    out.push(' ');
-                    continue;
-                }
-                out.push(' ');
-                if c2 == '"' {
-                    break;
-                }
-            }
-            continue;
+        let name = std::str::from_utf8(&bytes[name_start..cursor])
+            .context("YARA rule identifier is not valid UTF-8")?
+            .to_string();
+
+        while cursor < masked.len() && masked[cursor] != b'{' {
+            cursor += 1;
         }
-        out.push(c);
+        if cursor == masked.len() {
+            bail!("YARA rule {name} has no opening body brace");
+        }
+
+        let mut depth = 0usize;
+        let mut end = None;
+        for (offset, byte) in masked[cursor..].iter().copied().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    if depth == 0 {
+                        bail!("YARA rule {name} has an unmatched closing brace");
+                    }
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(cursor + offset + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end.with_context(|| format!("YARA rule {name} has no closing body brace"))?;
+
+        rules.push(RuleSourceSpan {
+            name,
+            source_range: declaration_start..end,
+        });
+        i = end;
     }
-    out
+
+    Ok(rules)
+}
+
+fn include_rule_modifiers(masked: &[u8], rule_start: usize) -> usize {
+    let mut start = rule_start;
+    loop {
+        let mut cursor = start;
+        while cursor > 0 && masked[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        let word_end = cursor;
+        while cursor > 0 && is_identifier_byte(masked[cursor - 1]) {
+            cursor -= 1;
+        }
+        if word_end == cursor {
+            break;
+        }
+        match &masked[cursor..word_end] {
+            b"private" | b"global" => start = cursor,
+            _ => break,
+        }
+    }
+    start
+}
+
+fn skip_ascii_whitespace(bytes: &[u8], cursor: &mut usize) {
+    while *cursor < bytes.len() && bytes[*cursor].is_ascii_whitespace() {
+        *cursor += 1;
+    }
+}
+
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn word_at(bytes: &[u8], index: usize, word: &[u8]) -> bool {
+    let Some(end) = index.checked_add(word.len()) else {
+        return false;
+    };
+    if end > bytes.len() || &bytes[index..end] != word {
+        return false;
+    }
+    let left_ok = index == 0 || !is_identifier_byte(bytes[index - 1]);
+    let right_ok = end == bytes.len() || !is_identifier_byte(bytes[end]);
+    left_ok && right_ok
+}
+
+/// Blanks comments, quoted strings, and regex literals byte-for-byte while
+/// preserving source offsets for `extract_rule_spans`.
+fn mask_non_code_preserving_offsets(source: &str) -> Vec<u8> {
+    let bytes = source.as_bytes();
+    let mut masked = bytes.to_vec();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            let start = i;
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            blank_range(&mut masked, start, i);
+            continue;
+        }
+
+        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            let start = i;
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                i += 2;
+            } else {
+                i = bytes.len();
+            }
+            blank_range(&mut masked, start, i);
+            continue;
+        }
+
+        if bytes[i] == b'"' {
+            let start = i;
+            i += 1;
+            let mut escaped = false;
+            while i < bytes.len() {
+                let byte = bytes[i];
+                i += 1;
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    break;
+                }
+            }
+            blank_range(&mut masked, start, i);
+            continue;
+        }
+
+        if bytes[i] == b'/' && regex_literal_starts(&masked, i) {
+            let start = i;
+            i += 1;
+            let mut escaped = false;
+            while i < bytes.len() {
+                let byte = bytes[i];
+                i += 1;
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'/' {
+                    break;
+                }
+            }
+            while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            blank_range(&mut masked, start, i);
+            continue;
+        }
+
+        i += 1;
+    }
+
+    masked
+}
+
+fn regex_literal_starts(masked: &[u8], slash_index: usize) -> bool {
+    let mut cursor = slash_index;
+    while cursor > 0 && masked[cursor - 1].is_ascii_whitespace() {
+        cursor -= 1;
+    }
+    if cursor > 0 && masked[cursor - 1] == b'=' {
+        return true;
+    }
+
+    let word_end = cursor;
+    while cursor > 0 && is_identifier_byte(masked[cursor - 1]) {
+        cursor -= 1;
+    }
+    &masked[cursor..word_end] == b"matches"
+}
+
+fn blank_range(masked: &mut [u8], start: usize, end: usize) {
+    for byte in &mut masked[start..end] {
+        if *byte != b'\n' && *byte != b'\r' {
+            *byte = b' ';
+        }
+    }
 }
 
 fn to_matches(results: Vec<yara::Rule<'_>>) -> Vec<YaraMatch> {
@@ -381,7 +522,9 @@ mod tests {
         let engine = YaraEngine::load(&bundled_rules_dir()).expect("load bundled rules");
         assert!(engine.rule_count > 0);
         let hits = engine.scan_bytes(eicar_bytes()).expect("scan EICAR bytes");
-        assert!(hits.iter().any(|h| h.rule_name == "Example_EICAR_Test_File"));
+        assert!(hits
+            .iter()
+            .any(|h| h.rule_name == "Example_EICAR_Test_File"));
     }
 
     #[test]
@@ -488,6 +631,57 @@ mod tests {
     }
 
     #[test]
+    fn editing_sibling_rule_in_same_file_only_changes_that_rules_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pack.yar");
+        std::fs::write(
+            &path,
+            r#"
+                rule RuleA {
+                    strings: $a = "AAA"
+                    condition: $a
+                }
+
+                rule RuleB {
+                    strings: $b = /B{2,4}/
+                    condition: $b
+                }
+            "#,
+        )
+        .unwrap();
+
+        let before = YaraEngine::load(dir.path()).unwrap();
+        let a_before = before.rule_fingerprint("RuleA").unwrap().to_string();
+        let b_before = before.rule_fingerprint("RuleB").unwrap().to_string();
+        let whole_before = before.ruleset_fingerprint.clone();
+
+        std::fs::write(
+            &path,
+            r#"
+                rule RuleA {
+                    strings: $a = "AAA"
+                    condition: $a
+                }
+
+                rule RuleB {
+                    strings: $b = /B{3,5}/
+                    condition: $b
+                }
+            "#,
+        )
+        .unwrap();
+
+        let after = YaraEngine::load(dir.path()).unwrap();
+        assert_eq!(
+            after.rule_fingerprint("RuleA"),
+            Some(a_before.as_str()),
+            "editing RuleB in the same source file must not invalidate unchanged RuleA coverage"
+        );
+        assert_ne!(after.rule_fingerprint("RuleB"), Some(b_before.as_str()));
+        assert_ne!(after.ruleset_fingerprint, whole_before);
+    }
+
+    #[test]
     fn regex_rule_shaped_text_cannot_hijack_another_files_fingerprint() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -505,6 +699,19 @@ mod tests {
             std::fs::read(dir.path().join("a_target.yar")).unwrap(),
         ));
         assert_eq!(engine.rule_fingerprint("TargetRule"), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn private_and_global_modifiers_are_part_of_rule_version_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("modifiers.yar");
+        std::fs::write(&path, "private rule Scoped { condition: true }").unwrap();
+        let private = YaraEngine::load(dir.path()).unwrap();
+        let private_fp = private.rule_fingerprint("Scoped").unwrap().to_string();
+
+        std::fs::write(&path, "rule Scoped { condition: true }").unwrap();
+        let ordinary = YaraEngine::load(dir.path()).unwrap();
+        assert_ne!(ordinary.rule_fingerprint("Scoped"), Some(private_fp.as_str()));
     }
 
     #[test]

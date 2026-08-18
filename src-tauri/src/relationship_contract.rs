@@ -1,9 +1,78 @@
+use anyhow::Result;
+use serde::Serialize;
+use sqlx::PgPool;
+use std::path::Path;
+use std::sync::Arc;
+
+use crate::analysis_coverage::YaraCoverage;
+use crate::bloom::{BloomState, IntelGate};
 use crate::db::indicators::MAX_EVIDENCE_PER_RELATIONSHIP;
 use crate::models::{
     EvidenceRelation, RelationshipKind, RelationshipStrength, ThreatRelationship, Verdict,
+    VerdictTier,
 };
+use crate::yara_scan::YaraEngine;
 
-/// Finalizes the analyst-facing RELATE contract before it crosses Tauri IPC.
+// Keep the evidence resolver private behind this contract module. Round 11
+// caught that the raw resolver was callable by any sibling Rust module, while
+// relationship normalization and YARA coverage were only applied later at the
+// Tauri command boundary. Orion/Execute are Rust-side consumers too, so the
+// unsafe/raw shape must not be part of the crate-level API they can reach.
+#[path = "verdict.rs"]
+mod raw_verdict;
+
+pub use raw_verdict::RecentYaraHits;
+
+/// Authoritative RELATE-stage result for both UI and future Rust-side
+/// consumers such as Orion/Execute.
+///
+/// `verdict` is already normalized to the stable relationship contract, and
+/// `yara_coverage` travels with it so a failed ruleset can never be mistaken
+/// for a healthy zero-hit scan merely because a caller bypassed Tauri IPC.
+#[derive(Debug, Serialize)]
+pub struct ResolvedVerdict {
+    #[serde(flatten)]
+    pub verdict: Verdict,
+    pub yara_coverage: YaraCoverage,
+}
+
+/// Resolve one file into the authoritative RELATE contract.
+///
+/// This is intentionally the only crate-level resolver exposed outside this
+/// module. The underlying evidence resolver remains private above, so a future
+/// Orion implementation cannot accidentally consume assertion-shaped,
+/// threshold-dependent relationships or omit runtime analysis coverage.
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve(
+    pool: &PgPool,
+    bloom: &BloomState,
+    intel_gate: &IntelGate,
+    yara: &Arc<YaraEngine>,
+    yara_coverage: &YaraCoverage,
+    recent_yara_hits: &RecentYaraHits,
+    path: &Path,
+) -> Result<ResolvedVerdict> {
+    let verdict = raw_verdict::resolve(
+        pool,
+        bloom,
+        intel_gate,
+        yara,
+        recent_yara_hits,
+        path,
+    )
+    .await?;
+
+    Ok(finalize_resolved(verdict, yara_coverage))
+}
+
+fn finalize_resolved(verdict: Verdict, yara_coverage: &YaraCoverage) -> ResolvedVerdict {
+    ResolvedVerdict {
+        verdict: finalize_verdict(verdict),
+        yara_coverage: yara_coverage.clone(),
+    }
+}
+
+/// Finalizes the stable RELATE relationship contract.
 ///
 /// The lower-level relationship queries intentionally preserve assertion
 /// provenance, and some have a concept-aware high-cardinality fallback. A
@@ -13,8 +82,8 @@ use crate::models::{
 /// while above it the fallback represented one concept with several evidence
 /// paths. Orion/Execute cannot safely consume a threshold-dependent object.
 ///
-/// The wire contract is therefore normalized here at every cardinality:
-/// one `(kind, target, strength, evidence-route shape)` object represents one
+/// The contract is therefore normalized here at every cardinality: one
+/// `(kind, target, strength, evidence-route shape)` object represents one
 /// relationship concept reached by one evidence mechanism/strength class,
 /// and every supporting assertion is carried as an independently-walkable
 /// evidence path (bounded separately). The route shape is part of identity so
@@ -23,7 +92,34 @@ use crate::models::{
 /// target. Strong and contextual routes to the same target likewise remain
 /// separate because they make materially different evidentiary claims.
 pub fn finalize_verdict(mut verdict: Verdict) -> Verdict {
+    let contextual_truncated = verdict
+        .bounds
+        .truncated_entry_tiers
+        .contains(&VerdictTier::Contextual);
+
     verdict.threat_relationships = coalesce_relationships(verdict.threat_relationships);
+
+    // Round 11: Contextual has a 20-row source cap and the relationship layer
+    // has a separate 20-path cap. When row 21 exists, the raw derivation can
+    // still hand exactly 20 paths to the coalescer; cardinality alone therefore
+    // cannot tell the relationship it is partial. The verdict-level bound is
+    // the authoritative fact that more contextual observations existed, and
+    // every contextual filename match for this lookup converges on the same
+    // weak RiskBased concept/route. Carry that partiality down to the concept
+    // itself so Orion does not read `has_more_evidence: false` from a known
+    // truncated relationship.
+    if contextual_truncated {
+        for relationship in &mut verdict.threat_relationships {
+            if relationship.kind == RelationshipKind::RiskBased
+                && relationship.strength == RelationshipStrength::Weak
+                && route_shape(relationship)
+                    == Some(vec![EvidenceRelation::ContextualFilenameMatch])
+            {
+                relationship.has_more_evidence = true;
+            }
+        }
+    }
+
     verdict
 }
 
@@ -120,7 +216,8 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
-    use crate::models::{EvidenceTiming, IndicatorKind, RelationshipEvidence};
+    use crate::analysis_coverage::{YaraCoverage, YaraCoverageState};
+    use crate::models::{EvidenceTiming, IndicatorKind, RelationshipEvidence, VerdictBounds};
 
     fn evidence(source: &str, relation: EvidenceRelation) -> Vec<RelationshipEvidence> {
         let now = Utc::now();
@@ -154,6 +251,18 @@ mod tests {
             explanation: format!("assertion from {source}"),
             evidence_paths: vec![evidence(source, relation)],
             has_more_evidence: false,
+        }
+    }
+
+    fn empty_verdict(relationships: Vec<ThreatRelationship>, bounds: VerdictBounds) -> Verdict {
+        Verdict {
+            path: "/tmp/round-11".to_string(),
+            sha256: "a".repeat(64),
+            md5: "b".repeat(32),
+            entries: vec![],
+            intel_freshness: vec![],
+            threat_relationships: relationships,
+            bounds,
         }
     }
 
@@ -310,5 +419,71 @@ mod tests {
 
         let normalized = coalesce_relationships(vec![left, right]);
         assert_eq!(normalized.len(), 2);
+    }
+
+    #[test]
+    fn contextual_row_truncation_marks_the_coalesced_relationship_partial() {
+        let limit = MAX_EVIDENCE_PER_RELATIONSHIP as usize;
+        let relationships = (0..limit)
+            .map(|n| ThreatRelationship {
+                kind: RelationshipKind::RiskBased,
+                strength: RelationshipStrength::Weak,
+                target: "shared-sample-name.exe".to_string(),
+                explanation: "contextual filename match".to_string(),
+                evidence_paths: vec![evidence(
+                    &format!("report-{n}"),
+                    EvidenceRelation::ContextualFilenameMatch,
+                )],
+                has_more_evidence: false,
+            })
+            .collect();
+
+        let verdict = empty_verdict(
+            relationships,
+            VerdictBounds {
+                truncated_entry_tiers: vec![VerdictTier::Contextual],
+                relationships_truncated: false,
+            },
+        );
+
+        let finalized = finalize_verdict(verdict);
+        assert_eq!(finalized.threat_relationships.len(), 1);
+        assert_eq!(finalized.threat_relationships[0].evidence_paths.len(), limit);
+        assert!(
+            finalized.threat_relationships[0].has_more_evidence,
+            "row 21 is known to exist from VerdictBounds, so the coalesced contextual relationship must not claim exhaustive evidence"
+        );
+    }
+
+    #[test]
+    fn authoritative_result_carries_normalized_relationships_and_yara_coverage_together() {
+        let relationships = vec![
+            relationship(
+                "CVE-2099-0011",
+                RelationshipStrength::Contextual,
+                "report-a",
+                EvidenceRelation::ObservedInReport,
+            ),
+            relationship(
+                "CVE-2099-0011",
+                RelationshipStrength::Contextual,
+                "report-b",
+                EvidenceRelation::ObservedInReport,
+            ),
+        ];
+        let coverage = YaraCoverage {
+            status: YaraCoverageState::Failed,
+            rule_count: 0,
+            failure_reason: Some("rejected ruleset".to_string()),
+        };
+
+        let resolved = finalize_resolved(
+            empty_verdict(relationships, VerdictBounds::default()),
+            &coverage,
+        );
+
+        assert_eq!(resolved.verdict.threat_relationships.len(), 1);
+        assert_eq!(resolved.verdict.threat_relationships[0].evidence_paths.len(), 2);
+        assert_eq!(resolved.yara_coverage, coverage);
     }
 }

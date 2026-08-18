@@ -8,7 +8,6 @@ mod hashing;
 mod ingest;
 mod models;
 mod relationship_contract;
-mod verdict;
 mod yara_scan;
 
 use std::path::PathBuf;
@@ -16,9 +15,9 @@ use std::sync::Arc;
 
 use analysis_coverage::YaraCoverage;
 use bloom::{BloomState, IntelGate};
+use relationship_contract::RecentYaraHits;
 use sqlx::PgPool;
 use tauri::Manager;
-use verdict::RecentYaraHits;
 use yara_scan::YaraEngine;
 
 pub struct AppState {
