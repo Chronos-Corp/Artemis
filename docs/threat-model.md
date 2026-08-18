@@ -88,17 +88,23 @@ privileges. This is the highest-consequence render surface in the product.
 *Current controls:* CSP set in `tauri.conf.json`; URLs validated at
 ingest (TB-2) and re-checked at render.
 
-### TB-4: YARA rules directory → detection identity
+### TB-4: YARA rules directory → detection identity and analysis coverage
 On a compromised host the rules directory is itself tamperable, and rule
 identity feeds durable CVE-coverage evidence.
 - A rule's **content** identity must come from the file that declared it,
   not the whole directory (or unrelated edits invalidate it).
 - Source parsing must not let one file's text claim another file's rule
   name.
+- A ruleset **load failure must remain distinguishable from a successful
+  empty ruleset**. Falling back to an empty engine for availability is
+  acceptable only if the verdict and UI retain `failed` coverage state;
+  otherwise "no YARA hit" overstates what was actually checked.
 
 *Current controls:* `YaraEngine::rule_fingerprints` (per declaring-file
 SHA-256); `strip_comments_and_strings` blanks comments, strings, **and**
-regex literals before scanning for declarations.
+regex literals before scanning for declarations; `analysis_coverage`
+retains `loaded` / `empty` / `failed` state and carries it through both
+`yara_status` and the analyst-facing verdict response.
 
 ### TB-5: Agent → console (Phase 1)
 Out of scope for PR #19; see `docs/phase1-design.md`. Per-agent
@@ -132,6 +138,9 @@ history shows single instances get fixed while siblings survive.
       byte-for-byte identical to a complete one?
 - [ ] Is there a total `ORDER BY`, so *which* rows survive the cap is
       deterministic rather than plan-dependent?
+- [ ] Does crossing a resource threshold preserve the **same wire-object
+      semantics**, or does the meaning/cardinality of one returned object
+      change only because a fallback path activated?
 
 **Races and TOCTOU**
 - [ ] Any check-then-use on a path: does the use operate on the *same handle* that was checked?
@@ -142,6 +151,16 @@ history shows single instances get fixed while siblings survive.
 - [ ] Does every emitted evidence field carry the value the *source edge* actually asserted, or is anything synthesized/borrowed from a different edge or from "now"?
 - [ ] Can historical data surface as if it were a current observation?
 - [ ] Is timing labeled as what it is (observation window vs. receipt time)?
+- [ ] If several assertions support one relationship concept, are their
+      evidence paths preserved without turning them into duplicate hunt
+      pivots or changing object identity at a cardinality threshold?
+
+**Analysis coverage honesty**
+- [ ] Can "not checked", "checked with zero configured sources/rules", and
+      "checked successfully with no match" be distinguished by the machine
+      contract and the analyst UI?
+- [ ] Does a degraded/fallback engine preserve the failure state that caused
+      the degradation instead of presenting itself as healthy empty coverage?
 
 **Render surface**
 - [ ] Any new `href`/`src`/raw-HTML sink fed by stored data?
@@ -236,6 +255,23 @@ nothing. So the deadlock really was unbounded. Explicit timeouts now make
 the premise true; whether the fetch/parse-vs-mutation split is still worth
 doing is a live question rather than a settled deferral.
 
+## Findings from round 10 review
+
+Round 10 found two second-order contract failures after the Round 9 bounds
+work itself had held up:
+
+| # | Finding | Boundary | Disposition |
+|---|---|---|---|
+| R10-1 | `ThreatRelationship` changed semantic identity when relationship-assertion cardinality crossed the safety cap: normal queries returned one object per assertion, while only the high-cardinality fallback grouped a target into one object with several evidence paths | RELATE wire contract / resource bounds | Fixed: `relationship_contract::finalize_verdict` normalizes the analyst-facing contract at every cardinality. One object represents one `(kind, target, strength, typed evidence-route shape)` concept; assertions remain independent evidence paths, with a separate per-concept evidence cap and `has_more_evidence`. Mixed/malformed route shapes fail conservative and do not coalesce. |
+| R10-2 | Any YARA load failure was converted to `YaraEngine::empty`, making a rejected/unsafe/malformed ruleset indistinguishable from a successful zero-rule configuration and allowing empty-verdict prose to overstate negative YARA coverage | TB-4 / analysis coverage | Fixed: `analysis_coverage` retains `loaded` / `empty` / `failed` state and a bounded display-safe reason. Both status and verdict response expose it; UI/no-match language never claims YARA was checked when loading failed. |
+
+The R10-1 fix intentionally makes **evidence mechanism** part of conceptual
+identity, not only `(kind, target)`. Two routes to the same target that have
+different strengths or typed relation sequences remain separate because they
+make different evidentiary claims. This is the contract Orion should consume:
+dedupe supporting assertions without erasing the path semantics that justify
+the pivot.
+
 ### Deferred, with reasons
 
 - **`IntelGate` holds its write guard across fetch/parse as well as the
@@ -243,9 +279,13 @@ doing is a live question rather than a settled deferral.
   unbounded, but a slow feed still pauses all verdicts for up to that long.
   Splitting the remote work out of the critical section is the real fix.
   Deferred as a Phase-0 tradeoff, not forgotten.
-- **`(kind, target)` aggregation for the PR #20 handoff.** Multiple
-  independently-sourced relationship objects can share a `(kind, target)`
-  pair (the same malware family attributed by two reports, say). Those are
-  genuinely separate assertions with separate provenance, and must not
-  become duplicate Hunt pivots. Belongs in the PR #20 interface contract,
-  where the consumer's aggregation semantics are actually decided.
+- **Phase 1 agent target-file reads do not yet share the desktop's complete
+  hostile-filesystem open/type/size controls.** Same-byte hash+YARA integrity
+  exists, but the stronger TB-1 primitive should move into shared code before
+  remote recursive hunting depends on the agent path. This is a separate
+  Phase 1 hardening item, not a RELATE-contract blocker.
+- **High-cardinality fallback bounds returned targets/evidence, but the SQL
+  may still rank a large matching assertion set before applying those
+  output budgets.** Current Rust memory and IPC payload are bounded. Revisit
+  query shape/indexing before Hunt Pack or fleet cardinality makes this an
+  availability concern rather than a local Phase-0 tradeoff.
