@@ -80,10 +80,18 @@ pub fn coalesce_relationships(
 }
 
 fn same_semantic_relationship(left: &ThreatRelationship, right: &ThreatRelationship) -> bool {
-    left.kind == right.kind
-        && left.target == right.target
-        && left.strength == right.strength
-        && route_shape(left) == route_shape(right)
+    if left.kind != right.kind || left.target != right.target || left.strength != right.strength {
+        return false;
+    }
+
+    // A malformed relationship whose paths do not all share one typed route
+    // shape must never coalesce merely because *another* malformed object also
+    // returns `None`. Failing conservative here preserves evidence rather than
+    // silently merging structures Orion cannot safely interpret.
+    match (route_shape(left), route_shape(right)) {
+        (Some(left_shape), Some(right_shape)) => left_shape == right_shape,
+        _ => false,
+    }
 }
 
 /// The relation sequence of one complete path is the relationship's
@@ -273,6 +281,34 @@ mod tests {
             ),
         ]);
 
+        assert_eq!(normalized.len(), 2);
+    }
+
+    #[test]
+    fn malformed_mixed_route_objects_fail_conservative_instead_of_coalescing() {
+        let mut left = relationship(
+            "CVE-2099-0006",
+            RelationshipStrength::Strong,
+            "left-a",
+            EvidenceRelation::ObservedInReport,
+        );
+        left.evidence_paths
+            .push(evidence("left-b", EvidenceRelation::DetectionCoversCve));
+
+        let mut right = relationship(
+            "CVE-2099-0006",
+            RelationshipStrength::Strong,
+            "right-a",
+            EvidenceRelation::ObservedInReport,
+        );
+        right
+            .evidence_paths
+            .push(evidence("right-b", EvidenceRelation::DetectionCoversCve));
+
+        assert_eq!(route_shape(&left), None);
+        assert_eq!(route_shape(&right), None);
+
+        let normalized = coalesce_relationships(vec![left, right]);
         assert_eq!(normalized.len(), 2);
     }
 }
