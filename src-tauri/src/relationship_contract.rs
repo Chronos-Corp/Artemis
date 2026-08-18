@@ -34,6 +34,11 @@ pub struct ResolvedVerdict {
     #[serde(flatten)]
     pub verdict: Verdict,
     pub yara_coverage: YaraCoverage,
+    /// Orion's bounded, explicitly directed projection over the normalized
+    /// RELATE result. Built here, at the authoritative Rust boundary, so the
+    /// UI does not reinterpret proof direction or construct security graph
+    /// semantics from prose.
+    pub orion_trace: nsic_core::orion::OrionTrace,
 }
 
 /// Resolve one file into the authoritative RELATE contract.
@@ -73,9 +78,12 @@ pub async fn resolve(
 }
 
 fn finalize_resolved(verdict: Verdict, yara_coverage: &YaraCoverage) -> ResolvedVerdict {
+    let verdict = finalize_verdict(verdict);
+    let orion_trace = nsic_core::orion::trace_verdict(&verdict);
     ResolvedVerdict {
-        verdict: finalize_verdict(verdict),
+        verdict,
         yara_coverage: yara_coverage.clone(),
+        orion_trace,
     }
 }
 
@@ -503,7 +511,7 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_result_carries_normalized_relationships_and_yara_coverage_together() {
+    fn authoritative_result_carries_relate_yara_and_orion_contracts_together() {
         let relationships = vec![
             relationship(
                 "CVE-2099-0011",
@@ -532,5 +540,10 @@ mod tests {
         assert_eq!(resolved.verdict.threat_relationships.len(), 1);
         assert_eq!(resolved.verdict.threat_relationships[0].evidence_paths.len(), 2);
         assert_eq!(resolved.yara_coverage, coverage);
+        // This deliberately incomplete CVE proof shape is normalized by
+        // RELATE but not safe to direct. Orion travels with the same result
+        // and refuses to guess rather than silently dropping the concept.
+        assert!(resolved.orion_trace.paths.is_empty());
+        assert_eq!(resolved.orion_trace.untraced_relationships.len(), 1);
     }
 }

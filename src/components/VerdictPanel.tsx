@@ -134,6 +134,7 @@ export function VerdictPanel({
           <ThreatRelationshipList
             relationships={verdict.threat_relationships}
             relationshipsTruncated={verdict.bounds.relationships_truncated}
+            orionTrace={verdict.orion_trace}
           />
 
           {verdict.bounds.truncated_entry_tiers.length > 0 && (
