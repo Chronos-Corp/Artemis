@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
@@ -40,18 +41,33 @@ const MAX_YARA_RULESET_BYTES: usize = 16 * 1024 * 1024;
 
 /// Public YARA engine facade.
 ///
-/// The inner engine owns compilation, fingerprints, and scanning. This layer
-/// owns the trust-boundary preflight that must happen *before* libyara parses
-/// source. YARA's `include` directive can make the compiler perform its own
-/// filesystem reads, including absolute paths; Apollo already owns recursive
-/// rule discovery, size bounds, and provenance, so includes are rejected
-/// rather than allowing a second unbounded/unfingerprinted traversal.
+/// The inner engine owns compilation, source fingerprints, and scanning. This
+/// layer owns two additional trust-boundary contracts:
+///
+/// 1. preflight must happen *before* libyara parses source, so YARA `include`
+///    cannot escape Apollo's file/byte/open-handle controls; and
+/// 2. durable rule **behavior identity** must not be confused with a rule's
+///    own source identity. YARA rules can depend on helper/private/global rules,
+///    so an unchanged rule source block can behave differently when the
+///    compiled ruleset changes. `rule_source_fingerprints` preserves the exact
+///    per-rule source hash for explainability; `rule_fingerprints` is the
+///    conservative effective-version identity used for durable observation and
+///    CVE coverage gating.
 pub struct YaraEngine {
     inner: inner::YaraEngine,
     pub rules_dir: PathBuf,
     pub rule_count: usize,
     pub ruleset_fingerprint: String,
+    /// Effective behavior/version identity used for durable edges. Today this
+    /// conservatively combines the exact rule source identity with the whole
+    /// compiled ruleset identity. That can over-invalidate when an unrelated
+    /// rule changes, but it fails safe: it cannot let version-scoped evidence
+    /// survive a helper/global semantic change that altered effective behavior.
     pub rule_fingerprints: HashMap<String, String>,
+    /// Exact source-span hash for each rule declaration/body. Useful for
+    /// explainability and future dependency-aware versioning, but deliberately
+    /// *not* sufficient by itself as durable behavior identity.
+    pub rule_source_fingerprints: HashMap<String, String>,
 }
 
 impl YaraEngine {
@@ -64,31 +80,86 @@ impl YaraEngine {
         inner::YaraEngine::load(rules_dir).map(Self::from_inner)
     }
 
+    /// Conservative effective behavior/version identity for durable
+    /// observations and version-scoped coverage assertions.
     pub fn rule_fingerprint(&self, rule_name: &str) -> Option<&str> {
         self.rule_fingerprints.get(rule_name).map(String::as_str)
     }
 
+    /// Exact source-block identity for explanation/debugging. This is not the
+    /// durable behavior identity because helper/private/global rule changes can
+    /// alter a rule's effective behavior while leaving its own source unchanged.
+    pub fn rule_source_fingerprint(&self, rule_name: &str) -> Option<&str> {
+        self.rule_source_fingerprints
+            .get(rule_name)
+            .map(String::as_str)
+    }
+
     pub fn scan(&self, file_path: &Path) -> Result<Vec<YaraMatch>> {
-        self.inner.scan(file_path)
+        let matches = self.inner.scan(file_path)?;
+        self.validate_match_identities(&matches)?;
+        Ok(matches)
     }
 
     pub fn scan_bytes(&self, data: &[u8]) -> Result<Vec<YaraMatch>> {
-        self.inner.scan_bytes(data)
+        let matches = self.inner.scan_bytes(data)?;
+        self.validate_match_identities(&matches)?;
+        Ok(matches)
     }
 
     pub fn scan_bytes_bounded(&self, data: &[u8]) -> Result<BoundedYaraMatches> {
-        self.inner.scan_bytes_bounded(data)
+        let bounded = self.inner.scan_bytes_bounded(data)?;
+        self.validate_match_identities(&bounded.matches)?;
+        Ok(bounded)
+    }
+
+    fn validate_match_identities(&self, matches: &[YaraMatch]) -> Result<()> {
+        for hit in matches {
+            if !self.rule_fingerprints.contains_key(&hit.rule_name) {
+                // `""` is a real schema sentinel meaning "applies to any
+                // version" on coverage edges. A compiler/source-identity
+                // invariant failure must never broaden into that wildcard.
+                // Fail closed before the observation reaches persistence.
+                bail!(
+                    "compiled YARA match '{}' has no effective rule fingerprint; refusing to persist an unversioned observation",
+                    hit.rule_name
+                );
+            }
+        }
+        Ok(())
     }
 
     fn from_inner(inner: inner::YaraEngine) -> Self {
+        let ruleset_fingerprint = inner.ruleset_fingerprint.clone();
+        let rule_source_fingerprints = inner.rule_fingerprints.clone();
+        let rule_fingerprints = rule_source_fingerprints
+            .iter()
+            .map(|(name, source_fingerprint)| {
+                (
+                    name.clone(),
+                    effective_rule_fingerprint(source_fingerprint, &ruleset_fingerprint),
+                )
+            })
+            .collect();
+
         Self {
             rules_dir: inner.rules_dir.clone(),
             rule_count: inner.rule_count,
-            ruleset_fingerprint: inner.ruleset_fingerprint.clone(),
-            rule_fingerprints: inner.rule_fingerprints.clone(),
+            ruleset_fingerprint,
+            rule_fingerprints,
+            rule_source_fingerprints,
             inner,
         }
     }
+}
+
+fn effective_rule_fingerprint(source_fingerprint: &str, ruleset_fingerprint: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"apollo-yara-effective-rule-v1\0");
+    digest.update(source_fingerprint.as_bytes());
+    digest.update(b"\0ruleset\0");
+    digest.update(ruleset_fingerprint.as_bytes());
+    hex::encode(digest.finalize())
 }
 
 /// Preflights exactly the source tree Apollo is willing to hand to the inner
@@ -351,5 +422,102 @@ mod tests {
 
         let err = read_rule_source_preflight(&fifo).expect_err("FIFO must be rejected");
         assert!(err.to_string().contains("non-regular"));
+    }
+
+    #[test]
+    fn helper_change_updates_effective_identity_without_changing_rule_source_identity() {
+        let dir = tempfile::tempdir().expect("create rules dir");
+        let path = dir.path().join("helpers.yar");
+        std::fs::write(
+            &path,
+            r#"
+                private rule Helper { strings: $a = "AAA" condition: $a }
+                rule RuleA { condition: Helper }
+            "#,
+        )
+        .expect("write v1 rules");
+        let before = YaraEngine::load(dir.path()).expect("load v1 rules");
+        let source_before = before
+            .rule_source_fingerprint("RuleA")
+            .expect("RuleA source fingerprint")
+            .to_string();
+        let effective_before = before
+            .rule_fingerprint("RuleA")
+            .expect("RuleA effective fingerprint")
+            .to_string();
+
+        std::fs::write(
+            &path,
+            r#"
+                private rule Helper { strings: $a = "BBB" condition: $a }
+                rule RuleA { condition: Helper }
+            "#,
+        )
+        .expect("write v2 rules");
+        let after = YaraEngine::load(dir.path()).expect("load v2 rules");
+
+        assert_eq!(
+            after.rule_source_fingerprint("RuleA"),
+            Some(source_before.as_str()),
+            "RuleA source text did not change"
+        );
+        assert_ne!(
+            after.rule_fingerprint("RuleA"),
+            Some(effective_before.as_str()),
+            "helper semantics changed, so RuleA durable behavior identity must change"
+        );
+    }
+
+    #[test]
+    fn global_rule_change_updates_effective_identity_without_changing_rule_source_identity() {
+        let dir = tempfile::tempdir().expect("create rules dir");
+        let path = dir.path().join("global.yar");
+        std::fs::write(
+            &path,
+            r#"
+                global rule Gate { condition: filesize < 1024 }
+                rule RuleA { condition: true }
+            "#,
+        )
+        .expect("write v1 rules");
+        let before = YaraEngine::load(dir.path()).expect("load v1 rules");
+        let source_before = before
+            .rule_source_fingerprint("RuleA")
+            .expect("RuleA source fingerprint")
+            .to_string();
+        let effective_before = before
+            .rule_fingerprint("RuleA")
+            .expect("RuleA effective fingerprint")
+            .to_string();
+
+        std::fs::write(
+            &path,
+            r#"
+                global rule Gate { condition: filesize < 16 }
+                rule RuleA { condition: true }
+            "#,
+        )
+        .expect("write v2 rules");
+        let after = YaraEngine::load(dir.path()).expect("load v2 rules");
+
+        assert_eq!(after.rule_source_fingerprint("RuleA"), Some(source_before.as_str()));
+        assert_ne!(after.rule_fingerprint("RuleA"), Some(effective_before.as_str()));
+    }
+
+    #[test]
+    fn missing_effective_identity_fails_closed_before_observation_persistence() {
+        let dir = tempfile::tempdir().expect("create rules dir");
+        std::fs::write(
+            dir.path().join("one.yar"),
+            "rule RuleA { strings: $a = \"AAA\" condition: $a }",
+        )
+        .expect("write rule");
+        let mut engine = YaraEngine::load(dir.path()).expect("load rules");
+        engine.rule_fingerprints.remove("RuleA");
+
+        let error = engine
+            .scan_bytes_bounded(b"AAA")
+            .expect_err("missing effective identity must fail closed");
+        assert!(error.to_string().contains("no effective rule fingerprint"));
     }
 }
