@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            i.value AS matched_value,\n            iorr.source,\n            iorr.confidence,\n            iorr.first_seen,\n            iorr.last_seen,\n            r.id AS report_id,\n            r.title AS report_title,\n            r.url AS report_url,\n            COALESCE(\n                array_agg(rrc.cve_id) FILTER (WHERE rrc.cve_id IS NOT NULL),\n                '{}'\n            ) AS \"cve_ids!\"\n        FROM indicator i\n        JOIN indicator_observed_in_report iorr ON iorr.indicator_id = i.id\n        JOIN report r ON r.id = iorr.report_id\n        LEFT JOIN report_references_cve rrc ON rrc.report_id = r.id\n        WHERE i.kind = $1 AND i.value = $2\n        GROUP BY i.value, iorr.source, iorr.confidence, iorr.first_seen, iorr.last_seen,\n                 r.id, r.title, r.url\n        ",
+  "query": "\n        SELECT\n            i.value AS matched_value,\n            iorr.source,\n            iorr.confidence,\n            iorr.first_seen,\n            iorr.last_seen,\n            r.id AS report_id,\n            r.title AS report_title,\n            r.url AS report_url\n        FROM indicator i\n        JOIN indicator_observed_in_report iorr ON iorr.indicator_id = i.id\n        JOIN report r ON r.id = iorr.report_id\n        WHERE i.kind = $1 AND i.value = $2\n        ORDER BY iorr.last_seen DESC, iorr.first_seen DESC, r.id, iorr.source\n        LIMIT $3\n        ",
   "describe": {
     "columns": [
       {
@@ -42,11 +42,6 @@
         "ordinal": 7,
         "name": "report_url",
         "type_info": "Text"
-      },
-      {
-        "ordinal": 8,
-        "name": "cve_ids!",
-        "type_info": "TextArray"
       }
     ],
     "parameters": {
@@ -71,7 +66,8 @@
             }
           }
         },
-        "Text"
+        "Text",
+        "Int8"
       ]
     },
     "nullable": [
@@ -82,9 +78,8 @@
       false,
       false,
       true,
-      true,
-      null
+      true
     ]
   },
-  "hash": "900cea8d6e63d8c3993014537b83e5c4125ef99252b5c2c7e8b69957caebc7b4"
+  "hash": "6e010c7cd00db012479b85fb5398c5b9bfa1ec9acd3e44c102142e6db5e491e9"
 }

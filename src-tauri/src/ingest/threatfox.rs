@@ -55,9 +55,11 @@ fn resolve_indicator(ioc_type: &str, ioc: &str) -> Option<(IndicatorKind, String
 }
 
 /// Pulls recent ThreatFox IOCs and folds the ones this project's indicator
-/// model can represent (hashes, domains, IPs) into the intel graph.
+/// model can represent (hashes, domains, IPs) into the intel graph, plus a
+/// malware-family attribution edge when the IOC carries one (PR #19's
+/// Threat Relationship Model).
 pub async fn sync(pool: &PgPool, api_key: &str) -> Result<SyncSummary> {
-    let client = reqwest::Client::new();
+    let client = super::feed_client()?;
     let resp = client
         .post(API_URL)
         .header("Auth-Key", api_key)
@@ -66,7 +68,7 @@ pub async fn sync(pool: &PgPool, api_key: &str) -> Result<SyncSummary> {
         .await
         .context("requesting ThreatFox recent IOCs")?;
 
-    let body: TfResponse = resp.json().await.context("parsing ThreatFox response")?;
+    let body: TfResponse = super::decode_bounded_json(resp, "ThreatFox").await?;
 
     if body.query_status != "ok" {
         bail!("ThreatFox query_status: {}", body.query_status);
@@ -93,10 +95,23 @@ pub async fn sync(pool: &PgPool, api_key: &str) -> Result<SyncSummary> {
             .malware_printable
             .clone()
             .unwrap_or_else(|| "ThreatFox IOC".to_string());
+        // `reference` is supplied by whoever submitted this IOC to
+        // ThreatFox -- community-submitted attacker-influenceable text,
+        // not abuse.ch's own data. It ends up stored on `report.url` and
+        // rendered to the analyst as a clickable provenance link in a
+        // Tauri webview that holds the IPC bridge, so it is scheme-checked
+        // here at the trust boundary (docs/threat-model.md, TB-2) rather
+        // than relying on whichever renderer happens to consume it. A
+        // rejected reference falls back to ThreatFox's own canonical IOC
+        // URL, built from the feed's ID -- so the analyst still gets a
+        // working provenance link, just not the attacker's chosen one.
+        let canonical_url = format!("https://threatfox.abuse.ch/ioc/{}/", ioc.id);
         let url = ioc
             .reference
-            .clone()
-            .unwrap_or_else(|| format!("https://threatfox.abuse.ch/ioc/{}/", ioc.id));
+            .as_deref()
+            .and_then(nsic_core::sanitize::safe_external_url)
+            .unwrap_or(&canonical_url)
+            .to_string();
 
         let (report_id, report_inserted) = db::upsert_report(
             &mut *tx,
@@ -130,6 +145,24 @@ pub async fn sync(pool: &PgPool, api_key: &str) -> Result<SyncSummary> {
             last_seen,
         )
         .await?;
+
+        // ThreatFox's `malware_printable` is a family/classification name,
+        // not just report display text -- previously only used as the
+        // report title. See the matching comment in malwarebazaar.rs.
+        if let Some(family_name) = &ioc.malware_printable {
+            let (family_id, _) = db::upsert_malware_family(&mut *tx, family_name).await?;
+            db::upsert_indicator_attributed_to_malware_family(
+                &mut *tx,
+                indicator_id,
+                family_id,
+                report_id,
+                SOURCE,
+                ioc.confidence_level,
+                first_seen,
+                last_seen,
+            )
+            .await?;
+        }
     }
 
     tx.commit().await?;

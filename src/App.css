@@ -228,6 +228,28 @@ body {
   border-radius: 6px;
 }
 
+/* Truncation notices. Amber rather than the green of .verdict-no-match:
+   this is a caveat about completeness, not a reassuring result, and an
+   analyst skimming should not read "partial evidence" in the same visual
+   register as "nothing found". */
+.verdict-truncated,
+.relationships-truncated {
+  font-size: 0.85rem;
+  color: #7a4b00;
+  background: #fdf0d5;
+  border-left: 3px solid #d79a1e;
+  padding: 0.6rem 0.75rem;
+  border-radius: 6px;
+  margin-bottom: 0.75rem;
+}
+
+.evidence-truncated {
+  font-size: 0.75rem;
+  color: #7a4b00;
+  font-style: italic;
+  margin-top: 0.3rem;
+}
+
 .file-intel {
   font-size: 0.8rem;
   margin-bottom: 1rem;
@@ -344,6 +366,121 @@ body {
 
 .intel-source-err {
   color: #9c2b2b;
+}
+
+.threat-relationships {
+  margin-bottom: 1rem;
+  font-size: 0.8rem;
+}
+
+.threat-relationships-label {
+  font-weight: 600;
+  color: #555;
+  margin-bottom: 0.4rem;
+}
+
+.relationship-group {
+  margin-bottom: 0.6rem;
+}
+
+.relationship-group-label {
+  font-weight: 600;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: #777;
+  margin-bottom: 0.25rem;
+}
+
+.relationship-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.relationship-entry {
+  border: 1px solid #e3e3e3;
+  border-radius: 4px;
+  padding: 0.4rem 0.6rem;
+  background: #fafafa;
+}
+
+.relationship-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.relationship-target {
+  font-size: 0.82em;
+  word-break: break-all;
+}
+
+.strength-badge {
+  font-size: 0.68rem;
+  font-weight: 600;
+  padding: 0.05rem 0.4rem;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+
+.strength-direct {
+  background: #d9f2e3;
+  color: #146c3f;
+}
+
+.strength-strong {
+  background: #fdeecb;
+  color: #8a5a00;
+}
+
+.strength-contextual {
+  background: #dde7f5;
+  color: #2c4f82;
+}
+
+.strength-weak {
+  background: #eaeaea;
+  color: #666;
+}
+
+.relationship-explanation {
+  color: #555;
+  margin-top: 0.2rem;
+}
+
+.relationship-evidence {
+  margin-top: 0.2rem;
+}
+
+.evidence-path {
+  margin-top: 0.3rem;
+}
+
+.evidence-path:first-child {
+  margin-top: 0;
+}
+
+.evidence-path-label {
+  color: #999;
+  font-size: 0.68rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.evidence-hop {
+  color: #888;
+  font-size: 0.72rem;
+}
+
+.evidence-relation {
+  color: #666;
+  font-weight: 600;
 }
 
 .provenance-list {
@@ -564,6 +701,46 @@ button:disabled {
 
   .provenance-entry {
     border-color: #3a3a3a;
+  }
+
+  .threat-relationships-label,
+  .relationship-explanation {
+    color: #ccc;
+  }
+
+  .relationship-group-label,
+  .evidence-hop,
+  .evidence-path-label {
+    color: #999;
+  }
+
+  .evidence-relation {
+    color: #bbb;
+  }
+
+  .relationship-entry {
+    background: #262626;
+    border-color: #3a3a3a;
+  }
+
+  .strength-direct {
+    background: #1e3d2b;
+    color: #7fd8a4;
+  }
+
+  .strength-strong {
+    background: #3d3018;
+    color: #e3b96a;
+  }
+
+  .strength-contextual {
+    background: #1e2c40;
+    color: #8fb3e8;
+  }
+
+  .strength-weak {
+    background: #333;
+    color: #ccc;
   }
 
   button {

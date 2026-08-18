@@ -1,3 +1,4 @@
+mod analysis_coverage;
 mod bloom;
 mod commands;
 mod db;
@@ -6,22 +7,31 @@ mod fs_browse;
 mod hashing;
 mod ingest;
 mod models;
-mod verdict;
+mod relationship_contract;
 mod yara_scan;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bloom::BloomState;
+use analysis_coverage::YaraCoverage;
+use bloom::{BloomState, IntelGate};
+use relationship_contract::RecentYaraHits;
 use sqlx::PgPool;
 use tauri::Manager;
-use verdict::RecentYaraHits;
 use yara_scan::YaraEngine;
 
 pub struct AppState {
     pub pool: Option<PgPool>,
     pub bloom: Arc<BloomState>,
+    /// Serializes a verdict's intel-corpus reads against a feed sync's
+    /// writes -- see `IntelGate`'s doc comment.
+    pub intel_gate: Arc<IntelGate>,
     pub yara: Arc<YaraEngine>,
+    /// Retains whether the configured ruleset loaded successfully. The
+    /// engine may deliberately degrade to an empty fallback so hash/intel
+    /// analysis remains usable, but callers must still be able to tell
+    /// `failed` from a legitimate zero-rule configuration.
+    pub yara_coverage: YaraCoverage,
     pub recent_yara_hits: Arc<RecentYaraHits>,
     pub api_key: String,
 }
@@ -56,27 +66,16 @@ async fn init_state() -> AppState {
     }
 
     let rules_dir = default_rules_dir();
-    let yara = match YaraEngine::load(&rules_dir) {
-        Ok(engine) => {
-            tracing::info!(
-                "YARA engine loaded {} rule file(s) from {}",
-                engine.rule_count,
-                rules_dir.display()
-            );
-            Arc::new(engine)
-        }
-        Err(e) => {
-            tracing::warn!("YARA engine failed to load from {}: {e}", rules_dir.display());
-            Arc::new(YaraEngine::empty(&rules_dir))
-        }
-    };
+    let (yara, yara_coverage) = analysis_coverage::load_yara_with_coverage(&rules_dir);
 
     let api_key = std::env::var("ABUSECH_API_KEY").unwrap_or_default();
 
     AppState {
         pool,
         bloom,
+        intel_gate: Arc::new(IntelGate::new()),
         yara,
+        yara_coverage,
         recent_yara_hits: Arc::new(RecentYaraHits::new()),
         api_key,
     }

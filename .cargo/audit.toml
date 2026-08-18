@@ -1,0 +1,31 @@
+# cargo-audit configuration. See docs/threat-model.md ("supply chain").
+#
+# Ignored advisories are *triaged exceptions with a written reason and a
+# re-check condition*, never blanket suppressions. Anything added here must
+# say why it is not reachable and what would make it reachable again.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 -- Marvin attack, timing sidechannel key recovery in
+    # `rsa` 0.9.x. No patched version exists upstream as of this writing.
+    #
+    # Not reachable in Apollo: `rsa` is pulled in only by `sqlx-mysql`, and
+    # Apollo never enables sqlx's MySQL driver -- all three consuming crates
+    # (src-tauri, crates/console, crates/nsic-core) select only the
+    # `postgres` driver feature. Verified with
+    # `cargo tree -i rsa -e normal --target all`, which resolves to nothing:
+    # the crate is a Cargo.lock entry that is never compiled or linked into
+    # any Apollo binary. Locked architecture decision #7 (Postgres for the
+    # intel store) means that is not expected to change.
+    #
+    # Re-check if: sqlx's mysql feature is ever enabled, or a patched `rsa`
+    # ships (then drop this entry and take the upgrade).
+    "RUSTSEC-2023-0071",
+]
+
+# `unmaintained` and `unsound` findings are reported but deliberately do
+# not fail the build: they are real signal worth reading each run, but they
+# are not themselves exploitable vulnerabilities, and treating them as
+# blocking turns the check into noise a team learns to skip past -- which
+# is precisely the failure mode that let an open Dependabot alert go unread
+# through seven review rounds on PR #19.

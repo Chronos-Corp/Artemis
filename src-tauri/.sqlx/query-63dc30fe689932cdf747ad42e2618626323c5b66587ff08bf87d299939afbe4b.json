@@ -1,0 +1,97 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            mf.name AS family_name,\n            iamf.source,\n            iamf.confidence,\n            iamf.first_seen,\n            iamf.last_seen,\n            r.id AS report_id,\n            r.title AS report_title,\n            r.url AS report_url,\n            i.kind AS \"indicator_kind: IndicatorKind\",\n            i.value AS indicator_value\n        FROM indicator i\n        JOIN indicator_attributed_to_malware_family iamf ON iamf.indicator_id = i.id\n        JOIN malware_family mf ON mf.id = iamf.malware_family_id\n        JOIN report r ON r.id = iamf.report_id\n        WHERE (i.kind = 'sha256' AND i.value = $1) OR (i.kind = 'md5' AND i.value = $2)\n        ORDER BY iamf.last_seen DESC, mf.name, r.id, iamf.source, i.kind\n        LIMIT $3\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "family_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "source",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "confidence",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 3,
+        "name": "first_seen",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 4,
+        "name": "last_seen",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "report_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 6,
+        "name": "report_title",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "report_url",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "indicator_kind: IndicatorKind",
+        "type_info": {
+          "Custom": {
+            "name": "indicator_kind",
+            "kind": {
+              "Enum": [
+                "sha256",
+                "md5",
+                "sha1",
+                "imphash",
+                "tlsh",
+                "ssdeep",
+                "path",
+                "regkey",
+                "mutex",
+                "domain",
+                "ip"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "indicator_value",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "63dc30fe689932cdf747ad42e2618626323c5b66587ff08bf87d299939afbe4b"
+}

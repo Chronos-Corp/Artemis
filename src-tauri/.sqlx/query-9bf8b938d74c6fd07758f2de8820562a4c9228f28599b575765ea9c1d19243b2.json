@@ -1,0 +1,134 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        WITH matched AS (\n            SELECT\n                rrc.cve_id,\n                rrc.source AS cve_source,\n                rrc.confidence AS cve_confidence,\n                rrc.first_seen AS cve_first_seen,\n                rrc.last_seen AS cve_last_seen,\n                r.id AS report_id,\n                r.title AS report_title,\n                r.url AS report_url,\n                iorr.source AS parent_source,\n                iorr.confidence AS parent_confidence,\n                iorr.first_seen AS parent_first_seen,\n                iorr.last_seen AS parent_last_seen,\n                i.kind AS parent_indicator_kind,\n                i.value AS parent_indicator_value\n            FROM report_references_cve rrc\n            JOIN report r ON r.id = rrc.report_id\n            JOIN indicator_observed_in_report iorr ON iorr.report_id = r.id\n            JOIN indicator i ON i.id = iorr.indicator_id\n            WHERE (i.kind = 'sha256' AND i.value = $1) OR (i.kind = 'md5' AND i.value = $2)\n        ),\n        ranked_edges AS (\n            SELECT\n                report_id,\n                cve_id,\n                cve_source,\n                ROW_NUMBER() OVER (ORDER BY cve_id, cve_source, report_id) AS edge_rank\n            FROM (SELECT DISTINCT report_id, cve_id, cve_source FROM matched) e\n        ),\n        kept_edges AS (\n            SELECT * FROM ranked_edges WHERE edge_rank <= $3::bigint + 1\n        ),\n        ranked_parents AS (\n            SELECT\n                m.*,\n                ke.edge_rank,\n                ROW_NUMBER() OVER (\n                    PARTITION BY m.report_id, m.cve_id, m.cve_source\n                    ORDER BY (m.parent_indicator_kind = 'sha256') DESC,\n                             m.parent_last_seen DESC,\n                             m.parent_source,\n                             m.parent_indicator_value\n                ) AS parent_rank,\n                COUNT(*) OVER (\n                    PARTITION BY m.report_id, m.cve_id, m.cve_source\n                ) AS parent_total\n            FROM matched m\n            JOIN kept_edges ke\n              ON ke.report_id = m.report_id\n             AND ke.cve_id = m.cve_id\n             AND ke.cve_source = m.cve_source\n        )\n        SELECT\n            cve_id,\n            cve_source,\n            cve_confidence,\n            cve_first_seen,\n            cve_last_seen,\n            report_id,\n            report_title,\n            report_url,\n            parent_source,\n            parent_confidence,\n            parent_first_seen,\n            parent_last_seen,\n            parent_indicator_kind AS \"parent_indicator_kind: IndicatorKind\",\n            parent_indicator_value,\n            edge_rank AS \"edge_rank!\",\n            parent_total AS \"parent_total!\"\n        FROM ranked_parents\n        WHERE parent_rank <= $4::bigint\n        ORDER BY edge_rank, parent_rank\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "cve_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "cve_source",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "cve_confidence",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 3,
+        "name": "cve_first_seen",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 4,
+        "name": "cve_last_seen",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "report_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 6,
+        "name": "report_title",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "report_url",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "parent_source",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "parent_confidence",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 10,
+        "name": "parent_first_seen",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "parent_last_seen",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "parent_indicator_kind: IndicatorKind",
+        "type_info": {
+          "Custom": {
+            "name": "indicator_kind",
+            "kind": {
+              "Enum": [
+                "sha256",
+                "md5",
+                "sha1",
+                "imphash",
+                "tlsh",
+                "ssdeep",
+                "path",
+                "regkey",
+                "mutex",
+                "domain",
+                "ip"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "parent_indicator_value",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 14,
+        "name": "edge_rank!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 15,
+        "name": "parent_total!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "9bf8b938d74c6fd07758f2de8820562a4c9228f28599b575765ea9c1d19243b2"
+}

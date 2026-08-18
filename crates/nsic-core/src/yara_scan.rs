@@ -1,246 +1,355 @@
-use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
+use anyhow::{bail, Context, Result};
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
-#[derive(Debug, Clone)]
-pub struct YaraMatch {
-    pub rule_name: String,
+// The inner module deliberately retains a few helper/test-only items from
+// the scanner implementation. They are private implementation detail behind
+// this facade, so keep lint exceptions scoped here rather than weakening the
+// crate/workspace lint policy.
+#[allow(dead_code, unused_imports)]
+#[path = "yara_scan_inner.rs"]
+mod inner;
+
+pub use inner::{BoundedYaraMatches, YaraMatch, MAX_YARA_MATCHES_PER_VERDICT};
+
+// `yara::Rules` does not implement Debug. The preserved inner scanner's own
+// unit tests use `Result::expect_err`, which requires the success type to be
+// debuggable even though the compiled rule object should remain opaque.
+// Mirror the public facade's safe Debug view rather than dropping those tests
+// or exposing libyara internals.
+impl std::fmt::Debug for inner::YaraEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("YaraEngine")
+            .field("rules_dir", &self.rules_dir)
+            .field("rule_count", &self.rule_count)
+            .field("ruleset_fingerprint", &self.ruleset_fingerprint)
+            .finish_non_exhaustive()
+    }
 }
 
-/// Wraps a compiled set of YARA rules loaded from a rules directory.
-/// Compiled rules are safe to scan with concurrently, so this is shared
-/// behind an Arc in app state rather than recompiled per scan.
+// These mirror the inner loader's hard ceilings. The facade performs a
+// security preflight before libyara sees any source so an `include` cannot
+// escape those ceilings; the inner loader then enforces the same bounds again
+// while fingerprinting and compiling the exact bytes it owns.
+const MAX_YARA_RULE_FILES: usize = 1024;
+const MAX_YARA_RULE_FILE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_YARA_RULESET_BYTES: usize = 16 * 1024 * 1024;
+
+/// Public YARA engine facade.
+///
+/// The inner engine owns compilation, fingerprints, and scanning. This layer
+/// owns the trust-boundary preflight that must happen *before* libyara parses
+/// source. YARA's `include` directive can make the compiler perform its own
+/// filesystem reads, including absolute paths; Apollo already owns recursive
+/// rule discovery, size bounds, and provenance, so includes are rejected
+/// rather than allowing a second unbounded/unfingerprinted traversal.
 pub struct YaraEngine {
-    rules: Option<yara::Rules>,
+    inner: inner::YaraEngine,
     pub rules_dir: PathBuf,
     pub rule_count: usize,
-    /// SHA-256, hex-encoded, over a canonical manifest of every rule file
-    /// that went into this compiled ruleset: for each file, in sorted
-    /// relative-path order, the manifest entry is the file's relative path,
-    /// then a NUL byte, then the hex SHA-256 of its contents, then a
-    /// newline. The per-file separators make this unambiguous (naive
-    /// concatenation of file A followed by file B is not distinguishable
-    /// from some other split X followed by Y with the same total bytes;
-    /// framing each entry closes that off). Identifies *which version* of
-    /// the rules produced a match: a rule's name alone is not enough to
-    /// reconstruct what it actually checked for once the rule file has
-    /// since been edited. Callers that persist a match durably (e.g. a
-    /// fleet sighting) should persist this alongside it.
     pub ruleset_fingerprint: String,
+    pub rule_fingerprints: HashMap<String, String>,
 }
 
 impl YaraEngine {
-    /// An engine with no compiled rules: every scan returns no matches.
-    /// Used as the startup fallback when rule loading fails or the rules
-    /// directory doesn't exist, so a bad rules directory degrades to
-    /// hash-only verdicts instead of preventing the app from starting.
     pub fn empty(rules_dir: &Path) -> Self {
-        Self {
-            rules: None,
-            rules_dir: rules_dir.to_path_buf(),
-            rule_count: 0,
-            ruleset_fingerprint: hex::encode(Sha256::digest(b"")),
-        }
+        Self::from_inner(inner::YaraEngine::empty(rules_dir))
     }
 
-    /// Loads every .yar/.yara file under rules_dir. A missing or empty
-    /// directory is not an error: Phase 0 ships with no bundled rules, and
-    /// callers should still work with hash-only verdicts until an analyst
-    /// drops rules in.
     pub fn load(rules_dir: &Path) -> Result<Self> {
-        if !rules_dir.exists() {
-            return Ok(Self::empty(rules_dir));
-        }
+        validate_ruleset_source_boundary(rules_dir)?;
+        inner::YaraEngine::load(rules_dir).map(Self::from_inner)
+    }
 
-        let mut rule_files: Vec<PathBuf> = WalkDir::new(rules_dir)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-            .filter(|e| {
-                matches!(
-                    e.path().extension().and_then(|s| s.to_str()),
-                    Some("yar") | Some("yara")
-                )
-            })
-            .map(|e| e.path().to_path_buf())
-            .collect();
-        // Sorted so both the compile order and the fingerprint below are
-        // deterministic; WalkDir's own iteration order is not guaranteed.
-        rule_files.sort();
-
-        if rule_files.is_empty() {
-            return Ok(Self::empty(rules_dir));
-        }
-
-        // yara::Compiler::add_rules_str consumes self and does not hand it
-        // back on error, so a single malformed rule file aborts the whole
-        // batch. That is surfaced as a load error rather than silently
-        // dropping rules the analyst thinks are active.
-        //
-        // Each file is read exactly once here and those same bytes both
-        // feed the fingerprint and get compiled (via add_rules_str, not
-        // add_rules_file, so the compiler never reopens the path itself).
-        // Reading once and fingerprinting/compiling the read bytes is the
-        // same TOCTOU fix `nsic-agent scan` applies to the scanned file:
-        // fingerprinting bytes at one instant and letting the compiler
-        // independently reopen the path an instant later could fingerprint
-        // version A of a rule while actually compiling version B if the
-        // file changed in between.
-        let mut compiler = yara::Compiler::new().context("initializing YARA compiler")?;
-        let mut fingerprint = Sha256::new();
-        let mut loaded = 0usize;
-        for file in &rule_files {
-            let bytes = std::fs::read(file)
-                .with_context(|| format!("reading YARA rule file {}", file.display()))?;
-
-            let relative = file.strip_prefix(rules_dir).unwrap_or(file);
-            fingerprint.update(relative.to_string_lossy().as_bytes());
-            fingerprint.update(b"\0");
-            fingerprint.update(hex::encode(Sha256::digest(&bytes)).as_bytes());
-            fingerprint.update(b"\n");
-
-            let source = std::str::from_utf8(&bytes)
-                .with_context(|| format!("YARA rule file {} is not valid UTF-8", file.display()))?;
-            compiler = compiler
-                .add_rules_str(source)
-                .with_context(|| format!("loading YARA rule file {}", file.display()))?;
-            loaded += 1;
-        }
-
-        let rules = compiler.compile_rules().context("compiling YARA rules")?;
-        Ok(Self {
-            rules: Some(rules),
-            rules_dir: rules_dir.to_path_buf(),
-            rule_count: loaded,
-            ruleset_fingerprint: hex::encode(fingerprint.finalize()),
-        })
+    pub fn rule_fingerprint(&self, rule_name: &str) -> Option<&str> {
+        self.rule_fingerprints.get(rule_name).map(String::as_str)
     }
 
     pub fn scan(&self, file_path: &Path) -> Result<Vec<YaraMatch>> {
-        let Some(rules) = &self.rules else {
-            return Ok(vec![]);
-        };
-        let results = rules
-            .scan_file(file_path, 30)
-            .with_context(|| format!("scanning {}", file_path.display()))?;
-        Ok(to_matches(results))
+        self.inner.scan(file_path)
     }
 
-    /// Scans an already-in-memory buffer instead of reopening a path.
-    /// Callers that also need a hash of the same content (e.g. to report a
-    /// sighting) should hash this same buffer rather than re-reading the
-    /// file separately -- two reads of "the same" path can observe
-    /// different bytes if the file changes in between, which for a
-    /// detection this hashes and persists durably is an evidence-integrity
-    /// problem, not just a race.
     pub fn scan_bytes(&self, data: &[u8]) -> Result<Vec<YaraMatch>> {
-        let Some(rules) = &self.rules else {
-            return Ok(vec![]);
-        };
-        let results = rules
-            .scan_mem(data, 30)
-            .context("scanning in-memory buffer")?;
-        Ok(to_matches(results))
+        self.inner.scan_bytes(data)
+    }
+
+    pub fn scan_bytes_bounded(&self, data: &[u8]) -> Result<BoundedYaraMatches> {
+        self.inner.scan_bytes_bounded(data)
+    }
+
+    fn from_inner(inner: inner::YaraEngine) -> Self {
+        Self {
+            rules_dir: inner.rules_dir.clone(),
+            rule_count: inner.rule_count,
+            ruleset_fingerprint: inner.ruleset_fingerprint.clone(),
+            rule_fingerprints: inner.rule_fingerprints.clone(),
+            inner,
+        }
     }
 }
 
-fn to_matches(results: Vec<yara::Rule<'_>>) -> Vec<YaraMatch> {
-    results
-        .into_iter()
-        .map(|r| YaraMatch {
-            rule_name: r.identifier.to_string(),
-        })
-        .collect()
+/// Preflights exactly the source tree Apollo is willing to hand to the inner
+/// loader. This is intentionally safe on hostile filesystems: the pathname is
+/// opened nonblocking on Unix, the opened handle is then type-checked, and the
+/// read itself is capped so growth after metadata cannot exceed the budget.
+fn validate_ruleset_source_boundary(rules_dir: &Path) -> Result<()> {
+    if !rules_dir.exists() {
+        return Ok(());
+    }
+
+    let mut file_count = 0usize;
+    let mut total_bytes = 0usize;
+    for entry in WalkDir::new(rules_dir) {
+        let entry = entry.with_context(|| {
+            format!(
+                "walking YARA rules directory during preflight {}",
+                rules_dir.display()
+            )
+        })?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if !matches!(
+            entry.path().extension().and_then(|s| s.to_str()),
+            Some("yar") | Some("yara")
+        ) {
+            continue;
+        }
+
+        file_count += 1;
+        if file_count > MAX_YARA_RULE_FILES {
+            bail!(
+                "YARA rules directory contains more than {MAX_YARA_RULE_FILES} rule files; refusing unbounded ruleset"
+            );
+        }
+
+        let bytes = read_rule_source_preflight(entry.path())?;
+        total_bytes = total_bytes
+            .checked_add(bytes.len())
+            .context("YARA preflight byte count overflow")?;
+        if total_bytes > MAX_YARA_RULESET_BYTES {
+            bail!(
+                "YARA ruleset exceeds {MAX_YARA_RULESET_BYTES} bytes of source; refusing unbounded ruleset"
+            );
+        }
+
+        let source = std::str::from_utf8(&bytes).with_context(|| {
+            format!("YARA rule file {} is not valid UTF-8", entry.path().display())
+        })?;
+        if contains_source_token(source, "include") {
+            bail!(
+                "YARA include directives are not supported in {}; place included rules directly under the configured rules directory so Apollo can bound and fingerprint them",
+                entry.path().display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn read_rule_source_preflight(path: &Path) -> Result<Vec<u8>> {
+    let file = open_rule_source_preflight(path)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_YARA_RULE_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading YARA rule file during preflight {}", path.display()))?;
+    if bytes.len() > MAX_YARA_RULE_FILE_BYTES {
+        bail!(
+            "YARA rule file {} exceeded the {MAX_YARA_RULE_FILE_BYTES}-byte limit during preflight",
+            path.display()
+        );
+    }
+    Ok(bytes)
+}
+
+fn open_rule_source_preflight(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+
+    let file = options
+        .open(path)
+        .with_context(|| format!("opening YARA rule file during preflight {}", path.display()))?;
+    let metadata = file.metadata().with_context(|| {
+        format!(
+            "inspecting opened YARA rule file during preflight {}",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "refusing non-regular YARA rule file {} during preflight",
+            path.display()
+        );
+    }
+    if metadata.len() > MAX_YARA_RULE_FILE_BYTES as u64 {
+        bail!(
+            "YARA rule file {} exceeds the {MAX_YARA_RULE_FILE_BYTES}-byte limit",
+            path.display()
+        );
+    }
+    Ok(file)
+}
+
+fn contains_source_token(source: &str, token: &str) -> bool {
+    strip_comments_strings_and_regexes(source)
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|candidate| candidate == token)
+}
+
+/// Blanks comments, quoted strings, and regex literals before token scanning.
+/// The include path itself is a quoted string, so after this pass a real
+/// directive still leaves the reserved `include` token while harmless text
+/// like `"include"`, `/include foo/`, or a comment does not.
+fn strip_comments_strings_and_regexes(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '/' && chars.peek() == Some(&'/') {
+            chars.next();
+            out.push_str("  ");
+            for c2 in chars.by_ref() {
+                if c2 == '\n' {
+                    out.push('\n');
+                    break;
+                }
+                out.push(' ');
+            }
+            continue;
+        }
+        if c == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            out.push_str("  ");
+            let mut prev = ' ';
+            for c2 in chars.by_ref() {
+                if prev == '*' && c2 == '/' {
+                    out.push(' ');
+                    break;
+                }
+                out.push(if c2 == '\n' { '\n' } else { ' ' });
+                prev = c2;
+            }
+            continue;
+        }
+        if c == '/' {
+            out.push(' ');
+            let mut escaped = false;
+            for c2 in chars.by_ref() {
+                if escaped {
+                    escaped = false;
+                    out.push(' ');
+                    continue;
+                }
+                if c2 == '\\' {
+                    escaped = true;
+                    out.push(' ');
+                    continue;
+                }
+                out.push(' ');
+                if c2 == '/' {
+                    break;
+                }
+            }
+            while let Some(&next) = chars.peek() {
+                if next.is_ascii_alphabetic() {
+                    out.push(' ');
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            continue;
+        }
+        if c == '"' {
+            out.push(' ');
+            let mut escaped = false;
+            for c2 in chars.by_ref() {
+                if escaped {
+                    escaped = false;
+                    out.push(' ');
+                    continue;
+                }
+                if c2 == '\\' {
+                    escaped = true;
+                    out.push(' ');
+                    continue;
+                }
+                out.push(' ');
+                if c2 == '"' {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
-    fn eicar_bytes() -> &'static [u8] {
-        br"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
-    }
-
-    fn bundled_rules_dir() -> PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("crates/nsic-core has a repo root two levels up")
-            .join("yara-rules")
-    }
-
-    /// Loads the repo's bundled example rule (yara-rules/example_eicar.yar)
-    /// and confirms it actually detects the EICAR test string. No DB, no
-    /// network -- unlike most of this crate's other DB-backed tests, this
-    /// one runs on every `cargo test`, not just `--ignored`, since local
-    /// YARA scanning is exactly the capability the agent needs standalone.
     #[test]
-    fn loads_bundled_rules_and_detects_eicar() {
-        let engine = YaraEngine::load(&bundled_rules_dir()).expect("load bundled yara rules");
+    fn include_directive_is_rejected_before_compilation() {
+        let dir = tempfile::tempdir().expect("create temp rules dir");
+        std::fs::write(
+            dir.path().join("include.yar"),
+            "include \"/outside/apollo/unbounded.yar\"\nrule Local { condition: true }\n",
+        )
+        .expect("write include rule");
+
+        let err = YaraEngine::load(dir.path()).expect_err("include must fail closed");
         assert!(
-            engine.rule_count > 0,
-            "expected the bundled EICAR rule to load from {}",
-            bundled_rules_dir().display()
-        );
-
-        let mut tmp = tempfile::NamedTempFile::new().expect("create temp file");
-        tmp.write_all(eicar_bytes()).expect("write eicar bytes");
-        tmp.flush().unwrap();
-
-        let matches = engine.scan(tmp.path()).expect("scan eicar file");
-        assert!(
-            matches
-                .iter()
-                .any(|m| m.rule_name == "Example_EICAR_Test_File"),
-            "expected a match for the bundled EICAR rule, got: {matches:?}"
+            err.to_string().contains("include directives are not supported"),
+            "expected Apollo include-boundary rejection, got: {err:#}"
         );
     }
 
     #[test]
-    fn scan_bytes_matches_scan_file_for_the_same_content() {
-        let engine = YaraEngine::load(&bundled_rules_dir()).expect("load bundled yara rules");
+    fn literal_include_text_is_not_rejected() {
+        let dir = tempfile::tempdir().expect("create temp rules dir");
+        std::fs::write(
+            dir.path().join("literal.yar"),
+            r#"
+                // include "/not/a/directive.yar"
+                rule IncludeLiteral {
+                    meta:
+                        note = "include /still/not/a/directive.yar"
+                    strings:
+                        $a = "include"
+                        $b = /include [a-z]+/
+                    condition:
+                        $a or $b
+                }
+            "#,
+        )
+        .expect("write literal include text");
 
-        let matches = engine
-            .scan_bytes(eicar_bytes())
-            .expect("scan eicar bytes in memory");
-        assert!(
-            matches
-                .iter()
-                .any(|m| m.rule_name == "Example_EICAR_Test_File"),
-            "expected a match for the bundled EICAR rule, got: {matches:?}"
-        );
+        let engine = YaraEngine::load(dir.path()).expect("literal text must remain valid");
+        assert_eq!(engine.rule_count, 1);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn missing_rules_dir_is_not_an_error() {
-        let engine = YaraEngine::load(Path::new("/nonexistent/does-not-exist-nsic-test"))
-            .expect("a missing rules dir should not error");
-        assert_eq!(engine.rule_count, 0);
-    }
+    fn preflight_rejects_fifo_without_waiting_for_writer() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
 
-    #[test]
-    fn ruleset_fingerprint_is_deterministic_and_distinguishes_rulesets() {
-        let loaded = YaraEngine::load(&bundled_rules_dir()).expect("load bundled yara rules");
-        let loaded_again =
-            YaraEngine::load(&bundled_rules_dir()).expect("load bundled yara rules again");
-        assert_eq!(
-            loaded.ruleset_fingerprint, loaded_again.ruleset_fingerprint,
-            "loading the same rules directory twice should fingerprint identically"
-        );
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let fifo = dir.path().join("swapped.yar");
+        let c_path = CString::new(fifo.as_os_str().as_bytes()).expect("fifo path has no nul");
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
 
-        let empty = YaraEngine::empty(Path::new("/nonexistent/does-not-exist-nsic-test"));
-        assert_ne!(
-            loaded.ruleset_fingerprint, empty.ruleset_fingerprint,
-            "a real ruleset and an empty one must not share a fingerprint"
-        );
-
-        let missing = YaraEngine::load(Path::new("/nonexistent/does-not-exist-nsic-test"))
-            .expect("a missing rules dir should not error");
-        assert_eq!(
-            missing.ruleset_fingerprint, empty.ruleset_fingerprint,
-            "a missing rules dir degrades to the same fingerprint as an explicitly empty engine"
-        );
+        let err = read_rule_source_preflight(&fifo).expect_err("FIFO must be rejected");
+        assert!(err.to_string().contains("non-regular"));
     }
 }

@@ -76,24 +76,182 @@ What works today:
   rather than guessing -- see the module doc comment. Deliberately does
   not touch Postgres at all, so it keeps working even when the intel
   database is unreachable.
+- **Threat Relationship Model (PR #19).** `get_verdict` now also returns
+  `threat_relationships: ThreatRelationship[]` (`crates/nsic-core/src/models.rs`)
+  -- the Apollo Constitution &sect;6 RELATE-stage structured view, distinct
+  from `entries`' verdict-tier framing ("why did this file get flagged").
+  Every relationship carries an explicit `kind` (IOC / CVE / threat actor /
+  campaign / malware family / ATT&amp;CK technique / detection / risk-based)
+  and `strength` (direct/strong/contextual/weak -- Open &middot; 3's
+  requested vocabulary). `strength` is set as a literal at each construction
+  site based on the *evidence mechanism* -- an exact hash match is `Direct`,
+  a YARA rule firing is a `Detection` (not an `Ioc`) at `Direct`, a
+  two-hop CVE inference through report co-occurrence is `Contextual` -- and
+  is never derived from a source's confidence number, which is an
+  orthogonal dimension (a low-confidence exact match is still `Direct`; a
+  high-confidence filename-only match is still `Weak`). Most relationships
+  are pure-derived from existing provenance entries
+  (`derive_relationships`), and only for tiers that are genuine
+  indicator-table lookups (`ExactHash`/`FuzzyHash`/`PathPattern`); a YARA
+  hit produces a `Detection` relationship only, and a contextual filename
+  match produces a `RiskBased` relationship only, since neither ever
+  touched the indicator table. **Malware family attribution is newly real
+  data**, not just restructured existing data -- MalwareBazaar's
+  `signature` and ThreatFox's `malware_printable` fields were previously
+  only used as report title text, now upserted as their own graph node and
+  edge (`malware_family` / `indicator_attributed_to_malware_family`,
+  migration `0009`), checked against both sha256 and md5 indicators, with
+  the supporting report's ID stored directly on the edge rather than
+  reconstructed later -- reconstructing it via a join back to
+  `indicator_observed_in_report` on `(indicator_id, source)` alone can
+  cross-attribute or duplicate whenever a source has filed more than one
+  report for the same indicator.
+  Every `ThreatRelationship` carries an
+  `evidence_paths: RelationshipEvidence[][]` list rather than one flat
+  `source`/`confidence`/timestamp set: Postgres stores provenance per
+  *edge*, not per relationship, so a single-hop relationship (IOC,
+  Detection, RiskBased, MalwareFamily) carries exactly one path with one
+  evidence item, while a CVE relationship carries the full multi-hop chain
+  it was inferred through, each hop with its own provenance. Each inner
+  array is one complete, independently-walkable path from the file to the
+  target -- a CVE relationship inferred through report co-occurrence can
+  have *more than one* path when the report observed this file under more
+  than one hash (or via more than one source) before converging on the
+  same `report_references_cve` assertion: those are two real, parallel
+  first hops sharing one second hop, not one longer linear chain, so
+  flattening them into a single array would either misrepresent the
+  topology or force a consumer to infer the branch from repeated
+  `report_id`s. CVE relationships come from two dedicated queries
+  (`db::indicators::cve_matches_via_report` / `cve_matches_via_detection`),
+  each anchored on the CVE-specific edge (not the parent indicator/detection
+  edge), so one real `report -> cve` or `detection -> cve` assertion can't
+  materialize as two relationships just because the file has two hash
+  representations or multiple source rows for the same edge --
+  deduplicating the *relationship* without discarding any real supporting
+  *evidence*: `cve_matches_via_report` groups every matching
+  `indicator_observed_in_report` row (sha256, md5, or more than one source)
+  under the one CVE edge it supports, then emits one evidence path per
+  parent row (each ending at its own copy of the shared CVE hop), so all of
+  them survive as separate, self-contained paths rather than a `LIMIT 1`
+  silently keeping only one and throwing the rest away.
+  `report_references_cve --> Contextual` (a two-hop report co-occurrence
+  inference) and `detection_covers_cve --> Strong` (one hop tighter: the
+  detection matched this exact file, though covering a CVE is still the
+  detection's own documented scope, not a per-file assertion).
+  `cve_matches_via_detection` is scoped to the detection names that
+  actually fired in the *current* scan, not any `detection_detects_indicator`
+  edge ever persisted for the hash -- a detection recorded historically (a
+  rule that has since changed, or one curated from another source) must not
+  resurface as though it matched this exact file just because a *different*
+  rule genuinely fired, or because the hash happens to be bloom-known for an
+  unrelated reason. `detection` rows are keyed by `(kind, name)`, so editing
+  a rule's body while keeping its name reuses the same row -- a
+  `rule_fingerprint` column (migration `0010`, `NOT NULL DEFAULT ''` and
+  part of both edge tables' primary keys, so a new rule-content version
+  gets its own row rather than overwriting the previous version's history
+  on conflict) is stamped on both `detection_detects_indicator` and
+  `detection_covers_cve` edges as they're written, and
+  `cve_matches_via_detection` filters on it per rule (`'' `= "applies to
+  any version"), so a CVE coverage assertion made against one revision of
+  a rule's content can't silently carry over to a later revision that
+  reuses the same rule name. Scoped by `YaraEngine::rule_fingerprint` --
+  the SHA-256 of the *one file* that declared that specific rule,
+  deliberately not `YaraEngine::ruleset_fingerprint`'s whole-directory hash
+  (that value is Phase 1's fleet-sighting identity, a legitimate but
+  different concept -- see `host_sighted_indicator`'s migration comment):
+  scoping CVE coverage by the whole compiled ruleset meant editing one
+  unrelated rule elsewhere in the directory falsely invalidated every other
+  rule's own unchanged coverage. Which rule a file declares is found by a
+  lightweight lexer (`extract_rule_names`) that blanks out comments, string
+  literals, *and* regex literals before scanning for `rule <identifier>`
+  text -- regex literals matter because a YARA string pattern like
+  `$r = /rule TargetRule/` is completely ordinary, valid syntax, and
+  without stripping it the literal text inside the pattern was
+  indistinguishable from a real declaration, letting one file's
+  `rule_fingerprints` entry silently overwrite another's. The YARA-hit provenance entry and
+  CVE-via-detection's first evidence hop are supplied directly from the
+  current scan's own known values (rule name, its own fingerprint, source,
+  confidence, timestamp, and the scanned indicator's kind/value) rather
+  than reconstructed by reading back whatever row a database query happened
+  to pick; the second hop preserves the coverage edge's own true stored
+  fingerprint (including the wildcard) rather than presenting it as though
+  asserted against whatever rule fired in the current scan.
+  Hashing and YARA scanning read a file's bytes exactly once
+  (`hashing::hash_and_read_file`) instead of two separate reads, closing a
+  TOCTOU race where a file changing between the hash read and the scan
+  read could bind a YARA hit's persisted edge to the wrong hash --
+  mirrors the read-once-then-hash-and-scan-the-same-buffer pattern
+  `crates/agent/src/main.rs` already used. That same function refuses
+  anything that isn't a regular file (a FIFO can block a read
+  indefinitely; a character device can return unbounded data regardless of
+  what `len()` reports) and caps the read at 256 MiB, reported as a clear
+  error rather than an OOM or an indefinite hang on a live filesystem
+  `fs_browse::list_dir` otherwise exposes with no type/size information at
+  all. It validates the object it actually opened, not a separate path
+  stat: `open_regular` opens with `O_NONBLOCK` on Unix (a no-op once a
+  regular file is confirmed, but it keeps opening a FIFO from blocking
+  indefinitely for a writer) and every subsequent check --
+  regular-file-or-not, size -- reads from an `fstat` on that same handle,
+  so there's no window between "stat says this path is safe" and "open
+  this path" for the underlying object to change.
+  The bloom filter tracks its own validity (`BloomState::check`, one
+  lock acquisition covering both the validity check and the membership
+  check together): a bloom miss only short-circuits the indicator-table
+  lookups when the filter is known to be in sync with the intel store, so a
+  refresh failure degrades to doing the DB round trip on every scan rather
+  than silently turning into false negatives. `sync_feeds` calls
+  `BloomState::invalidate` *before* `ingest::run_all` starts committing new
+  indicators/edges, not only after a failed post-sync refresh; `refresh`
+  holds one write lock across both its DB query and the filter swap so a
+  concurrent `insert` (a fresh local YARA hit) can't be silently discarded
+  by the swap. Beyond the bloom filter itself, `IntelGate`
+  (`src-tauri/src/bloom.rs`) serializes a verdict's *entire* intel-corpus
+  read (its bloom check through its final `intel_freshness` read) against a
+  feed sync's entire write (invalidate, ingest, refresh) as two mutually
+  exclusive units: `verdict::resolve` holds a read guard for its whole
+  duration, `commands::sync_feeds` holds the write guard around all three
+  of its steps, so a verdict can never observe a mix of pre-sync and
+  post-sync state -- a bloom-miss decision made against one corpus
+  generation paired with `intel_freshness` read back from a *different*,
+  newer one, purely because a sync happened to land in between. Many
+  verdicts can still resolve concurrently (shared read access); only a sync
+  excludes them, and only for its own short, explicit, manually-triggered
+  duration. `RelationshipEvidence.relation` is a closed `EvidenceRelation` enum
+  (one variant per edge table: `observed_in_report`,
+  `report_references_cve`, `detects_indicator`, `detection_covers_cve`,
+  `attributed_to_malware_family`, `contextual_filename_match`) rather than
+  a free-form string, and each hop carries the specific node it traversed
+  -- `indicator_kind`/`indicator_value` or `detection_name`/
+  `rule_fingerprint` -- so the full evidence chain is reconstructable from
+  the wire object alone, which PR #20's hunt engine will need to walk
+  programmatically rather than parsing prose. Every `ProvenanceEntry` and
+  `RelationshipEvidence` also carries `timing: EvidenceTiming` (`Observed`
+  or `ReceivedOnly`): every edge-backed tier has a genuine claimed
+  observation window for `first_seen`/`last_seen`, but the `Contextual`
+  tier has no backing edge at all, so its timestamps are only Apollo's own
+  report-receipt time (`report.ingested_at`) -- `ReceivedOnly` keeps that
+  labeled honestly on the wire instead of letting one field name silently
+  mean two different things depending on which tier produced it.
+  Threat-actor and campaign relationship kinds are
+  structurally supported (the graph tables already existed) but correctly
+  surface no data yet, since no ingestion populates them until later
+  hunt-pack work; ATT&amp;CK technique has no data source at all yet and is
+  declared in the vocabulary without a code path, the same precedent
+  `DetectionKind::Sigma` already sets for detection content this codebase
+  doesn't ingest either.
 
 What's stubbed or deliberately not built yet, in build order (see
 [`docs/apollo-constitution.md`](docs/apollo-constitution.md#12-current-product-build-doctrine)
 for the full sequencing rationale):
 
-- **Threat Relationship Model (PR #19).** CVE/IOC/APT/campaign/malware/
-  risk associations are not yet structured, actionable objects with an
-  explicit strength vocabulary (direct/strong/contextual/weak) -- see
-  Open &middot; 3 in the Apollo Constitution.
 - **Recursive Hunt Engine (PR #20) -- the other half of Apollo's core
   product promise.** Today's verdict engine only goes one direction: file
   in, correlation out. There is no command that goes the other way --
-  pick a CVE/IOC/APT relationship a file surfaced, and scan the chosen
-  directory scope recursively for every other file associated with it.
-  `fs_browse.rs` lists one directory level at a time; nothing walks a
-  tree looking for matches. Blocked on PR #19 existing first, per
-  the Apollo Constitution's build doctrine -- not something to build
-  ahead of the relationship model it depends on.
+  pick a relationship a file surfaced, and scan the chosen directory scope
+  recursively for every other file associated with it. `fs_browse.rs`
+  lists one directory level at a time; nothing walks a tree looking for
+  matches. The Threat Relationship Model (PR #19, done -- see "What works
+  today" above) is what a recursive hunt now has to pivot on.
 - Fuzzy hashing (imphash / TLSH / ssdeep). The indicator kind and query
   path exist; nothing computes these values yet, so tier 2 (fuzzy match)
   never fires in Phase 0.
@@ -348,9 +506,10 @@ Do not jump ahead; each phase de-risks the next.
   verdict (PR #17, done -- see "What works today" above), a File
   Intelligence Model (PR #18, done -- see "What works today" above --
   what a file is actually *for*, not just its hash/reputation), a
-  Threat Relationship Model (PR #19 -- CVE/IOC/
-  APT/campaign/malware/risk associations as structured, actionable
-  objects with an explicit strength vocabulary), a Recursive Hunt Engine
+  Threat Relationship Model (PR #19, done -- see "What works today" above
+  -- CVE/IOC/APT/campaign/malware/risk associations as structured,
+  actionable objects with an explicit strength vocabulary), a Recursive
+  Hunt Engine
   (PR #20 -- the actual missing pivot: today's verdict engine only goes
   file-in, correlation-out, never indicator-in, matching-files-out), a
   first real KEV-seeded Hunt Pack to prove the engine (PR #21), then Hunt

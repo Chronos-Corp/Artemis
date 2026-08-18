@@ -2849,6 +2849,7 @@ dependencies = [
  "bloomfilter",
  "chrono",
  "dirs",
+ "libc",
  "nsic-core",
  "reqwest 0.12.28",
  "serde",

@@ -1,7 +1,8 @@
 use serde::Serialize;
 use tauri::State;
 
-use crate::models::{FileEntry, SyncSummary, Verdict};
+use crate::analysis_coverage::YaraCoverageState;
+use crate::models::{FileEntry, SyncSummary};
 use crate::AppState;
 
 fn db_unavailable() -> String {
@@ -24,12 +25,22 @@ pub async fn list_directory(state: State<'_, AppState>, path: String) -> Result<
 }
 
 #[tauri::command]
-pub async fn get_verdict(state: State<'_, AppState>, path: String) -> Result<Verdict, String> {
+pub async fn get_verdict(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<crate::relationship_contract::ResolvedVerdict, String> {
     let pool = state.pool.as_ref().ok_or_else(db_unavailable)?;
-    crate::verdict::resolve(
+
+    // The relationship-contract module owns the only exposed resolver. It
+    // returns an already-normalized RELATE result with YARA coverage attached,
+    // so this Tauri adapter cannot be the only place Orion-critical semantics
+    // become true.
+    crate::relationship_contract::resolve(
         pool,
         &state.bloom,
+        &state.intel_gate,
         &state.yara,
+        &state.yara_coverage,
         &state.recent_yara_hits,
         std::path::Path::new(&path),
     )
@@ -68,6 +79,21 @@ pub async fn sync_feeds(state: State<'_, AppState>) -> Result<Vec<FeedSyncResult
         );
     }
 
+    // Held for invalidation + ingestion + refresh as one unit -- see
+    // `IntelGate`'s doc comment. A round-6 review already established that
+    // the bloom must be invalidated *before* `ingest::run_all` starts
+    // committing (not just after a failed post-sync refresh); a round-7
+    // review went further and caught that even with that ordering, a
+    // verdict running concurrently could still see the bloom decision from
+    // *before* this sync and the freshness state from *after* it, since
+    // nothing previously excluded a `resolve()` call from interleaving
+    // with these three steps. Holding this write guard blocks any
+    // concurrent `resolve()` (which takes the matching read guard for its
+    // whole duration) until the sync -- invalidate, ingest, refresh -- has
+    // completed as one atomic-from-the-outside unit.
+    let _intel_write_guard = state.intel_gate.write().await;
+
+    state.bloom.invalidate().await;
     let results = crate::ingest::run_all(pool, &state.api_key).await;
     let mapped: Vec<FeedSyncResult> = results
         .into_iter()
@@ -98,13 +124,17 @@ pub async fn sync_feeds(state: State<'_, AppState>) -> Result<Vec<FeedSyncResult
 pub struct YaraStatus {
     pub rules_dir: String,
     pub rule_count: usize,
+    pub status: YaraCoverageState,
+    pub failure_reason: Option<String>,
 }
 
 #[tauri::command]
 pub fn yara_status(state: State<'_, AppState>) -> YaraStatus {
     YaraStatus {
         rules_dir: state.yara.rules_dir.to_string_lossy().to_string(),
-        rule_count: state.yara.rule_count,
+        rule_count: state.yara_coverage.rule_count,
+        status: state.yara_coverage.status,
+        failure_reason: state.yara_coverage.failure_reason.clone(),
     }
 }
 

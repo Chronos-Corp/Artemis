@@ -1,11 +1,14 @@
-import type { FileEntry, FileIntelligence, IntelSourceFreshness, Verdict } from "../types";
+import type { VerdictWithCoverage } from "../analysisCoverage";
+import type { FileEntry, FileIntelligence, IntelSourceFreshness } from "../types";
 import { TIER_LABELS } from "../types";
 import { formatDate, formatRelativeTime } from "../format";
+import { safeExternalUrl } from "../lib/safeUrl";
 import { FileIntelPanel } from "./FileIntelPanel";
+import { ThreatRelationshipList } from "./ThreatRelationshipList";
 
 interface Props {
   file: FileEntry | null;
-  verdict: Verdict | null;
+  verdict: VerdictWithCoverage | null;
   loading: boolean;
   error: string | null;
   fileIntel: FileIntelligence | null;
@@ -13,12 +16,6 @@ interface Props {
   fileIntelError: string | null;
 }
 
-// Documented-as-arbitrary default, matching the Phase 1 console's
-// NSIC_SCAN_STALENESS_HOURS precedent (crates/console/src/main.rs) for the
-// same reasoning: a sane ceiling for a feed expected to sync roughly daily,
-// not derived from any measured workload. Unlike the console, there's no
-// per-deployment operator here to override it via an env var -- this is a
-// single-analyst desktop app, so it's a constant, not a config value.
 const INTEL_STALENESS_HOURS = 24;
 
 function isStale(freshness: IntelSourceFreshness): boolean {
@@ -33,8 +30,8 @@ function IntelCoverage({ sources }: { sources: IntelSourceFreshness[] }) {
   if (sources.length === 0) {
     return (
       <div className="intel-coverage intel-coverage-empty">
-        No feed has completed a sync yet -- this verdict reflects local YARA
-        rules and path/naming signals only, not any intel feed.
+        No feed has completed a sync yet -- this verdict has no threat-intel
+        feed coverage. Local analysis coverage is reported separately below.
       </div>
     );
   }
@@ -59,6 +56,36 @@ function IntelCoverage({ sources }: { sources: IntelSourceFreshness[] }) {
       </ul>
     </div>
   );
+}
+
+function YaraCoverageNotice({ verdict }: { verdict: VerdictWithCoverage }) {
+  if (verdict.yara_coverage.status === "failed") {
+    return (
+      <div className="verdict-truncated" role="status">
+        <strong>YARA coverage unavailable.</strong> The configured ruleset
+        failed to load, so this verdict cannot make a negative claim about
+        local YARA detections. Hash, path, contextual, and available
+        relationship evidence are still shown.
+        {verdict.yara_coverage.failure_reason && (
+          <div>
+            <strong>Reason:</strong> {verdict.yara_coverage.failure_reason}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  if (verdict.yara_coverage.status === "empty") {
+    return (
+      <div className="intel-coverage intel-coverage-empty" role="status">
+        YARA coverage: no local rules are configured. This is a successful
+        zero-rule configuration, not a failed ruleset, so this verdict has no
+        YARA detection coverage.
+      </div>
+    );
+  }
+
+  return null;
 }
 
 export function VerdictPanel({
@@ -102,14 +129,53 @@ export function VerdictPanel({
           </div>
 
           <IntelCoverage sources={verdict.intel_freshness} />
+          <YaraCoverageNotice verdict={verdict} />
+
+          <ThreatRelationshipList
+            relationships={verdict.threat_relationships}
+            relationshipsTruncated={verdict.bounds.relationships_truncated}
+          />
+
+          {verdict.bounds.truncated_entry_tiers.length > 0 && (
+            <div className="verdict-truncated" role="status">
+              <strong>Partial evidence.</strong> More matching evidence exists
+              than is shown for:{" "}
+              {verdict.bounds.truncated_entry_tiers
+                .map((tier) => TIER_LABELS[tier])
+                .join(", ")}
+              . This list is bounded, not complete -- treat it as a sample
+              rather than the full picture.
+            </div>
+          )}
 
           {verdict.entries.length === 0 ? (
             <div className="verdict-no-match">
-              No matching hash evidence, YARA hit, path pattern, or contextual
-              association in any tier checked. Not a guarantee the file is
-              clean -- only that nothing in the current intel store or local
-              rules flagged it. See intel coverage above for how current that
-              intel actually is.
+              {verdict.yara_coverage.status === "failed" ? (
+                <>
+                  No matching hash evidence, path pattern, or contextual
+                  association was found in the available tiers. YARA was not
+                  successfully checked because the configured ruleset failed
+                  to load, so absence of a YARA detection is unknown. This is
+                  not a guarantee the file is clean. See coverage above for
+                  the exact analysis state.
+                </>
+              ) : verdict.yara_coverage.status === "empty" ? (
+                <>
+                  No matching hash evidence, path pattern, or contextual
+                  association was found in the available tiers. No YARA rules
+                  are configured, so this verdict contains no YARA detection
+                  coverage. This is not a guarantee the file is clean. See
+                  coverage above for the exact analysis state.
+                </>
+              ) : (
+                <>
+                  No matching hash evidence, YARA hit, path pattern, or
+                  contextual association in any tier checked. Not a guarantee
+                  the file is clean -- only that nothing in the current intel
+                  store or loaded local rules flagged it. See intel coverage
+                  above for how current that intel actually is.
+                </>
+              )}
             </div>
           ) : (
             <ul className="provenance-list">
@@ -134,8 +200,12 @@ export function VerdictPanel({
                     {entry.report_title && (
                       <div>
                         <strong>Report:</strong>{" "}
-                        {entry.report_url ? (
-                          <a href={entry.report_url} target="_blank" rel="noreferrer">
+                        {safeExternalUrl(entry.report_url) ? (
+                          <a
+                            href={safeExternalUrl(entry.report_url)!}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
                             {entry.report_title}
                           </a>
                         ) : (
@@ -143,14 +213,15 @@ export function VerdictPanel({
                         )}
                       </div>
                     )}
-                    {entry.cve_ids.length > 0 && (
-                      <div>
-                        <strong>CVEs:</strong> {entry.cve_ids.join(", ")}
-                      </div>
-                    )}
                     <div className="provenance-dates">
-                      First seen {formatDate(entry.first_seen)}, last seen{" "}
-                      {formatDate(entry.last_seen)}
+                      {entry.timing === "received_only" ? (
+                        <>Report received {formatDate(entry.first_seen)}</>
+                      ) : (
+                        <>
+                          First seen {formatDate(entry.first_seen)}, last seen{" "}
+                          {formatDate(entry.last_seen)}
+                        </>
+                      )}
                     </div>
                   </div>
                 </li>
