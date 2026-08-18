@@ -206,6 +206,11 @@ fn trace_verdict_bounded(verdict: &Verdict, max_paths: usize) -> OrionTrace {
                 relationship,
                 UntracedReason::UnsupportedRelationshipShape,
             ));
+        } else {
+            // Fair allocation must consume each relationship's best path
+            // first. Sorting only after applying the global budget could
+            // preserve a weaker earlier proof while omitting a stronger one.
+            paths.sort_by(compare_paths);
         }
         by_relationship.push(paths);
     }
@@ -318,9 +323,16 @@ fn project_path(
     proof: &[RelationshipEvidence],
     shape: &[EvidenceRelation],
 ) -> Result<TracePath, UntracedReason> {
+    if relationship.target.trim().is_empty() {
+        return Err(UntracedReason::MissingNodeIdentity);
+    }
+
     let (nodes, edges, state) = match (relationship.kind, shape) {
         (RelationshipKind::Ioc, [EvidenceRelation::ObservedInReport]) => {
-            let indicator = indicator_from_evidence(&proof[0], &relationship.target)?;
+            let indicator = indicator_from_evidence(&proof[0])?;
+            if indicator.label != relationship.target {
+                return Err(UntracedReason::InconsistentProofEndpoints);
+            }
             (
                 vec![start.clone(), indicator.clone()],
                 vec![synthetic_edge(
@@ -332,8 +344,11 @@ fn project_path(
             )
         }
         (RelationshipKind::Detection, [EvidenceRelation::DetectsIndicator]) => {
-            let indicator = indicator_from_evidence(&proof[0], "")?;
+            let indicator = indicator_from_evidence(&proof[0])?;
             let detection = detection_from_evidence(&proof[0])?;
+            if detection.label != relationship.target {
+                return Err(UntracedReason::InconsistentProofEndpoints);
+            }
             (
                 vec![start.clone(), indicator.clone(), detection.clone()],
                 vec![
@@ -353,9 +368,12 @@ fn project_path(
             RelationshipKind::Cve,
             [EvidenceRelation::ObservedInReport, EvidenceRelation::ReportReferencesCve],
         ) => {
-            let indicator = indicator_from_evidence(&proof[0], "")?;
+            let indicator = indicator_from_evidence(&proof[0])?;
             let report = report_from_evidence(&proof[0])?;
-            if proof[1].report_id != proof[0].report_id {
+            let referenced_report_id = proof[1]
+                .report_id
+                .ok_or(UntracedReason::MissingNodeIdentity)?;
+            if Some(referenced_report_id) != proof[0].report_id {
                 return Err(UntracedReason::InconsistentProofEndpoints);
             }
             let cve = concept_node(TraceNodeKind::Cve, "cve", &relationship.target);
@@ -385,11 +403,9 @@ fn project_path(
             RelationshipKind::Cve,
             [EvidenceRelation::DetectsIndicator, EvidenceRelation::DetectionCoversCve],
         ) => {
-            let indicator = indicator_from_evidence(&proof[0], "")?;
+            let indicator = indicator_from_evidence(&proof[0])?;
             let detection = detection_from_evidence(&proof[0])?;
-            if proof[1].detection_name != proof[0].detection_name {
-                return Err(UntracedReason::InconsistentProofEndpoints);
-            }
+            validate_detection_coverage_endpoint(&proof[0], &proof[1])?;
             let cve = concept_node(TraceNodeKind::Cve, "cve", &relationship.target);
             (
                 vec![start.clone(), indicator.clone(), detection.clone(), cve.clone()],
@@ -417,7 +433,7 @@ fn project_path(
             RelationshipKind::MalwareFamily,
             [EvidenceRelation::AttributedToMalwareFamily],
         ) => {
-            let indicator = indicator_from_evidence(&proof[0], "")?;
+            let indicator = indicator_from_evidence(&proof[0])?;
             let family = concept_node(
                 TraceNodeKind::MalwareFamily,
                 "malware_family",
@@ -494,7 +510,6 @@ fn artifact_node(sha256: &str, path: &str) -> TraceNode {
 
 fn indicator_from_evidence(
     evidence: &RelationshipEvidence,
-    target_fallback: &str,
 ) -> Result<TraceNode, UntracedReason> {
     let kind = evidence
         .indicator_kind
@@ -502,8 +517,7 @@ fn indicator_from_evidence(
     let value = evidence
         .indicator_value
         .as_deref()
-        .filter(|value| !value.is_empty())
-        .or_else(|| (!target_fallback.is_empty()).then_some(target_fallback))
+        .filter(|value| !value.trim().is_empty())
         .ok_or(UntracedReason::MissingNodeIdentity)?;
     Ok(TraceNode {
         id: stable_id("indicator", &[indicator_kind_key(kind), value]),
@@ -532,14 +546,56 @@ fn detection_from_evidence(
     let name = evidence
         .detection_name
         .as_deref()
-        .filter(|name| !name.is_empty())
+        .filter(|name| !name.trim().is_empty())
         .ok_or(UntracedReason::MissingNodeIdentity)?;
-    let version = evidence.rule_fingerprint.as_deref().unwrap_or("any_version");
+    // A Detection node represents the concrete rule that fired. Any-version
+    // is valid only as the scope of a DetectionCoversCve assertion; it can
+    // never stand in for a missing current observation fingerprint.
+    let version = evidence
+        .rule_fingerprint
+        .as_deref()
+        .filter(|version| !version.trim().is_empty())
+        .ok_or(UntracedReason::MissingNodeIdentity)?;
     Ok(TraceNode {
         id: stable_id("detection_yara", &[name, version]),
         kind: TraceNodeKind::Detection,
         label: name.to_string(),
     })
+}
+
+fn validate_detection_coverage_endpoint(
+    observation: &RelationshipEvidence,
+    coverage: &RelationshipEvidence,
+) -> Result<(), UntracedReason> {
+    let observation_name = observation
+        .detection_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .ok_or(UntracedReason::MissingNodeIdentity)?;
+    let coverage_name = coverage
+        .detection_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .ok_or(UntracedReason::MissingNodeIdentity)?;
+    if coverage_name != observation_name {
+        return Err(UntracedReason::InconsistentProofEndpoints);
+    }
+
+    let observation_version = observation
+        .rule_fingerprint
+        .as_deref()
+        .filter(|version| !version.trim().is_empty())
+        .ok_or(UntracedReason::MissingNodeIdentity)?;
+    if let Some(coverage_version) = coverage.rule_fingerprint.as_deref() {
+        if coverage_version.trim().is_empty() {
+            return Err(UntracedReason::MissingNodeIdentity);
+        }
+        if coverage_version != observation_version {
+            return Err(UntracedReason::InconsistentProofEndpoints);
+        }
+    }
+
+    Ok(())
 }
 
 fn concept_node(kind: TraceNodeKind, namespace: &str, value: &str) -> TraceNode {
@@ -713,6 +769,46 @@ mod tests {
     }
 
     #[test]
+    fn detection_cve_trace_accepts_explicit_any_version_coverage() {
+        let mut cve = relationship(
+            RelationshipKind::Cve,
+            RelationshipStrength::Strong,
+            "CVE-2026-0002",
+            &[
+                EvidenceRelation::DetectsIndicator,
+                EvidenceRelation::DetectionCoversCve,
+            ],
+        );
+        cve.evidence_paths[0][1].rule_fingerprint = None;
+
+        let trace = trace_verdict(&verdict(vec![cve]));
+        assert_eq!(trace.paths.len(), 1);
+        assert!(trace.untraced_relationships.is_empty());
+        assert!(trace.paths[0].nodes[2].id.contains("rule-v1"));
+    }
+
+    #[test]
+    fn current_detection_identity_never_broadens_to_any_version() {
+        for fingerprint in [None, Some(String::new()), Some("   ".to_string())] {
+            let mut detection = relationship(
+                RelationshipKind::Detection,
+                RelationshipStrength::Strong,
+                "test_rule",
+                &[EvidenceRelation::DetectsIndicator],
+            );
+            detection.evidence_paths[0][0].rule_fingerprint = fingerprint;
+
+            let trace = trace_verdict(&verdict(vec![detection]));
+            assert!(trace.paths.is_empty());
+            assert_eq!(trace.untraced_relationships.len(), 1);
+            assert_eq!(
+                trace.untraced_relationships[0].reason,
+                UntracedReason::MissingNodeIdentity
+            );
+        }
+    }
+
+    #[test]
     fn contextual_filename_is_possible_not_observed() {
         let trace = trace_verdict(&verdict(vec![relationship(
             RelationshipKind::RiskBased,
@@ -801,6 +897,103 @@ mod tests {
     }
 
     #[test]
+    fn missing_ioc_identity_is_not_synthesized_from_the_target() {
+        let mut ioc = relationship(
+            RelationshipKind::Ioc,
+            RelationshipStrength::Direct,
+            "abc123",
+            &[EvidenceRelation::ObservedInReport],
+        );
+        ioc.evidence_paths[0][0].indicator_value = None;
+
+        let trace = trace_verdict(&verdict(vec![ioc]));
+        assert!(trace.paths.is_empty());
+        assert_eq!(
+            trace.untraced_relationships[0].reason,
+            UntracedReason::MissingNodeIdentity
+        );
+    }
+
+    #[test]
+    fn relationship_targets_must_equal_their_proof_endpoints() {
+        let ioc = relationship(
+            RelationshipKind::Ioc,
+            RelationshipStrength::Direct,
+            "different-indicator",
+            &[EvidenceRelation::ObservedInReport],
+        );
+        let detection = relationship(
+            RelationshipKind::Detection,
+            RelationshipStrength::Strong,
+            "different-rule",
+            &[EvidenceRelation::DetectsIndicator],
+        );
+
+        let trace = trace_verdict(&verdict(vec![ioc, detection]));
+        assert!(trace.paths.is_empty());
+        assert_eq!(trace.untraced_relationships.len(), 2);
+        assert!(trace.untraced_relationships.iter().all(|untraced| {
+            untraced.reason == UntracedReason::InconsistentProofEndpoints
+        }));
+    }
+
+    #[test]
+    fn shared_multi_hop_endpoints_fail_closed() {
+        let mut missing_report = relationship(
+            RelationshipKind::Cve,
+            RelationshipStrength::Contextual,
+            "CVE-2026-0010",
+            &[
+                EvidenceRelation::ObservedInReport,
+                EvidenceRelation::ReportReferencesCve,
+            ],
+        );
+        missing_report.evidence_paths[0][1].report_id = None;
+
+        let mut wrong_detection = relationship(
+            RelationshipKind::Cve,
+            RelationshipStrength::Strong,
+            "CVE-2026-0011",
+            &[
+                EvidenceRelation::DetectsIndicator,
+                EvidenceRelation::DetectionCoversCve,
+            ],
+        );
+        wrong_detection.evidence_paths[0][1].detection_name = Some("other_rule".to_string());
+
+        let mut wrong_version = relationship(
+            RelationshipKind::Cve,
+            RelationshipStrength::Strong,
+            "CVE-2026-0012",
+            &[
+                EvidenceRelation::DetectsIndicator,
+                EvidenceRelation::DetectionCoversCve,
+            ],
+        );
+        wrong_version.evidence_paths[0][1].rule_fingerprint = Some("rule-v2".to_string());
+
+        let trace = trace_verdict(&verdict(vec![
+            missing_report,
+            wrong_detection,
+            wrong_version,
+        ]));
+        assert!(trace.paths.is_empty());
+        assert_eq!(trace.untraced_relationships.len(), 3);
+        assert_eq!(
+            trace.untraced_relationships[0].reason,
+            UntracedReason::MissingNodeIdentity
+        );
+        assert_eq!(
+            trace.untraced_relationships[1].reason,
+            UntracedReason::InconsistentProofEndpoints
+        );
+        assert_eq!(
+            trace.untraced_relationships[2].reason,
+            UntracedReason::InconsistentProofEndpoints
+        );
+    }
+
+    #[test]
     fn path_budget_gives_distinct_relationships_a_first_slot() {
         let mut noisy = relationship(
             RelationshipKind::Ioc,
@@ -820,6 +1013,27 @@ mod tests {
         assert_eq!(trace.paths.len(), 2);
         assert!(trace.paths.iter().any(|path| path.relationship_index == 0));
         assert!(trace.paths.iter().any(|path| path.relationship_index == 1));
+        assert!(trace.bounds.paths_truncated);
+        assert_eq!(trace.bounds.omitted_paths, 1);
+    }
+
+    #[test]
+    fn path_budget_selects_the_best_proof_inside_each_relationship() {
+        let mut ioc = relationship(
+            RelationshipKind::Ioc,
+            RelationshipStrength::Direct,
+            "abc123",
+            &[EvidenceRelation::ObservedInReport],
+        );
+        ioc.evidence_paths[0][0].confidence = 10;
+        let mut stronger_proof = hop(EvidenceRelation::ObservedInReport);
+        stronger_proof.confidence = 95;
+        ioc.evidence_paths.push(vec![stronger_proof]);
+
+        let trace = trace_verdict_bounded(&verdict(vec![ioc]), 1);
+        assert_eq!(trace.paths.len(), 1);
+        assert_eq!(trace.paths[0].rank.weakest_source_confidence, 95);
+        assert_eq!(trace.paths[0].supporting_proof[0].confidence, 95);
         assert!(trace.bounds.paths_truncated);
         assert_eq!(trace.bounds.omitted_paths, 1);
     }

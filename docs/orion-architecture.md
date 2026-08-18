@@ -151,8 +151,10 @@ remains weak.
 
 The initial engine budget is 100 paths. Selection is fair by relationship:
 each relationship receives a first path before a noisy relationship receives
-a second. Orion reports its omitted path count independently from RELATE's
-omitted concepts or evidence.
+a second. Candidate paths are ranked inside each relationship before that
+fair allocation, so applying the budget cannot retain a weaker proof merely
+because RELATE returned it first. Orion reports its omitted path count
+independently from RELATE's omitted concepts or evidence.
 
 ## 8. Security and integrity rules
 
@@ -160,6 +162,12 @@ omitted concepts or evidence.
 - The UI never supplies or rewrites graph direction.
 - Mixed proof shapes, missing identities, inconsistent endpoints, and unknown
   projections produce explicit `untraced_relationships` diagnostics.
+- Current detection observations require a concrete effective rule
+  fingerprint. Only the scope of a `DetectionCoversCve` assertion may use the
+  deliberate any-version sentinel, and a concrete coverage fingerprint must
+  equal the observation fingerprint.
+- Relationship targets and shared multi-hop endpoints must agree exactly;
+  Orion never synthesizes a missing proof-node identity from target text.
 - Reversed traversal is visible to the analyst.
 - Contextual matches never render as observed graph facts.
 - Partial upstream evidence remains partial downstream.
