@@ -132,7 +132,7 @@ Issue #20 hardening is implemented outside PR #19's frozen scope. The stacked im
 
 Regression tests should protect semantic boundaries rather than only implementation branches: case-insensitive contextual identity, YARA source-versus-effective identity, fail-closed version identity, and stable proof-chain semantics are contract tests for Orion's future consumer boundary.
 
-During PR #21 validation, the supply-chain gate detected newly published `RUSTSEC-2026-0258` against locked `h2 0.4.15`. The repository takes the fixed `h2 0.4.16` lockfile update rather than adding an audit suppression. This dependency change is security maintenance discovered by the gate, not part of the RELATE ontology itself.
+During PR #21 validation, the supply-chain gate detected newly published `RUSTSEC-2026-0258` against locked `h2 0.4.15`. The repository takes the fixed `h2 0.4.16` lockfile update rather than adding an audit suppression. The committed lockfile delta is intentionally limited to the `h2` version and checksum so unrelated resolver churn is not smuggled into the hardening PR. This dependency change is security maintenance discovered by the gate, not part of the RELATE ontology itself.
 
 The governing rule remains:
 
