@@ -1,6 +1,7 @@
 use serde::Serialize;
 use tauri::State;
 
+use crate::analysis_coverage::{YaraCoverage, YaraCoverageState};
 use crate::models::{FileEntry, SyncSummary, Verdict};
 use crate::AppState;
 
@@ -23,10 +24,28 @@ pub async fn list_directory(state: State<'_, AppState>, path: String) -> Result<
         .map_err(|e| e.to_string())
 }
 
+/// Analyst-facing verdict wire shape.
+///
+/// `Verdict` remains the shared core evidence object. YARA coverage is kept
+/// beside it here because the configured ruleset is runtime/application
+/// state, not evidence stored in the intel graph. `serde(flatten)` preserves
+/// the existing JSON shape while adding a machine-readable `yara_coverage`
+/// field, so a failed ruleset cannot be normalized into a healthy empty
+/// verdict.
+#[derive(Debug, Serialize)]
+pub struct VerdictResponse {
+    #[serde(flatten)]
+    pub verdict: Verdict,
+    pub yara_coverage: YaraCoverage,
+}
+
 #[tauri::command]
-pub async fn get_verdict(state: State<'_, AppState>, path: String) -> Result<Verdict, String> {
+pub async fn get_verdict(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<VerdictResponse, String> {
     let pool = state.pool.as_ref().ok_or_else(db_unavailable)?;
-    crate::verdict::resolve(
+    let verdict = crate::verdict::resolve(
         pool,
         &state.bloom,
         &state.intel_gate,
@@ -35,7 +54,18 @@ pub async fn get_verdict(state: State<'_, AppState>, path: String) -> Result<Ver
         std::path::Path::new(&path),
     )
     .await
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+
+    // This is the authoritative external RELATE contract. Lower-level DB
+    // helpers may preserve assertion-shaped rows for query efficiency, but
+    // the object Orion/Execute receives never changes meaning merely because
+    // relationship cardinality crossed a resource-bound threshold.
+    let verdict = crate::relationship_contract::finalize_verdict(verdict);
+
+    Ok(VerdictResponse {
+        verdict,
+        yara_coverage: state.yara_coverage.clone(),
+    })
 }
 
 /// FILE/UNDERSTAND-stage intelligence, independent of `get_verdict`'s
@@ -114,13 +144,17 @@ pub async fn sync_feeds(state: State<'_, AppState>) -> Result<Vec<FeedSyncResult
 pub struct YaraStatus {
     pub rules_dir: String,
     pub rule_count: usize,
+    pub status: YaraCoverageState,
+    pub failure_reason: Option<String>,
 }
 
 #[tauri::command]
 pub fn yara_status(state: State<'_, AppState>) -> YaraStatus {
     YaraStatus {
         rules_dir: state.yara.rules_dir.to_string_lossy().to_string(),
-        rule_count: state.yara.rule_count,
+        rule_count: state.yara_coverage.rule_count,
+        status: state.yara_coverage.status,
+        failure_reason: state.yara_coverage.failure_reason.clone(),
     }
 }
 
