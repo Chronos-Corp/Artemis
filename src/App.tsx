@@ -4,14 +4,13 @@ import "./App.css";
 import { FileList } from "./components/FileList";
 import { VerdictPanel } from "./components/VerdictPanel";
 import { StatusBar } from "./components/StatusBar";
+import type { VerdictWithCoverage, YaraStatusWithCoverage } from "./analysisCoverage";
 import type {
   DbStatus,
   FeedSyncResult,
   FileEntry,
   FileIntelligence,
   IntelSourceFreshness,
-  Verdict,
-  YaraStatus,
 } from "./types";
 import { parentPath, pathSegments } from "./format";
 
@@ -22,7 +21,7 @@ function App() {
   const [dirError, setDirError] = useState<string | null>(null);
 
   const [selectedFile, setSelectedFile] = useState<FileEntry | null>(null);
-  const [verdict, setVerdict] = useState<Verdict | null>(null);
+  const [verdict, setVerdict] = useState<VerdictWithCoverage | null>(null);
   const [verdictLoading, setVerdictLoading] = useState(false);
   const [verdictError, setVerdictError] = useState<string | null>(null);
 
@@ -31,7 +30,7 @@ function App() {
   const [fileIntelError, setFileIntelError] = useState<string | null>(null);
 
   const [dbStatus, setDbStatus] = useState<DbStatus | null>(null);
-  const [yaraStatus, setYaraStatus] = useState<YaraStatus | null>(null);
+  const [yaraStatus, setYaraStatus] = useState<YaraStatusWithCoverage | null>(null);
   const [syncStates, setSyncStates] = useState<IntelSourceFreshness[]>([]);
   const [syncing, setSyncing] = useState(false);
   const [lastSyncResults, setLastSyncResults] = useState<FeedSyncResult[] | null>(null);
@@ -39,7 +38,7 @@ function App() {
   const refreshStatus = useCallback(async () => {
     const [db, yara, sync] = await Promise.all([
       invoke<DbStatus>("db_status"),
-      invoke<YaraStatus>("yara_status"),
+      invoke<YaraStatusWithCoverage>("yara_status"),
       invoke<IntelSourceFreshness[]>("feed_sync_status").catch(() => []),
     ]);
     setDbStatus(db);
@@ -93,7 +92,7 @@ function App() {
     // never touches the database (see its Rust doc comment), so it can
     // succeed even when get_verdict fails because Postgres is
     // unreachable, and neither should block or hide the other's result.
-    invoke<Verdict>("get_verdict", { path: entry.path })
+    invoke<VerdictWithCoverage>("get_verdict", { path: entry.path })
       .then(setVerdict)
       .catch((e) => setVerdictError(String(e)))
       .finally(() => setVerdictLoading(false));
