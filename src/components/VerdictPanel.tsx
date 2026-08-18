@@ -16,12 +16,6 @@ interface Props {
   fileIntelError: string | null;
 }
 
-// Documented-as-arbitrary default, matching the Phase 1 console's
-// NSIC_SCAN_STALENESS_HOURS precedent (crates/console/src/main.rs) for the
-// same reasoning: a sane ceiling for a feed expected to sync roughly daily,
-// not derived from any measured workload. Unlike the console, there's no
-// per-deployment operator here to override it via an env var -- this is a
-// single-analyst desktop app, so it's a constant, not a config value.
 const INTEL_STALENESS_HOURS = 24;
 
 function isStale(freshness: IntelSourceFreshness): boolean {
@@ -36,8 +30,8 @@ function IntelCoverage({ sources }: { sources: IntelSourceFreshness[] }) {
   if (sources.length === 0) {
     return (
       <div className="intel-coverage intel-coverage-empty">
-        No feed has completed a sync yet -- this verdict reflects local YARA
-        rules and path/naming signals only, not any intel feed.
+        No feed has completed a sync yet -- this verdict has no threat-intel
+        feed coverage. Local analysis coverage is reported separately below.
       </div>
     );
   }
@@ -143,9 +137,6 @@ export function VerdictPanel({
           />
 
           {verdict.bounds.truncated_entry_tiers.length > 0 && (
-            // A capped result must not read as an exhaustive one. Named per
-            // tier because that is what the backend actually knows -- saying
-            // "some evidence omitted" would be vaguer than the data.
             <div className="verdict-truncated" role="status">
               <strong>Partial evidence.</strong> More matching evidence exists
               than is shown for:{" "}
@@ -209,9 +200,6 @@ export function VerdictPanel({
                     {entry.report_title && (
                       <div>
                         <strong>Report:</strong>{" "}
-                        {/* Revalidated at the sink, never trusted from the
-                            wire object -- see lib/safeUrl.ts (TB-3). A
-                            rejected URL renders the title as plain text. */}
                         {safeExternalUrl(entry.report_url) ? (
                           <a
                             href={safeExternalUrl(entry.report_url)!}
@@ -227,12 +215,6 @@ export function VerdictPanel({
                     )}
                     <div className="provenance-dates">
                       {entry.timing === "received_only" ? (
-                        // Contextual entries have no backing evidence edge,
-                        // so there's no source-claimed observation window
-                        // to report -- only when Apollo itself received the
-                        // report the filename came from. Labeling this the
-                        // same as "first/last seen" would present receipt
-                        // time as though it were observation time.
                         <>Report received {formatDate(entry.first_seen)}</>
                       ) : (
                         <>
