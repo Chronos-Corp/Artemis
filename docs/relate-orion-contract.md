@@ -4,6 +4,8 @@ Status: **implementation contract for Issue #20 / stacked PR #21**
 
 This document narrows the handoff between Artemis RELATE and Orion TRACE. It exists specifically so the relationship model does not accidentally promise directed graph semantics that belong to Orion.
 
+Where older PR #19 comments, README prose, or implementation notes describe `evidence_paths` as literal file-to-target traversal paths, or describe `rule_fingerprint` as only the declaring-file/source identity, **this document is the authoritative post-#19 handoff contract**. Those descriptions record earlier implementation stages and must not be used as Orion API semantics.
+
 ## 1. Responsibility boundary
 
 **RELATE owns:**
@@ -129,6 +131,8 @@ Before First Useful Trace treats RELATE as traversal input, Orion must:
 Issue #20 hardening is implemented outside PR #19's frozen scope. The stacked implementation must receive exact-head Rust, frontend, database-migration, and supply-chain checks before it can be retargeted to `main` after PR #19 merges.
 
 Regression tests should protect semantic boundaries rather than only implementation branches: case-insensitive contextual identity, YARA source-versus-effective identity, fail-closed version identity, and stable proof-chain semantics are contract tests for Orion's future consumer boundary.
+
+During PR #21 validation, the supply-chain gate detected newly published `RUSTSEC-2026-0258` against locked `h2 0.4.15`. The repository takes the fixed `h2 0.4.16` lockfile update rather than adding an audit suppression. This dependency change is security maintenance discovered by the gate, not part of the RELATE ontology itself.
 
 The governing rule remains:
 
