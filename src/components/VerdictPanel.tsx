@@ -1,4 +1,5 @@
-import type { FileEntry, FileIntelligence, IntelSourceFreshness, Verdict } from "../types";
+import type { VerdictWithCoverage } from "../analysisCoverage";
+import type { FileEntry, FileIntelligence, IntelSourceFreshness } from "../types";
 import { TIER_LABELS } from "../types";
 import { formatDate, formatRelativeTime } from "../format";
 import { safeExternalUrl } from "../lib/safeUrl";
@@ -7,7 +8,7 @@ import { ThreatRelationshipList } from "./ThreatRelationshipList";
 
 interface Props {
   file: FileEntry | null;
-  verdict: Verdict | null;
+  verdict: VerdictWithCoverage | null;
   loading: boolean;
   error: string | null;
   fileIntel: FileIntelligence | null;
@@ -63,6 +64,36 @@ function IntelCoverage({ sources }: { sources: IntelSourceFreshness[] }) {
   );
 }
 
+function YaraCoverageNotice({ verdict }: { verdict: VerdictWithCoverage }) {
+  if (verdict.yara_coverage.status === "failed") {
+    return (
+      <div className="verdict-truncated" role="status">
+        <strong>YARA coverage unavailable.</strong> The configured ruleset
+        failed to load, so this verdict cannot make a negative claim about
+        local YARA detections. Hash, path, contextual, and available
+        relationship evidence are still shown.
+        {verdict.yara_coverage.failure_reason && (
+          <div>
+            <strong>Reason:</strong> {verdict.yara_coverage.failure_reason}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  if (verdict.yara_coverage.status === "empty") {
+    return (
+      <div className="intel-coverage intel-coverage-empty" role="status">
+        YARA coverage: no local rules are configured. This is a successful
+        zero-rule configuration, not a failed ruleset, so this verdict has no
+        YARA detection coverage.
+      </div>
+    );
+  }
+
+  return null;
+}
+
 export function VerdictPanel({
   file,
   verdict,
@@ -104,6 +135,7 @@ export function VerdictPanel({
           </div>
 
           <IntelCoverage sources={verdict.intel_freshness} />
+          <YaraCoverageNotice verdict={verdict} />
 
           <ThreatRelationshipList
             relationships={verdict.threat_relationships}
@@ -127,11 +159,32 @@ export function VerdictPanel({
 
           {verdict.entries.length === 0 ? (
             <div className="verdict-no-match">
-              No matching hash evidence, YARA hit, path pattern, or contextual
-              association in any tier checked. Not a guarantee the file is
-              clean -- only that nothing in the current intel store or local
-              rules flagged it. See intel coverage above for how current that
-              intel actually is.
+              {verdict.yara_coverage.status === "failed" ? (
+                <>
+                  No matching hash evidence, path pattern, or contextual
+                  association was found in the available tiers. YARA was not
+                  successfully checked because the configured ruleset failed
+                  to load, so absence of a YARA detection is unknown. This is
+                  not a guarantee the file is clean. See coverage above for
+                  the exact analysis state.
+                </>
+              ) : verdict.yara_coverage.status === "empty" ? (
+                <>
+                  No matching hash evidence, path pattern, or contextual
+                  association was found in the available tiers. No YARA rules
+                  are configured, so this verdict contains no YARA detection
+                  coverage. This is not a guarantee the file is clean. See
+                  coverage above for the exact analysis state.
+                </>
+              ) : (
+                <>
+                  No matching hash evidence, YARA hit, path pattern, or
+                  contextual association in any tier checked. Not a guarantee
+                  the file is clean -- only that nothing in the current intel
+                  store or loaded local rules flagged it. See intel coverage
+                  above for how current that intel actually is.
+                </>
+              )}
             </div>
           ) : (
             <ul className="provenance-list">
