@@ -31,7 +31,7 @@ export function StatusBar({
       ? "unavailable"
       : yaraStatus.status === "empty"
         ? "0 rules configured"
-        : `${yaraStatus.rule_count} rule file(s)`;
+        : `${yaraStatus.rule_count} rule declaration(s)`;
 
   return (
     <div className="status-bar">
