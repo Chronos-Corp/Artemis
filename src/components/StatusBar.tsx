@@ -1,9 +1,10 @@
-import type { DbStatus, FeedSyncResult, IntelSourceFreshness, YaraStatus } from "../types";
+import type { YaraStatusWithCoverage } from "../analysisCoverage";
+import type { DbStatus, FeedSyncResult, IntelSourceFreshness } from "../types";
 import { formatDate } from "../format";
 
 interface Props {
   dbStatus: DbStatus | null;
-  yaraStatus: YaraStatus | null;
+  yaraStatus: YaraStatusWithCoverage | null;
   syncStates: IntelSourceFreshness[];
   syncing: boolean;
   lastSyncResults: FeedSyncResult[] | null;
@@ -18,14 +19,31 @@ export function StatusBar({
   lastSyncResults,
   onSync,
 }: Props) {
+  const yaraClass =
+    yaraStatus?.status === "failed"
+      ? "bad"
+      : yaraStatus?.status === "loaded"
+        ? "ok"
+        : "";
+  const yaraLabel = !yaraStatus
+    ? "loading"
+    : yaraStatus.status === "failed"
+      ? "unavailable"
+      : yaraStatus.status === "empty"
+        ? "0 rules configured"
+        : `${yaraStatus.rule_count} rule file(s)`;
+
   return (
     <div className="status-bar">
       <div className="status-items">
         <span className={`status-pill ${dbStatus?.connected ? "ok" : "bad"}`}>
           Intel store: {dbStatus?.connected ? "connected" : "not connected"}
         </span>
-        <span className="status-pill">
-          YARA: {yaraStatus ? `${yaraStatus.rule_count} rule file(s)` : "loading"}
+        <span
+          className={`status-pill ${yaraClass}`}
+          title={yaraStatus?.failure_reason ?? undefined}
+        >
+          YARA: {yaraLabel}
         </span>
         {syncStates.map((s) => (
           <span className="status-pill" key={s.source}>
