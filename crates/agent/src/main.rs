@@ -29,7 +29,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use nsic_core::hashing::{compute_hashes, hash_bytes};
+use nsic_core::hashing::{hash_bytes, read_regular_file_bounded, MAX_ANALYSIS_BYTES};
 use nsic_core::proto::{
     EnrollRequest, EnrollResponse, HeartbeatRequest, HeartbeatResponse, SampleRequestFailure,
     SampleRequestFulfilled, SampleRequestListResponse, ScanReport, ScanReportResponse,
@@ -37,7 +37,6 @@ use nsic_core::proto::{
 };
 use nsic_core::yara_scan::YaraEngine;
 use reqwest::Response;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -143,8 +142,9 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Hash { path } => {
-            let result =
-                compute_hashes(&path).with_context(|| format!("hashing {}", path.display()))?;
+            let snapshot = read_regular_file_bounded(&path, MAX_ANALYSIS_BYTES)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let result = hash_bytes(&snapshot.bytes);
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -164,19 +164,17 @@ async fn main() -> Result<()> {
         } => {
             let engine = YaraEngine::load(&rules_dir)
                 .with_context(|| format!("loading YARA rules from {}", rules_dir.display()))?;
-            // Read the file exactly once and hash and scan the identical
-            // bytes, rather than hashing and scanning via two separate
-            // opens of the same path: a file can change between two reads,
-            // and for a match this hashes and may persist durably as a
-            // sighting, binding the detection to whichever bytes were
-            // actually inspected is an evidence-integrity requirement, not
-            // just a nice-to-have.
-            let data =
-                std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            // One shared, same-handle-validated, bounded snapshot feeds
+            // both hashing and YARA. A hostile path cannot turn this into
+            // an unbounded allocation or a blocking FIFO/device open, and
+            // the reported hash always identifies the bytes actually
+            // inspected.
+            let snapshot = read_regular_file_bounded(&path, MAX_ANALYSIS_BYTES)
+                .with_context(|| format!("reading {}", path.display()))?;
             let matches = engine
-                .scan_bytes(&data)
+                .scan_bytes(&snapshot.bytes)
                 .with_context(|| format!("scanning {}", path.display()))?;
-            let hash = hash_bytes(&data);
+            let hash = hash_bytes(&snapshot.bytes);
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -466,44 +464,14 @@ async fn report_sightings(
     Ok(())
 }
 
-/// Reads `path` into memory, refusing to read more than `max_bytes` and
-/// refusing anything that isn't a regular file. The console enforces
-/// `MAX_SAMPLE_SIZE_BYTES` on the way in (`DefaultBodyLimit` plus an
-/// in-handler check), but that's too late to matter here: a multi-
-/// gigabyte file, or an endless special file (a device node, a FIFO, a
-/// symlink loop's eventual target) named by an operator's request path
-/// would otherwise get read via an unbounded `std::fs::read` before the
-/// agent ever makes the HTTP request the console could reject. Uses
-/// `std::fs::metadata` (follows symlinks) rather than `symlink_metadata`,
-/// so a path that's a symlink to an ordinary file is still accepted --
-/// only the final target's type has to be a regular file, not the path
-/// itself. Reads at most `max_bytes + 1` via `Read::take` so a file
-/// exactly at the limit is distinguishable from one a single byte over
-/// it, without ever buffering more than one byte past what's allowed.
-fn read_bounded_sample(path: &Path, max_bytes: usize) -> std::io::Result<Vec<u8>> {
-    let metadata = std::fs::metadata(path)?;
-    if !metadata.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{} is not a regular file", path.display()),
-        ));
-    }
-
-    let file = std::fs::File::open(path)?;
-    let mut limited = file.take(max_bytes as u64 + 1);
-    let mut buf = Vec::new();
-    limited.read_to_end(&mut buf)?;
-
-    if buf.len() > max_bytes {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "{} exceeds the {max_bytes}-byte sample size limit",
-                path.display()
-            ),
-        ));
-    }
-    Ok(buf)
+/// Reads an explicitly requested sample through the same hostile-filesystem
+/// boundary used for hashing and YARA, with the protocol's smaller sample
+/// limit. The shared primitive follows symlinks to ordinary files, validates
+/// the final opened handle, rejects special files, and never buffers more
+/// than one byte beyond the configured limit.
+fn read_bounded_sample(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
+    let max_bytes = u64::try_from(max_bytes).context("sample byte limit does not fit u64")?;
+    Ok(read_regular_file_bounded(path, max_bytes)?.bytes)
 }
 
 /// Fetches this host's pending sample requests and resolves each one:
@@ -640,9 +608,9 @@ mod tests {
     fn rejects_a_file_over_the_limit() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(&[0u8; 11]).unwrap();
-        let err =
+        let error =
             read_bounded_sample(tmp.path(), 10).expect_err("an over-limit file must be rejected");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("larger than the 10 byte limit"));
     }
 
     /// The actual motivating case: an unbounded read of a huge or
@@ -655,23 +623,22 @@ mod tests {
     fn does_not_buffer_more_than_one_byte_past_the_limit() {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(&[0u8; 4096]).unwrap();
-        let err = read_bounded_sample(tmp.path(), 1024)
+        let error = read_bounded_sample(tmp.path(), 1024)
             .expect_err("a file well over the limit must still be rejected");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("larger than the 1024 byte limit"));
     }
 
     #[test]
     fn rejects_a_directory() {
         let tmp_dir = tempfile::tempdir().unwrap();
-        let err = read_bounded_sample(tmp_dir.path(), 100)
+        let error = read_bounded_sample(tmp_dir.path(), 100)
             .expect_err("a directory is not a regular file");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("not a regular file"));
     }
 
-    /// `read_bounded_sample` deliberately uses `std::fs::metadata`
-    /// (follows symlinks), not `symlink_metadata` -- a path that's a
-    /// symlink to an ordinary file must still be accepted; only the
-    /// final target's type has to be a regular file.
+    /// The shared reader follows symlinks, then validates the final object
+    /// through metadata on the opened handle. A symlink to an ordinary file
+    /// remains valid without reintroducing a path-stat/open race.
     #[cfg(unix)]
     #[test]
     fn follows_a_symlink_to_an_ordinary_file() {

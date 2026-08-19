@@ -272,6 +272,12 @@ make different evidentiary claims. This is the contract Orion should consume:
 dedupe supporting assertions without erasing the path semantics that justify
 the pivot.
 
+## Findings from Artemis Engineering hardening
+
+| ID | Finding | Boundary | Status |
+| --- | --- | --- | --- |
+| AE-1 | Desktop analysis, agent hashing/scanning, and sample retrieval used different file-open and size controls; agent scan was unbounded, and sample retrieval validated a path before opening it separately | TB-1 / evidence integrity / availability | Fixed: `nsic_core::hashing::read_regular_file_bounded` performs nonblocking open on Unix, same-handle regular-file validation, pre-read size enforcement, and an independently capped read. Every current file-content inspection path consumes the same primitive. |
+
 ### Deferred, with reasons
 
 - **`IntelGate` holds its write guard across fetch/parse as well as the
@@ -279,11 +285,6 @@ the pivot.
   unbounded, but a slow feed still pauses all verdicts for up to that long.
   Splitting the remote work out of the critical section is the real fix.
   Deferred as a Phase-0 tradeoff, not forgotten.
-- **Phase 1 agent target-file reads do not yet share the desktop's complete
-  hostile-filesystem open/type/size controls.** Same-byte hash+YARA integrity
-  exists, but the stronger TB-1 primitive should move into shared code before
-  remote recursive hunting depends on the agent path. This is a separate
-  Phase 1 hardening item, not a RELATE-contract blocker.
 - **High-cardinality fallback bounds returned targets/evidence, but the SQL
   may still rank a large matching assertion set before applying those
   output budgets.** Current Rust memory and IPC payload are bounded. Revisit
