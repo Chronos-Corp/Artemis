@@ -46,10 +46,11 @@ fn resolve_indicator(ioc_type: &str, ioc: &str) -> Option<(IndicatorKind, String
         "md5_hash" => Some((IndicatorKind::Md5, ioc.to_lowercase())),
         "sha1_hash" => Some((IndicatorKind::Sha1, ioc.to_lowercase())),
         "domain" => Some((IndicatorKind::Domain, ioc.to_lowercase())),
-        "ip:port" => ioc
-            .split(':')
-            .next()
-            .map(|host| (IndicatorKind::Ip, host.to_string())),
+        // Artemis has no endpoint indicator kind yet. Dropping the port and
+        // storing this as a bare IP would broaden a precise source assertion
+        // into a claim ThreatFox did not make. Skip it until the model can
+        // preserve the endpoint exactly.
+        "ip:port" => None,
         _ => None,
     }
 }
@@ -87,9 +88,34 @@ pub async fn sync(pool: &PgPool, api_key: &str) -> Result<SyncSummary> {
             continue;
         };
 
+        let Some(first_seen) = parse_abusech_time(ioc.first_seen.as_deref()) else {
+            tracing::warn!(
+                source = SOURCE,
+                threatfox_id = %ioc.id,
+                first_seen = ?ioc.first_seen,
+                "skipping IOC with missing or invalid first_seen"
+            );
+            continue;
+        };
+        let last_seen = match ioc.last_seen.as_deref() {
+            Some(raw) => {
+                let Some(parsed) = parse_abusech_time(Some(raw)) else {
+                    tracing::warn!(
+                        source = SOURCE,
+                        threatfox_id = %ioc.id,
+                        last_seen = %raw,
+                        "skipping IOC with invalid last_seen"
+                    );
+                    continue;
+                };
+                parsed
+            }
+            // The feed does not claim a later observation. Represent the
+            // one known observation as a zero-width interval rather than
+            // replacing source time with local ingestion time.
+            None => first_seen,
+        };
         let raw: Json = serde_json::to_value(ioc.clone())?;
-        let first_seen = parse_abusech_time(ioc.first_seen.as_deref()).unwrap_or_else(Utc::now);
-        let last_seen = parse_abusech_time(ioc.last_seen.as_deref()).unwrap_or(first_seen);
 
         let title = ioc
             .malware_printable
@@ -176,4 +202,29 @@ pub async fn sync(pool: &PgPool, api_key: &str) -> Result<SyncSummary> {
         reports_added,
         synced_at: Utc::now(),
     })
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_indicator;
+    use crate::models::IndicatorKind;
+
+    #[test]
+    fn preserves_supported_indicator_semantics() {
+        assert_eq!(
+            resolve_indicator("sha256_hash", "ABCDEF"),
+            Some((IndicatorKind::Sha256, "abcdef".to_string()))
+        );
+        assert_eq!(
+            resolve_indicator("domain", "EXAMPLE.COM"),
+            Some((IndicatorKind::Domain, "example.com".to_string()))
+        );
+    }
+
+    #[test]
+    fn does_not_broaden_ip_port_to_bare_ip() {
+        assert_eq!(resolve_indicator("ip:port", "198.51.100.7:443"), None);
+        assert_eq!(resolve_indicator("ip:port", "[2001:db8::1]:443"), None);
+    }
 }
