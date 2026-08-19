@@ -35,7 +35,7 @@ pub struct BoundedYaraMatches {
 /// dimension, fingerprints the exact bytes handed to libyara, and disables
 /// YARA `include` handling on the compiler before any source is added. The
 /// latter is important: include resolution would otherwise let libyara
-/// perform an implicit second filesystem traversal outside Apollo's file,
+/// perform an implicit second filesystem traversal outside Artemis's file,
 /// byte, opened-handle, and fingerprint controls.
 pub struct YaraEngine {
     rules: Option<yara::Rules>,
@@ -97,7 +97,7 @@ impl YaraEngine {
         let mut compiler = yara::Compiler::new().context("initializing YARA compiler")?;
         // yara 0.29 exposes this exact control. It installs no include
         // callback on the underlying libyara compiler, so an `include`
-        // directive cannot cause a filesystem read behind Apollo's back.
+        // directive cannot cause a filesystem read behind Artemis's back.
         // This happens before the first add_rules_str and therefore protects
         // the exact source bytes actually compiled, with no check/use gap.
         compiler.disable_include_directive();
@@ -716,7 +716,7 @@ mod tests {
 
     #[test]
     fn missing_rules_dir_is_empty_not_error() {
-        let engine = YaraEngine::load(Path::new("/nonexistent/apollo-yara-test")).unwrap();
+        let engine = YaraEngine::load(Path::new("/nonexistent/artemis-yara-test")).unwrap();
         assert_eq!(engine.rule_count, 0);
     }
 }

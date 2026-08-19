@@ -1,4 +1,4 @@
-//! The File Intelligence Model (Apollo Constitution §5): answers "what is
+//! The File Intelligence Model (Artemis Product Constitution §6): answers "what is
 //! this file, and what is it for," independent of the threat-intel graph.
 //! `verdict::resolve` answers "is this file threat-relevant"; this module
 //! answers the FILE and UNDERSTAND stages of the interaction loop that
@@ -7,7 +7,7 @@
 //! the OS package manager, so it stays available even when the intel
 //! database is unreachable (see `commands::db_unavailable`).
 //!
-//! Purpose-source hierarchy (Apollo Constitution §5, HYPOTHESIS): prefer
+//! Purpose-source hierarchy (Artemis Product Constitution §6, HYPOTHESIS): prefer
 //! deterministic, curated sources before any model-only classification.
 //! This module only implements the deterministic tier -- OS package-manager
 //! catalogs -- and reports `Unknown` honestly when no such source applies,
@@ -92,7 +92,7 @@ pub struct ProductContext {
     /// package-level ("GNU core utilities"), not necessarily specific to
     /// this individual file's own role within the package -- `derive_purpose`
     /// words its summary to make that distinction explicit rather than
-    /// implying Apollo identified this exact file's function.
+    /// implying Artemis identified this exact file's function.
     pub description: Option<String>,
 }
 
@@ -139,7 +139,7 @@ pub struct FileExpectedness {
 pub struct LocalContext {
     /// Files in the same directory, this file excluded. Single directory
     /// level only -- a recursive scope-wide search is the Recursive Hunt
-    /// Engine's job (Apollo Constitution §7 / PR #20), not this module's.
+    /// Engine's job (Artemis Product Constitution §8 / PR #20), not this module's.
     pub sibling_count: usize,
     /// Other filenames in the same directory that are suspiciously close
     /// to this one (near-miss casing, digit-for-letter substitution,
@@ -304,7 +304,7 @@ async fn sniff_path(path: &Path) -> Result<String> {
 }
 
 /// Identifies a file's type from its leading bytes. Pure and dependency-free
-/// on purpose: this is Apollo's own deterministic first tier, not a wrapper
+/// on purpose: this is Artemis's own deterministic first tier, not a wrapper
 /// around a third-party magic-number database.
 pub(crate) fn sniff_file_type(bytes: &[u8]) -> String {
     if bytes.is_empty() {
@@ -560,7 +560,7 @@ fn classify_dpkg_search(
 /// literal query of `/usr/bin/*` returns dozens of unrelated real
 /// packages, not "not found." Without an exact-path check, a selected
 /// file whose name happens to contain one of those characters could match
-/// a *different* installed file's manifest entry, and Apollo would
+/// a *different* installed file's manifest entry, and Artemis would
 /// attribute that other file's package/version/description as this one's
 /// Product Context and Purpose -- a real misattribution, not just a
 /// missed match. `path` is the literal path that was queried; only a line
@@ -721,7 +721,7 @@ fn derive_purpose(product_context: &ProductContext) -> FilePurpose {
         // package normally does), not just product-context metadata --
         // but it describes the package as a whole, not necessarily this
         // specific file's individual role within it, so the summary says
-        // so explicitly rather than implying Apollo identified this exact
+        // so explicitly rather than implying Artemis identified this exact
         // file's function. A follow-up review caught the previous version
         // of this function synthesizing a purpose-shaped sentence purely
         // from the package *name*, with no actual description text behind
@@ -1280,7 +1280,7 @@ mod tests {
     fn purpose_is_unknown_when_package_found_but_no_description() {
         // The review's finding: package identity alone (name/version) is
         // product context, not purpose -- claiming `PackageCatalog` here
-        // without real description text would misrepresent what Apollo
+        // without real description text would misrepresent what Artemis
         // actually knows.
         let ctx = ProductContext {
             package: Some("some-pkg".to_string()),
@@ -1627,7 +1627,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_context_reports_unavailable_when_the_directory_cannot_be_listed() {
-        let unreachable = Path::new("/nonexistent-dir-xyz-apollo-test/somefile");
+        let unreachable = Path::new("/nonexistent-dir-xyz-artemis-test/somefile");
         let local = build_local_context(unreachable)
             .await
             .expect("build_local_context itself should not error");

@@ -45,7 +45,7 @@ const MAX_YARA_RULESET_BYTES: usize = 16 * 1024 * 1024;
 /// layer owns two additional trust-boundary contracts:
 ///
 /// 1. preflight must happen *before* libyara parses source, so YARA `include`
-///    cannot escape Apollo's file/byte/open-handle controls; and
+///    cannot escape Artemis's file/byte/open-handle controls; and
 /// 2. durable rule **behavior identity** must not be confused with a rule's
 ///    own source identity. YARA rules can depend on helper/private/global rules,
 ///    so an unchanged rule source block can behave differently when the
@@ -162,7 +162,7 @@ fn effective_rule_fingerprint(source_fingerprint: &str, ruleset_fingerprint: &st
     hex::encode(digest.finalize())
 }
 
-/// Preflights exactly the source tree Apollo is willing to hand to the inner
+/// Preflights exactly the source tree Artemis is willing to hand to the inner
 /// loader. This is intentionally safe on hostile filesystems: the pathname is
 /// opened nonblocking on Unix, the opened handle is then type-checked, and the
 /// read itself is capped so growth after metadata cannot exceed the budget.
@@ -212,7 +212,7 @@ fn validate_ruleset_source_boundary(rules_dir: &Path) -> Result<()> {
         })?;
         if contains_source_token(source, "include") {
             bail!(
-                "YARA include directives are not supported in {}; place included rules directly under the configured rules directory so Apollo can bound and fingerprint them",
+                "YARA include directives are not supported in {}; place included rules directly under the configured rules directory so Artemis can bound and fingerprint them",
                 entry.path().display()
             );
         }
@@ -373,14 +373,14 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp rules dir");
         std::fs::write(
             dir.path().join("include.yar"),
-            "include \"/outside/apollo/unbounded.yar\"\nrule Local { condition: true }\n",
+            "include \"/outside/artemis/unbounded.yar\"\nrule Local { condition: true }\n",
         )
         .expect("write include rule");
 
         let err = YaraEngine::load(dir.path()).expect_err("include must fail closed");
         assert!(
             err.to_string().contains("include directives are not supported"),
-            "expected Apollo include-boundary rejection, got: {err:#}"
+            "expected Artemis include-boundary rejection, got: {err:#}"
         );
     }
 
