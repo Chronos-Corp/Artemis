@@ -636,10 +636,9 @@ mod tests {
         assert!(error.to_string().contains("not a regular file"));
     }
 
-    /// `read_bounded_sample` deliberately uses `std::fs::metadata`
-    /// (follows symlinks), not `symlink_metadata` -- a path that's a
-    /// symlink to an ordinary file must still be accepted; only the
-    /// final target's type has to be a regular file.
+    /// The shared reader follows symlinks, then validates the final object
+    /// through metadata on the opened handle. A symlink to an ordinary file
+    /// remains valid without reintroducing a path-stat/open race.
     #[cfg(unix)]
     #[test]
     fn follows_a_symlink_to_an_ordinary_file() {
