@@ -204,7 +204,6 @@ pub async fn sync(pool: &PgPool, api_key: &str) -> Result<SyncSummary> {
     })
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::resolve_indicator;
