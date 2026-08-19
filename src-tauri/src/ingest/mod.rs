@@ -93,11 +93,14 @@ pub(crate) async fn decode_bounded_json<T: serde::de::DeserializeOwned>(
     serde_json::from_slice(&body).with_context(|| format!("parsing {what} response"))
 }
 
-/// abuse.ch feeds format timestamps as naive `YYYY-MM-DD HH:MM:SS` strings
-/// (implicitly UTC); shared by every feed module rather than duplicated.
+/// abuse.ch feeds currently return timestamps as `YYYY-MM-DD HH:MM:SS UTC`
+/// in some responses, while older responses omitted the explicit suffix.
+/// Accept both representations, but preserve missing or malformed source
+/// time as `None`: callers must never manufacture feed observation time.
 pub(crate) fn parse_abusech_time(s: Option<&str>) -> Option<DateTime<Utc>> {
-    let s = s?;
-    NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+    let raw = s?.trim();
+    let normalized = raw.strip_suffix(" UTC").unwrap_or(raw);
+    NaiveDateTime::parse_from_str(normalized, "%Y-%m-%d %H:%M:%S")
         .ok()
         .map(|naive| naive.and_utc())
 }
@@ -127,6 +130,40 @@ pub async fn run_all(pool: &PgPool, api_key: &str) -> Vec<(&'static str, Result<
         ),
         (threatfox::SOURCE, threatfox::sync(pool, api_key).await),
     ]
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::parse_abusech_time;
+
+    #[test]
+    fn parses_timestamp_with_explicit_utc_suffix() {
+        let parsed = parse_abusech_time(Some("2026-08-13 15:04:05 UTC"))
+            .expect("timestamp with UTC suffix should parse");
+        assert_eq!(parsed.to_rfc3339(), "2026-08-13T15:04:05+00:00");
+    }
+
+    #[test]
+    fn parses_legacy_timestamp_without_suffix() {
+        let parsed = parse_abusech_time(Some("2026-08-13 15:04:05"))
+            .expect("legacy timestamp should parse");
+        assert_eq!(parsed.to_rfc3339(), "2026-08-13T15:04:05+00:00");
+    }
+
+    #[test]
+    fn trims_surrounding_whitespace() {
+        let parsed = parse_abusech_time(Some(" 2026-08-13 15:04:05 UTC "))
+            .expect("surrounding whitespace should not change the source time");
+        assert_eq!(parsed.to_rfc3339(), "2026-08-13T15:04:05+00:00");
+    }
+
+    #[test]
+    fn rejects_missing_and_malformed_timestamps() {
+        assert!(parse_abusech_time(None).is_none());
+        assert!(parse_abusech_time(Some("not-a-timestamp")).is_none());
+        assert!(parse_abusech_time(Some("2026-08-13 15:04:05 EDT")).is_none());
+    }
 }
 
 #[cfg(test)]
