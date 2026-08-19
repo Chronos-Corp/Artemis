@@ -251,10 +251,13 @@ Rule source identity and effective behavior identity are different concepts:
 
 - `rule_source_fingerprint` identifies the exact parsed source for one rule and remains stable when that rule's own source is unchanged.
 - The current Phase-0 `rule_fingerprint` deliberately combines the rule source fingerprint with the whole compiled-ruleset fingerprint. A helper, private, global, or unrelated rule change therefore changes the effective identity today.
-- This whole-ruleset dependency is **DECIDED — accepted conservative over-invalidation for the current phase**. It can require revalidation of unchanged rules, but it fails closed rather than allowing version-scoped evidence to survive a possible semantic dependency change.
-- A later dependency-aware identity may narrow effective identity to the rule's transitive dependencies and relevant global, module, and engine context. That is a precision improvement, not current behavior.
+> **DECIDED CURRENT STATE — Conservative whole-ruleset effective identity.** The current Phase-0 `rule_fingerprint` intentionally over-invalidates: changing any compiled rule changes the effective identity of every rule in that ruleset. This can require revalidation of an unchanged rule, but it fails closed rather than allowing version-scoped evidence to survive a possible helper, private, global, module, engine, or other ruleset semantic change.
 
-An unrelated ruleset change must not rewrite the unchanged rule's source identity or historical assertion record. It may invalidate the current effective-version match until coverage is requalified.
+An unrelated ruleset change must not rewrite the unchanged rule's `rule_source_fingerprint` or historical assertion record. It does invalidate the current effective-version match until coverage is requalified.
+
+> **OPEN IMPROVEMENT — Dependency-aware effective identity.** A later design may narrow `rule_fingerprint` to the rule's transitive dependencies plus relevant global, module, engine, and compiler context. This is a target precision improvement, not current behavior and not authorization to weaken fail-closed version gating.
+>
+> **EVIDENCE REQUIRED —** A dependency model must prove that it captures helper/private references, global-rule gates, module and external-variable behavior, includes or equivalent source composition, compiler/libyara version effects, and ambiguous or unresolvable dependencies. Any unresolved dependency must retain conservative invalidation.
 
 ### Execution integrity
 
