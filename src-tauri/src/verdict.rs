@@ -2429,7 +2429,16 @@ mod tests {
         );
         assert!(rel_a.has_more_evidence);
         assert!(!find(&cve_b).unwrap().has_more_evidence);
-        assert!(!verdict.bounds.relationships_truncated);
+        assert!(
+            verdict.bounds.relationships_truncated,
+            "the exact-hash row cap omitted relationship source rows"
+        );
+        assert!(
+            verdict
+                .bounds
+                .truncated_entry_tiers
+                .contains(&VerdictTier::ExactHash)
+        );
         for path in &rel_a.evidence_paths {
             assert_eq!(path.len(), 2);
         }
