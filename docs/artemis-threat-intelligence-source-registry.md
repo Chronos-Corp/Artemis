@@ -247,7 +247,14 @@ Artemis must preserve:
 
 A relationship curated for one rule revision must not silently apply to a later revision that merely reuses the same rule name.
 
-Rule-file fingerprint and whole-ruleset fingerprint are different concepts. Editing an unrelated rule must not invalidate or rewrite the identity of an unchanged rule's curated coverage assertion.
+Rule source identity and effective behavior identity are different concepts:
+
+- `rule_source_fingerprint` identifies the exact parsed source for one rule and remains stable when that rule's own source is unchanged.
+- The current Phase-0 `rule_fingerprint` deliberately combines the rule source fingerprint with the whole compiled-ruleset fingerprint. A helper, private, global, or unrelated rule change therefore changes the effective identity today.
+- This whole-ruleset dependency is **DECIDED — accepted conservative over-invalidation for the current phase**. It can require revalidation of unchanged rules, but it fails closed rather than allowing version-scoped evidence to survive a possible semantic dependency change.
+- A later dependency-aware identity may narrow effective identity to the rule's transitive dependencies and relevant global, module, and engine context. That is a precision improvement, not current behavior.
+
+An unrelated ruleset change must not rewrite the unchanged rule's source identity or historical assertion record. It may invalidate the current effective-version match until coverage is requalified.
 
 ### Execution integrity
 
@@ -273,7 +280,7 @@ Every trusted rule or Hunt Pack ruleset must include, as applicable:
 - bounded execution validation;
 - expected false-positive analysis;
 - supported file types and size limits;
-- rule-version and fingerprint tests;
+- rule-version and fingerprint tests, including unchanged source identity with changed effective ruleset identity;
 - license and redistribution review;
 - human approval after assessment.
 
