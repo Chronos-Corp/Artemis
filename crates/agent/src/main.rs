@@ -477,7 +477,11 @@ async fn report_sightings(
 /// only the final target's type has to be a regular file, not the path
 /// itself. Reads at most `max_bytes + 1` via `Read::take` so a file
 /// exactly at the limit is distinguishable from one a single byte over
-/// it, without ever buffering more than one byte past what's allowed.
+/// Reads an explicitly requested sample through the same hostile-filesystem
+/// boundary used for hashing and YARA, with the protocol's smaller sample
+/// limit. The shared primitive follows symlinks to ordinary files, validates
+/// the final opened handle, rejects special files, and never buffers more
+/// than one byte beyond the configured limit.
 fn read_bounded_sample(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
     let max_bytes = u64::try_from(max_bytes).context("sample byte limit does not fit u64")?;
     Ok(read_regular_file_bounded(path, max_bytes)?.bytes)
