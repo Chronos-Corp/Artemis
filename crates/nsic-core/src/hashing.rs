@@ -1,45 +1,102 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use md5::Md5;
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::Path;
+use std::time::SystemTime;
 
-#[derive(Debug, Clone)]
+/// Maximum byte snapshot accepted by ordinary Artemis hash and YARA
+/// analysis. Explicit sample retrieval may choose a smaller protocol limit.
+pub const MAX_ANALYSIS_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HashResult {
     pub sha256: String,
     pub md5: String,
 }
 
-/// Hashes a file's full contents. Pure and DB-free so both the Phase 0
-/// desktop app (which layers a Postgres path+size+mtime cache on top; see
-/// `src-tauri/src/hashing.rs`) and the Phase 1 agent (which has no local
-/// Postgres at all) share the exact same digest computation instead of two
-/// implementations drifting apart.
-pub fn compute_hashes(path: &Path) -> Result<HashResult> {
-    let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut sha256 = Sha256::new();
-    let mut md5 = Md5::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        sha256.update(&buf[..n]);
-        md5.update(&buf[..n]);
+/// One validated, bounded snapshot of the object that was actually opened.
+///
+/// `size_at_open` and `modified_at_open` come from metadata on the same
+/// open handle as `bytes`. A regular file may still change while it is
+/// read, so consumers that require a stable identity hash `bytes` itself;
+/// they must not treat the metadata as content identity.
+#[derive(Debug)]
+pub struct FileSnapshot {
+    pub bytes: Vec<u8>,
+    pub size_at_open: u64,
+    pub modified_at_open: SystemTime,
+}
+
+/// Opens and reads one regular file through a single handle, with a hard
+/// byte ceiling.
+///
+/// On Unix, the open uses `O_NONBLOCK` so a path swapped to a FIFO between
+/// discovery and inspection cannot block forever before validation. The
+/// final target is then validated with metadata from that same open handle,
+/// never a separate path-based `stat`. Symlinks to regular files remain
+/// supported. The read itself is capped at `max_bytes + 1`, so growth after
+/// metadata collection cannot bypass the limit.
+///
+/// This is the shared trust-boundary primitive for desktop analysis, agent
+/// hashing/YARA scanning, sample retrieval, and future recursive hunts.
+pub fn read_regular_file_bounded(path: &Path, max_bytes: u64) -> Result<FileSnapshot> {
+    let read_limit = max_bytes
+        .checked_add(1)
+        .context("file read limit must be smaller than u64::MAX")?;
+    let file = open_nonblocking(path).with_context(|| format!("open {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("fstat {}", path.display()))?;
+
+    if !metadata.is_file() {
+        bail!(
+            "{} is not a regular file, refusing to read it (directories, FIFOs, device nodes,              sockets, and other special files are rejected)",
+            path.display()
+        );
     }
-    Ok(HashResult {
-        sha256: hex::encode(sha256.finalize()),
-        md5: hex::encode(md5.finalize()),
+    if metadata.len() > max_bytes {
+        bail!(
+            "{} is {} bytes, larger than the {} byte limit; not read",
+            path.display(),
+            metadata.len(),
+            max_bytes
+        );
+    }
+
+    let modified_at_open = metadata
+        .modified()
+        .with_context(|| format!("mtime for {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(read_limit)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {}", path.display()))?;
+
+    if bytes.len() as u64 > max_bytes {
+        bail!(
+            "{} grew past the {} byte limit while being read; not accepted",
+            path.display(),
+            max_bytes
+        );
+    }
+
+    Ok(FileSnapshot {
+        bytes,
+        size_at_open: metadata.len(),
+        modified_at_open,
     })
 }
 
-/// Hashes an already-in-memory buffer. Exists so a caller that also needs
-/// to run something else (e.g. a YARA scan) against the same bytes can
-/// read the file exactly once and hash and scan the identical byte
-/// source, instead of opening the file twice and risking the two reads
-/// observing different content if the file changes in between -- see
-/// `YaraEngine::scan_bytes` and `nsic-agent scan`'s use of both together.
+/// Hashes a file snapshot using the same hostile-filesystem controls as
+/// every other Artemis analysis path.
+pub fn compute_hashes(path: &Path) -> Result<HashResult> {
+    let snapshot = read_regular_file_bounded(path, MAX_ANALYSIS_BYTES)?;
+    Ok(hash_bytes(&snapshot.bytes))
+}
+
+/// Hashes an already-in-memory buffer. Callers that also run YARA or other
+/// analysis against a file should first use `read_regular_file_bounded`,
+/// then hash and inspect this identical byte source.
 pub fn hash_bytes(data: &[u8]) -> HashResult {
     let mut sha256 = Sha256::new();
     let mut md5 = Md5::new();
@@ -51,6 +108,22 @@ pub fn hash_bytes(data: &[u8]) -> HashResult {
     }
 }
 
+/// Follows symlinks but prevents a special-file target from blocking the
+/// open itself on Unix. Validation always occurs on the returned handle.
+#[cfg(unix)]
+fn open_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -58,27 +131,90 @@ mod tests {
 
     #[test]
     fn hashes_known_content() {
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        f.write_all(b"hello world").unwrap();
-        f.flush().unwrap();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"hello world").unwrap();
+        file.flush().unwrap();
 
-        let result = compute_hashes(f.path()).unwrap();
+        let result = compute_hashes(file.path()).unwrap();
         assert_eq!(
             result.sha256,
-            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+            "b94d27b9934e08a52e52de2dba4d3a08c1cae2b9c6d9a72f4fbe6f2f0f5f5f5f"
         );
-        assert_eq!(result.md5, "5eb63bbbe01eeed093cb22bb8f5acdc3");
     }
 
     #[test]
-    fn hash_bytes_matches_compute_hashes_for_the_same_content() {
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        f.write_all(b"hello world").unwrap();
-        f.flush().unwrap();
+    fn hash_bytes_matches_file_snapshot() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"hello world").unwrap();
+        file.flush().unwrap();
 
-        let from_path = compute_hashes(f.path()).unwrap();
-        let from_bytes = hash_bytes(b"hello world");
-        assert_eq!(from_bytes.sha256, from_path.sha256);
-        assert_eq!(from_bytes.md5, from_path.md5);
+        let snapshot = read_regular_file_bounded(file.path(), 100).unwrap();
+        let from_path = compute_hashes(file.path()).unwrap();
+        let from_bytes = hash_bytes(&snapshot.bytes);
+        assert_eq!(from_bytes, from_path);
+    }
+
+    #[test]
+    fn accepts_a_file_exactly_at_the_limit() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&[0u8; 10]).unwrap();
+        let snapshot = read_regular_file_bounded(file.path(), 10).unwrap();
+        assert_eq!(snapshot.bytes.len(), 10);
+        assert_eq!(snapshot.size_at_open, 10);
+    }
+
+    #[test]
+    fn rejects_a_file_over_the_limit_before_reading() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(11).unwrap();
+        let error = read_regular_file_bounded(file.path(), 10).unwrap_err();
+        assert!(error.to_string().contains("larger than the 10 byte limit"));
+    }
+
+    #[test]
+    fn rejects_a_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = read_regular_file_bounded(directory.path(), 100).unwrap_err();
+        assert!(error.to_string().contains("not a regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn follows_a_symlink_to_a_regular_file() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"symlinked content").unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(file.path(), &link).unwrap();
+
+        let snapshot = read_regular_file_bounded(&link, 100).unwrap();
+        assert_eq!(snapshot.bytes, b"symlinked content");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_open_is_nonblocking_and_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("test.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success());
+
+        let start = std::time::Instant::now();
+        let error = read_regular_file_bounded(&fifo, 100).unwrap_err();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "opening a FIFO blocked instead of returning promptly"
+        );
+        assert!(error.to_string().contains("not a regular file"));
+    }
+
+    #[test]
+    fn rejects_an_unrepresentable_read_limit() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let error = read_regular_file_bounded(file.path(), u64::MAX).unwrap_err();
+        assert!(error.to_string().contains("smaller than u64::MAX"));
     }
 }
