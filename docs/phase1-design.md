@@ -313,13 +313,14 @@ endpoints use the exact same check rather than two copies drifting.
   observe different content if the file changes in between, which for a
   match this may persist durably and attribute to a specific host is an
   evidence-integrity defect, not just a race. `nsic-agent scan` now reads
-  the file into memory exactly once (`std::fs::read`) and both hashes
+  the file into memory exactly once through
+  `nsic_core::hashing::read_regular_file_bounded`, then both hashes
   (`nsic_core::hashing::hash_bytes`) and scans
   (`YaraEngine::scan_bytes`, using the `yara` crate's `scan_mem` instead
-  of `scan_file`) that same buffer, so the reported hash is provably the
-  hash of whatever YARA actually inspected. `scan`/`scan_file`
-  (path-based) stay as they were for `src-tauri`'s own callers, which
-  don't (yet) share this problem in the same way; see below.
+  of `scan_file`) that same buffer. The reported hash is therefore the
+  hash of whatever YARA actually inspected, while the shared reader also
+  rejects special files and oversized or growing targets before they can
+  become an availability failure.
 - **Input validation at the trust boundary.** Authentication proves which
   agent sent a request, not that the agent is bug-free or uncompromised.
   `report_sighting` now rejects (`400`) a `sha256` or
@@ -703,23 +704,13 @@ the audit trail locked architecture decision #3 requires, that's a real
 tension, but there's no host deletion/decommissioning workflow yet for
 it to bite in practice. See below.
 
-**Also not fixed here, also logged as deferred: a smaller TOCTOU in
-`read_bounded_sample` itself.** It checks `std::fs::metadata(path)
-.is_file()`, then separately calls `std::fs::File::open(path)` -- a
-local process could in theory swap what that path resolves to (a FIFO,
-a device node, a different symlink target) in the gap between those two
-calls. `Read::take(max_bytes + 1)` still bounds memory use regardless,
-so the actual problem this PR set out to fix (unbounded reads) stays
-fixed either way; the residual risk is narrower -- mainly that a swap to
-something blocking (a FIFO with no writer) could hang the one-shot
-agent process while opening or reading it, not a memory-safety issue.
-Worth tightening once the agent is more than a one-shot CLI: handle-
-based identity/type validation (open first, then check the open file
-descriptor's metadata, rather than checking a path and trusting a
-second open of "the same" path) rather than a path check followed by a
-separate open, and on Unix, nonblocking open flags are worth
-considering against hostile special files. Not worth the added
-complexity for Phase 1's one-shot invocation model yet.
+**Later Artemis Engineering hardening closed the residual read
+TOCTOU.** Sample retrieval now uses
+`nsic_core::hashing::read_regular_file_bounded`: on Unix it opens with
+`O_NONBLOCK`, validates the final object through metadata on that same
+handle, and performs an independently capped read. Desktop analysis,
+agent hashing, and agent YARA scanning use the same primitive, so their
+trust-boundary behavior cannot drift independently.
 
 ### PR #10: reading sample content back out
 
@@ -1550,14 +1541,6 @@ documented as a source of test flakiness since PR #14.
   they enter the manifest would make ruleset identity comparable across
   a mixed-OS fleet; not done yet since Phase 1 has no Windows agent to
   observe the mismatch against.
-- **`scan` buffers the whole target file into memory.** Reading the file
-  once and hashing/scanning those same bytes is the right evidence-
-  integrity call for a one-shot, one-file Phase 1 CLI invocation, but a
-  persistent scanner (Phase 2+) that watches many files should not
-  blindly buffer arbitrarily large ones. That needs either a file-size
-  policy (skip or chunk-hash above a threshold) or a stable-handle
-  strategy (e.g. hold an open handle and read from it for both hashing
-  and scanning) instead of `std::fs::read`'s single full-file buffer.
 - **TLS is opt-in and mutually exclusive with plain HTTP, not dual-mode.**
   PR #11 added HTTPS support, but a single console process serves either
   plain HTTP or HTTPS on one port, never both at once -- there's no
