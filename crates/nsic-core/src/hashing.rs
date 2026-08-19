@@ -138,7 +138,7 @@ mod tests {
         let result = compute_hashes(file.path()).unwrap();
         assert_eq!(
             result.sha256,
-            "b94d27b9934e08a52e52de2dba4d3a08c1cae2b9c6d9a72f4fbe6f2f0f5f5f5f"
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde95f"
         );
     }
 
