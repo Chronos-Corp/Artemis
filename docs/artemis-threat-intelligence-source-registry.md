@@ -251,6 +251,7 @@ Rule source identity and effective behavior identity are different concepts:
 
 - `rule_source_fingerprint` identifies the exact parsed source for one rule and remains stable when that rule's own source is unchanged.
 - The current Phase-0 `rule_fingerprint` deliberately combines the rule source fingerprint with the whole compiled-ruleset fingerprint. A helper, private, global, or unrelated rule change therefore changes the effective identity today.
+
 > **DECIDED CURRENT STATE — Conservative whole-ruleset effective identity.** The current Phase-0 `rule_fingerprint` intentionally over-invalidates: changing any compiled rule changes the effective identity of every rule in that ruleset. This can require revalidation of an unchanged rule, but it fails closed rather than allowing version-scoped evidence to survive a possible helper, private, global, module, engine, or other ruleset semantic change.
 
 An unrelated ruleset change must not rewrite the unchanged rule's `rule_source_fingerprint` or historical assertion record. It does invalidate the current effective-version match until coverage is requalified.
