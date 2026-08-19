@@ -272,6 +272,7 @@ export interface TracePathRank {
 }
 
 export interface TracePath {
+  id: string;
   relationship_index: number;
   target_kind: RelationshipKind;
   target: string;
@@ -310,6 +311,81 @@ export interface OrionTrace {
   paths: TracePath[];
   untraced_relationships: UntracedRelationship[];
   bounds: TraceBounds;
+}
+
+// ---------------------------------------------------------------------
+// Artemis HUNT -- one authoritative Orion path applied to an explicit,
+// bounded execution scope. The UI submits only selectors; Rust reconstructs
+// the target and proof before scanning.
+// ---------------------------------------------------------------------
+
+export type HuntScopeKind = "subtree";
+
+export interface HuntScope {
+  kind: HuntScopeKind;
+  root: string;
+}
+
+export interface HuntRequest {
+  seed_path: string;
+  expected_seed_sha256: string;
+  trace_path_id: string;
+  scope: HuntScope;
+}
+
+export interface HuntHypothesis {
+  seed_artifact: TraceNode;
+  selected_path: TracePath;
+}
+
+export type HuntEvidenceRole = "confirming" | "contradicting" | "contextual";
+
+export interface HuntFinding {
+  artifact_path: string;
+  sha256: string;
+  md5: string;
+  role: HuntEvidenceRole;
+  strength: RelationshipStrength;
+  supporting_path: TracePath;
+  additional_matching_paths: number;
+}
+
+export interface HuntScanError {
+  path: string;
+  error: string;
+}
+
+export interface HuntSummary {
+  files_discovered: number;
+  files_analyzed: number;
+  files_inconclusive: number;
+  confirming_findings: number;
+  contradicting_findings: number;
+  contextual_findings: number;
+}
+
+export interface HuntBounds {
+  max_files: number;
+  max_findings: number;
+  max_errors: number;
+  max_walk_entries: number;
+  scope_truncated: boolean;
+  findings_truncated: boolean;
+  omitted_findings: number;
+  errors_truncated: boolean;
+  omitted_errors: number;
+}
+
+export interface HuntResult {
+  hypothesis: HuntHypothesis;
+  scope: HuntScope;
+  findings: HuntFinding[];
+  scan_errors: HuntScanError[];
+  summary: HuntSummary;
+  bounds: HuntBounds;
+  limitations: string[];
+  started_at: string;
+  completed_at: string;
 }
 
 export interface SyncSummary {

@@ -98,12 +98,62 @@ pub async fn resolve(
     // consistent corpus.
     let _intel_read_guard = intel_gate.read().await;
 
+    resolve_in_intel_snapshot(pool, bloom, yara, recent_yara_hits, path).await
+}
+
+/// Resolves one file while the caller already holds `IntelGate`'s read side.
+/// Kept visible only to the parent relationship-contract module so a bounded
+/// multi-file hunt can use one coherent intel snapshot without attempting a
+/// nested read acquisition (which can deadlock behind a queued writer on a
+/// fair `RwLock`). All external consumers still go through the normalized
+/// relationship contract.
+pub(super) async fn resolve_in_intel_snapshot(
+    pool: &PgPool,
+    bloom: &BloomState,
+    yara: &Arc<YaraEngine>,
+    recent_yara_hits: &RecentYaraHits,
+    path: &Path,
+) -> Result<Verdict> {
+    resolve_in_intel_snapshot_inner(pool, bloom, yara, recent_yara_hits, path, None).await
+}
+
+/// Hash-pinned variant for HUNT's selected seed. The expected digest is
+/// checked immediately after the resolver's single file read, before YARA
+/// scanning or evidence persistence can observe a stale/replaced seed.
+pub(super) async fn resolve_in_intel_snapshot_with_expected_sha256(
+    pool: &PgPool,
+    bloom: &BloomState,
+    yara: &Arc<YaraEngine>,
+    recent_yara_hits: &RecentYaraHits,
+    path: &Path,
+    expected_sha256: &str,
+) -> Result<Verdict> {
+    resolve_in_intel_snapshot_inner(
+        pool,
+        bloom,
+        yara,
+        recent_yara_hits,
+        path,
+        Some(expected_sha256),
+    )
+    .await
+}
+
+async fn resolve_in_intel_snapshot_inner(
+    pool: &PgPool,
+    bloom: &BloomState,
+    yara: &Arc<YaraEngine>,
+    recent_yara_hits: &RecentYaraHits,
+    path: &Path,
+    expected_sha256: Option<&str>,
+) -> Result<Verdict> {
     // Read the file's bytes exactly once and hash + YARA-scan the identical
     // buffer -- see `hashing::hash_and_read_file`'s doc comment for why:
     // two separate reads (one to hash, one to scan) can observe different
     // content if the file changes in between, silently binding a YARA hit's
     // persisted edge to the wrong hash.
     let (hash, file_data) = hashing::hash_and_read_file(pool, path).await?;
+    require_expected_sha256(&hash.sha256, expected_sha256)?;
     let mut entries = Vec::new();
     // Accumulates which parts of this verdict a cap made partial. Folded in
     // at each capped lookup rather than inferred at the end: "we returned
@@ -438,12 +488,31 @@ async fn record_yara_hit(
     Ok(())
 }
 
+fn require_expected_sha256(actual: &str, expected: Option<&str>) -> Result<()> {
+    if let Some(expected) = expected {
+        if actual != expected {
+            anyhow::bail!(
+                "hunt seed changed since TRACE: expected SHA-256 {expected}, observed {actual}; select the file again"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bloom::BloomState;
     use crate::yara_scan::YaraEngine;
     use std::io::Write;
+
+    #[test]
+    fn hash_pin_rejects_changed_seed_before_resolution_continues() {
+        let error = require_expected_sha256("observed", Some("expected")).unwrap_err();
+        assert!(error.to_string().contains("hunt seed changed since TRACE"));
+        assert!(require_expected_sha256("same", Some("same")).is_ok());
+        assert!(require_expected_sha256("anything", None).is_ok());
+    }
 
     /// Guards every test that mutates `feed_sync_state` rows for real
     /// configured sources (`malwarebazaar`, `threatfox`). Rust runs `#[test]`

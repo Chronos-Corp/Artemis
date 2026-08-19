@@ -1,4 +1,10 @@
-import type { OrionTrace, RelationshipStrength, ThreatRelationship } from "../types";
+import type {
+  HuntResult,
+  OrionTrace,
+  RelationshipStrength,
+  ThreatRelationship,
+  TracePath,
+} from "../types";
 import {
   EVIDENCE_RELATION_LABELS,
   RELATIONSHIP_KIND_LABELS,
@@ -16,6 +22,12 @@ interface Props {
   // an analyst comparing against it needs to know when it is a subset.
   relationshipsTruncated?: boolean;
   orionTrace?: OrionTrace;
+  huntResult?: HuntResult | null;
+  huntingPathId?: string | null;
+  huntSubjectPathId?: string | null;
+  huntError?: string | null;
+  huntScopeRoot?: string | null;
+  onRunHunt?: (path: TracePath) => void;
 }
 
 function strengthClass(strength: RelationshipStrength): string {
@@ -33,6 +45,12 @@ export function ThreatRelationshipList({
   relationships,
   relationshipsTruncated = false,
   orionTrace,
+  huntResult,
+  huntingPathId,
+  huntSubjectPathId,
+  huntError,
+  huntScopeRoot,
+  onRunHunt,
 }: Props) {
   // Still render when the list is empty but truncation fired -- "nothing to
   // show" and "we stopped looking" must not collapse into the same silence.
@@ -80,7 +98,16 @@ export function ThreatRelationshipList({
                 </div>
                 <div className="relationship-explanation">{r.explanation}</div>
                 {orionTrace && (
-                  <OrionTraceView relationshipIndex={index} trace={orionTrace} />
+                  <OrionTraceView
+                    relationshipIndex={index}
+                    trace={orionTrace}
+                    huntResult={huntResult}
+                    huntingPathId={huntingPathId}
+                    huntSubjectPathId={huntSubjectPathId}
+                    huntError={huntError}
+                    huntScopeRoot={huntScopeRoot}
+                    onRunHunt={onRunHunt}
+                  />
                 )}
                 {/* One block per evidence path -- most relationships have
                     exactly one, but a Cve relationship can have more than

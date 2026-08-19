@@ -1,5 +1,11 @@
 import type { VerdictWithCoverage } from "../analysisCoverage";
-import type { FileEntry, FileIntelligence, IntelSourceFreshness } from "../types";
+import type {
+  FileEntry,
+  FileIntelligence,
+  HuntResult,
+  IntelSourceFreshness,
+  TracePath,
+} from "../types";
 import { TIER_LABELS } from "../types";
 import { formatDate, formatRelativeTime } from "../format";
 import { safeExternalUrl } from "../lib/safeUrl";
@@ -14,6 +20,12 @@ interface Props {
   fileIntel: FileIntelligence | null;
   fileIntelLoading: boolean;
   fileIntelError: string | null;
+  huntResult: HuntResult | null;
+  huntingPathId: string | null;
+  huntSubjectPathId: string | null;
+  huntError: string | null;
+  huntScopeRoot: string | null;
+  onRunHunt: (path: TracePath) => void;
 }
 
 const INTEL_STALENESS_HOURS = 24;
@@ -96,6 +108,12 @@ export function VerdictPanel({
   fileIntel,
   fileIntelLoading,
   fileIntelError,
+  huntResult,
+  huntingPathId,
+  huntSubjectPathId,
+  huntError,
+  huntScopeRoot,
+  onRunHunt,
 }: Props) {
   if (!file) {
     return (
@@ -135,6 +153,12 @@ export function VerdictPanel({
             relationships={verdict.threat_relationships}
             relationshipsTruncated={verdict.bounds.relationships_truncated}
             orionTrace={verdict.orion_trace}
+            huntResult={huntResult}
+            huntingPathId={huntingPathId}
+            huntSubjectPathId={huntSubjectPathId}
+            huntError={huntError}
+            huntScopeRoot={huntScopeRoot}
+            onRunHunt={onRunHunt}
           />
 
           {verdict.bounds.truncated_entry_tiers.length > 0 && (

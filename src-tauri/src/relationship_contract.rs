@@ -77,6 +77,55 @@ pub async fn resolve(
     Ok(finalize_resolved(verdict, yara_coverage))
 }
 
+/// Resolves one file against a caller-owned coherent intel snapshot.
+/// `hunt::run` is the only intended caller: it holds `IntelGate::read()` for
+/// the entire bounded subtree execution, then uses this entry point for the
+/// seed and every candidate. Keeping finalization here preserves the rule
+/// that Orion/HUNT can consume only normalized RELATE plus analysis coverage.
+pub(crate) async fn resolve_in_intel_snapshot(
+    pool: &PgPool,
+    bloom: &BloomState,
+    yara: &Arc<YaraEngine>,
+    yara_coverage: &YaraCoverage,
+    observation_scope: &RecentYaraHits,
+    path: &Path,
+) -> Result<ResolvedVerdict> {
+    let verdict = raw_verdict::resolve_in_intel_snapshot(
+        pool,
+        bloom,
+        yara,
+        observation_scope,
+        path,
+    )
+    .await?;
+    Ok(finalize_resolved(verdict, yara_coverage))
+}
+
+/// Hash-pinned snapshot resolution for the analyst-selected HUNT seed. The
+/// raw resolver enforces the pin immediately after its atomic file read and
+/// before YARA observation persistence, then this boundary still performs
+/// the mandatory RELATE normalization and Orion projection.
+pub(crate) async fn resolve_in_intel_snapshot_with_expected_sha256(
+    pool: &PgPool,
+    bloom: &BloomState,
+    yara: &Arc<YaraEngine>,
+    yara_coverage: &YaraCoverage,
+    observation_scope: &RecentYaraHits,
+    path: &Path,
+    expected_sha256: &str,
+) -> Result<ResolvedVerdict> {
+    let verdict = raw_verdict::resolve_in_intel_snapshot_with_expected_sha256(
+        pool,
+        bloom,
+        yara,
+        observation_scope,
+        path,
+        expected_sha256,
+    )
+    .await?;
+    Ok(finalize_resolved(verdict, yara_coverage))
+}
+
 fn finalize_resolved(verdict: Verdict, yara_coverage: &YaraCoverage) -> ResolvedVerdict {
     let verdict = finalize_verdict(verdict);
     let orion_trace = nsic_core::orion::trace_verdict(&verdict);

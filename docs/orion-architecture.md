@@ -44,6 +44,13 @@ RELATE and Orion.
 - Orion has an independent resource budget and reports when it truncates.
 - A dedicated graph database is not required for First Useful Trace. The
   initial engine projects the existing evidence graph contract in memory.
+- The first executable HUNT pivot accepts only a hash-pinned seed, one opaque
+  server-generated trace-path identity, and an explicit local subtree.
+- HUNT reconstructs RELATE and TRACE on the Rust side under one intelligence
+  snapshot. The IPC caller cannot supply a target, proof chain, direction, or
+  evidence role.
+- Observed matching paths are confirming evidence. Possible matching paths are
+  contextual evidence. Absence of a match is inconclusive, never contradiction.
 
 ### HYPOTHESIS
 
@@ -55,7 +62,8 @@ RELATE and Orion.
 
 ### OPEN
 
-- The first executable pivot and its exact Hunt Pack request contract.
+- The first reusable Hunt Pack beyond the current exact-path/local-subtree
+  request, including authorization and transport for remote execution.
 - Whether Orion eventually persists a derived traversal graph or continues to
   query the shared Chronos Evidence Graph directly.
 - Path ranking beyond the first transparent rank vector, including temporal
@@ -70,7 +78,7 @@ RELATE and Orion.
 - Performance and memory measurements across realistic relationship and proof
   cardinalities before adopting graph-specific infrastructure.
 - Real Hunt Pack execution showing that the current node and edge contract can
-  express both confirming and falsifying evidence.
+  express typed falsifying evidence without treating absence as contradiction.
 
 ## 3. Responsibility boundary
 
@@ -173,7 +181,45 @@ independently from RELATE's omitted concepts or evidence.
 - Partial upstream evidence remains partial downstream.
 - No path is a compromise verdict by itself.
 
-## 9. Implementation boundary
+## 9. First executable pivot
+
+An analyst can apply one visible Orion path to the current filesystem subtree.
+The request is intentionally selector-only:
+
+- the selected file path;
+- the SHA-256 observed when TRACE was rendered;
+- the opaque identity of the exact selected `TracePath`;
+- a declared subtree root.
+
+The Rust backend canonicalizes and bounds the scope, re-resolves the seed,
+checks that its content hash is unchanged, and requires the path identity to
+select exactly one freshly reconstructed path. A missing or duplicate selector
+fails closed. The backend then applies the selected typed target to candidate
+artifacts through the existing authoritative resolver; the frontend never
+defines graph semantics.
+
+One intelligence read guard spans seed reconstruction and every candidate, so
+a feed sync cannot split a hunt across different evidence corpora. Filesystem
+execution remains explicitly live rather than pretending to be an immutable
+snapshot: symbolic links are not followed, candidates are canonicalized and
+revalidated, and anything that changes or cannot be read is inconclusive.
+
+Initial bounds are 1,000 candidate files, 20,000 walked entries, 100 returned
+findings, and 100 returned errors. Every fired bound and omitted count is
+returned. File contents remain on the host; only hashes, paths, typed proof,
+counts, errors, and timing cross the desktop IPC boundary.
+
+The result groups evidence by role:
+
+- an `observed` matching path is confirming;
+- a `possible` matching path is contextual;
+- contradiction remains representable but is not emitted until Orion has a
+  typed falsification primitive.
+
+The exact contract and threat analysis live in
+`docs/orion-hunt-contract.md`.
+
+## 10. Implementation boundary
 
 The reusable engine lives in `crates/nsic-core/src/orion.rs`. The authoritative
 desktop resolver adds the resulting `OrionTrace` beside its normalized verdict
@@ -181,19 +227,20 @@ and YARA coverage. The React interface reveals the already-built path for the
 exact relationship selected by the analyst.
 
 No migration, new database, external graph service, AI inference, Hunt Pack
-language, or execution backend is introduced by this slice.
+language, remote execution backend, or fleet scope is introduced by this slice.
 
-## 10. Next architecture gate
+## 11. Next architecture gate
 
-The next gate is the first executable relationship pivot:
+The next gate is the first reusable Hunt Pack:
 
-1. select one Orion path;
-2. turn its target and supporting proof into a structured hunt hypothesis;
-3. bind that hypothesis to an explicit filesystem scope;
-4. execute established detection primitives;
-5. return confirming, contradicting, and contextual evidence through the same
-   evidence doctrine.
+1. preserve the current exact path and evidence doctrine;
+2. define an authorized, serializable execution plan for another host or data
+   source;
+3. add a typed falsification mechanism before emitting contradiction;
+4. retain scope, resource bounds, provenance, and execution auditability;
+5. measure usefulness and cost before selecting graph persistence or fleet
+   infrastructure.
 
-That is HUNT. First Useful Trace establishes the directed contract it will
-consume without prematurely deciding fleet scale, graph persistence, or the
-commercial deployment model.
+The local executable pivot proves that TRACE can safely drive HUNT without
+prematurely deciding fleet scale, graph persistence, or the commercial
+deployment model.

@@ -62,6 +62,27 @@ pub async fn get_file_intelligence(
         .map_err(|e| e.to_string())
 }
 
+/// Applies one exact, server-reconstructed Orion path to an explicit local
+/// subtree. The nested request is only a selector and scope declaration;
+/// targets, proof, direction, and evidence roles are all rebuilt in Rust.
+#[tauri::command]
+pub async fn run_hunt(
+    state: State<'_, AppState>,
+    request: nsic_core::hunt::HuntRequest,
+) -> Result<nsic_core::hunt::HuntResult, String> {
+    let pool = state.pool.as_ref().ok_or_else(db_unavailable)?;
+    crate::hunt::run(
+        pool,
+        &state.bloom,
+        &state.intel_gate,
+        &state.yara,
+        &state.yara_coverage,
+        request,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
 #[derive(Debug, Serialize)]
 pub struct FeedSyncResult {
     pub source: String,
