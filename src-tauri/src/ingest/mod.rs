@@ -132,7 +132,6 @@ pub async fn run_all(pool: &PgPool, api_key: &str) -> Vec<(&'static str, Result<
     ]
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::parse_abusech_time;
