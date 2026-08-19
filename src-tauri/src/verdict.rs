@@ -197,9 +197,7 @@ async fn resolve_in_intel_snapshot_inner(
             VerdictTier::ExactHash,
             IndicatorKind::Md5,
         ));
-        if exact_hash_truncated {
-            bounds.truncated_entry_tiers.push(VerdictTier::ExactHash);
-        }
+        record_exact_hash_truncation(&mut bounds, exact_hash_truncated);
 
         // Malware-family attribution and CVE-via-report relationships can
         // only exist for a hash the bloom filter already knows about: both
@@ -497,6 +495,17 @@ fn require_expected_sha256(actual: &str, expected: Option<&str>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn record_exact_hash_truncation(bounds: &mut VerdictBounds, truncated: bool) {
+    if truncated {
+        bounds.truncated_entry_tiers.push(VerdictTier::ExactHash);
+        // Exact-hash provenance rows are also the source of IOC
+        // relationships. Omitted rows may contain distinct pivots that were
+        // never materialized, so HUNT must treat a non-match as inconclusive
+        // rather than as evidence of absence.
+        bounds.relationships_truncated = true;
+    }
 }
 
 #[cfg(test)]
@@ -2585,5 +2594,21 @@ mod tests {
         f.write_all(br"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*")
             .expect("write eicar bytes");
         f
+    }
+
+    #[test]
+    fn exact_hash_truncation_marks_relationships_partial() {
+        let mut bounds = VerdictBounds::default();
+        record_exact_hash_truncation(&mut bounds, true);
+
+        assert!(
+            bounds
+                .truncated_entry_tiers
+                .contains(&VerdictTier::ExactHash)
+        );
+        assert!(
+            bounds.relationships_truncated,
+            "omitted exact-hash rows may hide IOC pivots"
+        );
     }
 }
