@@ -1,4 +1,4 @@
-import type { Verdict, YaraStatus } from "./types";
+import type { OrionTrace, Verdict, YaraStatus } from "./types";
 
 export type YaraCoverageState = "loaded" | "empty" | "failed";
 
@@ -12,6 +12,7 @@ export interface YaraCoverage {
 // coverage beside it at the Tauri command boundary.
 export type VerdictWithCoverage = Verdict & {
   yara_coverage: YaraCoverage;
+  orion_trace: OrionTrace;
 };
 
 export type YaraStatusWithCoverage = YaraStatus & YaraCoverage;

@@ -1,4 +1,4 @@
-import type { RelationshipStrength, ThreatRelationship } from "../types";
+import type { OrionTrace, RelationshipStrength, ThreatRelationship } from "../types";
 import {
   EVIDENCE_RELATION_LABELS,
   RELATIONSHIP_KIND_LABELS,
@@ -6,6 +6,7 @@ import {
   RELATIONSHIP_STRENGTH_ORDER,
 } from "../types";
 import { safeExternalUrl } from "../lib/safeUrl";
+import { OrionTraceView } from "./OrionTraceView";
 
 interface Props {
   relationships: ThreatRelationship[];
@@ -14,6 +15,7 @@ interface Props {
   // than ignored: PR #20 treats this set as the authoritative pivot set, so
   // an analyst comparing against it needs to know when it is a subset.
   relationshipsTruncated?: boolean;
+  orionTrace?: OrionTrace;
 }
 
 function strengthClass(strength: RelationshipStrength): string {
@@ -30,6 +32,7 @@ function strengthClass(strength: RelationshipStrength): string {
 export function ThreatRelationshipList({
   relationships,
   relationshipsTruncated = false,
+  orionTrace,
 }: Props) {
   // Still render when the list is empty but truncation fired -- "nothing to
   // show" and "we stopped looking" must not collapse into the same silence.
@@ -37,17 +40,17 @@ export function ThreatRelationshipList({
     return null;
   }
 
-  const byKind = new Map<string, ThreatRelationship[]>();
-  for (const r of relationships) {
+  const byKind = new Map<string, Array<{ relationship: ThreatRelationship; index: number }>>();
+  for (const [index, r] of relationships.entries()) {
     const group = byKind.get(r.kind) ?? [];
-    group.push(r);
+    group.push({ relationship: r, index });
     byKind.set(r.kind, group);
   }
   for (const group of byKind.values()) {
     group.sort(
       (a, b) =>
-        RELATIONSHIP_STRENGTH_ORDER.indexOf(a.strength) -
-        RELATIONSHIP_STRENGTH_ORDER.indexOf(b.strength)
+        RELATIONSHIP_STRENGTH_ORDER.indexOf(a.relationship.strength) -
+        RELATIONSHIP_STRENGTH_ORDER.indexOf(b.relationship.strength)
     );
   }
 
@@ -67,8 +70,8 @@ export function ThreatRelationshipList({
             {RELATIONSHIP_KIND_LABELS[kind as ThreatRelationship["kind"]]}
           </div>
           <ul className="relationship-list">
-            {group.map((r, i) => (
-              <li key={i} className="relationship-entry">
+            {group.map(({ relationship: r, index }) => (
+              <li key={index} className="relationship-entry">
                 <div className="relationship-header">
                   <code className="relationship-target">{r.target}</code>
                   <span className={`strength-badge ${strengthClass(r.strength)}`}>
@@ -76,6 +79,9 @@ export function ThreatRelationshipList({
                   </span>
                 </div>
                 <div className="relationship-explanation">{r.explanation}</div>
+                {orionTrace && (
+                  <OrionTraceView relationshipIndex={index} trace={orionTrace} />
+                )}
                 {/* One block per evidence path -- most relationships have
                     exactly one, but a Cve relationship can have more than
                     one when a report observed this file under more than

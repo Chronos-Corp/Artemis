@@ -214,6 +214,104 @@ export interface Verdict {
   bounds: VerdictBounds;
 }
 
+// ---------------------------------------------------------------------
+// Orion TRACE -- an explicitly directed projection over the normalized
+// RELATE contract. Proof direction is resolved in Rust, never inferred by
+// the UI from EvidenceRelation names or explanation prose.
+// ---------------------------------------------------------------------
+
+export type TraceNodeKind =
+  | "artifact"
+  | "indicator"
+  | "report"
+  | "detection"
+  | "cve"
+  | "malware_family"
+  | "risk_concept";
+
+export interface TraceNode {
+  id: string;
+  kind: TraceNodeKind;
+  label: string;
+}
+
+export type TraceEdgeRelation =
+  | "artifact_has_indicator"
+  | "indicator_observed_in_report"
+  | "report_references_cve"
+  | "indicator_matched_by_detection"
+  | "detection_covers_cve"
+  | "indicator_attributed_to_malware_family"
+  | "contextual_filename_match";
+
+export const TRACE_EDGE_LABELS: Record<TraceEdgeRelation, string> = {
+  artifact_has_indicator: "has indicator",
+  indicator_observed_in_report: "observed in report",
+  report_references_cve: "references CVE",
+  indicator_matched_by_detection: "matched by detection",
+  detection_covers_cve: "covers CVE",
+  indicator_attributed_to_malware_family: "attributed to family",
+  contextual_filename_match: "possible filename association",
+};
+
+export type AssertionOrientation = "native" | "reversed" | "synthetic";
+export type TracePathState = "observed" | "possible";
+
+export interface TraceEdge {
+  from: string;
+  to: string;
+  relation: TraceEdgeRelation;
+  assertion_orientation: AssertionOrientation;
+  proof_hop_index: number | null;
+}
+
+export interface TracePathRank {
+  relationship_strength: RelationshipStrength;
+  weakest_source_confidence: number;
+  hop_count: number;
+}
+
+export interface TracePath {
+  relationship_index: number;
+  target_kind: RelationshipKind;
+  target: string;
+  state: TracePathState;
+  rank: TracePathRank;
+  nodes: TraceNode[];
+  edges: TraceEdge[];
+  supporting_proof: RelationshipEvidence[];
+  supporting_evidence_partial: boolean;
+}
+
+export type UntracedReason =
+  | "empty_proof"
+  | "mixed_proof_shape"
+  | "unsupported_relationship_shape"
+  | "missing_node_identity"
+  | "inconsistent_proof_endpoints";
+
+export interface UntracedRelationship {
+  relationship_index: number;
+  target_kind: RelationshipKind;
+  target: string;
+  reason: UntracedReason;
+}
+
+export interface TraceBounds {
+  input_relationships_truncated: boolean;
+  input_evidence_truncated: boolean;
+  paths_truncated: boolean;
+  omitted_paths: number;
+  max_paths: number;
+}
+
+export interface OrionTrace {
+  start: TraceNode;
+  paths: TracePath[];
+  untraced_relationships: UntracedRelationship[];
+  bounds: TraceBounds;
+}
+
 export interface SyncSummary {
   source: string;
   indicators_added: number;

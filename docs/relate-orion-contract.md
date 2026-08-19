@@ -1,6 +1,6 @@
 # RELATE → Orion Contract
 
-Status: **implementation contract for Issue #20 / stacked PR #21**
+Status: **implemented input contract on `main` through PR #21**
 
 This document narrows the handoff between Artemis RELATE and Orion TRACE. It exists specifically so the relationship model does not accidentally promise directed graph semantics that belong to Orion.
 
@@ -137,3 +137,14 @@ During PR #21 validation, the supply-chain gate detected newly published `RUSTSE
 The governing rule remains:
 
 > **Artemis observes and structures evidence. Orion traces relationships. Evidence proves.**
+
+## 10. First Useful Trace consumer
+
+`crates/nsic-core/src/orion.rs` is the first consumer of this contract. It
+projects the normalized RELATE result into typed nodes and explicitly directed
+edges, records native versus reversed assertion orientation, preserves each
+supporting proof chain alongside the traversal, separates observed from
+possible paths, and carries both RELATE and Orion bounds forward.
+
+See `docs/orion-architecture.md` for the governing Orion decisions and the
+next Hunt/Execute boundary.

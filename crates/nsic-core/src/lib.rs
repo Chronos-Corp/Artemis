@@ -7,6 +7,7 @@
 
 pub mod hashing;
 pub mod models;
+pub mod orion;
 pub mod proto;
 pub mod sanitize;
 
