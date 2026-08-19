@@ -1,16 +1,20 @@
 # 4NSIC
 
 DFIR triage and threat hunting tool -- codenamed **Apollo**, the first
-committed product of the Chronos Corp portfolio thesis. See
-[`docs/apollo-constitution.md`](docs/apollo-constitution.md) for the
-product-level source of truth on what Apollo is, what it isn't, and what's
-still genuinely open (and
+committed product of the Chronos Corp portfolio thesis, now named
+**Artemis**. See
+[`docs/artemis-product-constitution.md`](docs/artemis-product-constitution.md)
+for the current product-level source of truth on what Artemis is, what it
+isn't, and what's still genuinely open (and
 [`docs/chronos-constitution.md`](docs/chronos-constitution.md) for the
 company-level thesis it sits under); this README covers the technical
 state of the repo, kept consistent with those documents rather than
-repeating them. "4NSIC" is this repo's working name and shows up in the
-crate names (`nsic-core`/`nsic-agent`/`nsic-console`); "Apollo" is the
-product name.
+repeating them. `docs/apollo-constitution.md` is retained as retired,
+historical product doctrine from before the Artemis rename -- not current
+authority. "4NSIC" is this repo's working name and shows up in the
+crate names (`nsic-core`/`nsic-agent`/`nsic-console`); "Artemis" is the
+product name ("Apollo" throughout the rest of this README and the codebase
+is the pre-rename name and has not yet been fully migrated).
 
 **Apollo's non-negotiable product promise:** selecting a file should
 progressively answer what it is, what it's for, whether it's expected here,
