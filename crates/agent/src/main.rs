@@ -464,19 +464,6 @@ async fn report_sightings(
     Ok(())
 }
 
-/// Reads `path` into memory, refusing to read more than `max_bytes` and
-/// refusing anything that isn't a regular file. The console enforces
-/// `MAX_SAMPLE_SIZE_BYTES` on the way in (`DefaultBodyLimit` plus an
-/// in-handler check), but that's too late to matter here: a multi-
-/// gigabyte file, or an endless special file (a device node, a FIFO, a
-/// symlink loop's eventual target) named by an operator's request path
-/// would otherwise get read via an unbounded `std::fs::read` before the
-/// agent ever makes the HTTP request the console could reject. Uses
-/// `std::fs::metadata` (follows symlinks) rather than `symlink_metadata`,
-/// so a path that's a symlink to an ordinary file is still accepted --
-/// only the final target's type has to be a regular file, not the path
-/// itself. Reads at most `max_bytes + 1` via `Read::take` so a file
-/// exactly at the limit is distinguishable from one a single byte over
 /// Reads an explicitly requested sample through the same hostile-filesystem
 /// boundary used for hashing and YARA, with the protocol's smaller sample
 /// limit. The shared primitive follows symlinks to ordinary files, validates
