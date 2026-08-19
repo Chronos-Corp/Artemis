@@ -495,7 +495,6 @@ fn project_path(
     };
     let id = trace_path_id(
         start,
-        relationship_index,
         relationship,
         state,
         &rank,
@@ -520,7 +519,6 @@ fn project_path(
 #[allow(clippy::too_many_arguments)]
 fn trace_path_id(
     start: &TraceNode,
-    relationship_index: usize,
     relationship: &ThreatRelationship,
     state: TracePathState,
     rank: &TracePathRank,
@@ -529,9 +527,8 @@ fn trace_path_id(
     proof: &[RelationshipEvidence],
 ) -> String {
     let mut digest = Sha256::new();
-    hash_component(&mut digest, "orion-trace-path-v1");
+    hash_component(&mut digest, "orion-trace-path-v2");
     hash_component(&mut digest, &start.id);
-    hash_component(&mut digest, &relationship_index.to_string());
     hash_component(&mut digest, relationship_kind_key(relationship.kind));
     hash_component(&mut digest, &relationship.target);
     hash_component(&mut digest, trace_path_state_key(state));
@@ -958,6 +955,40 @@ mod tests {
         let second = trace_verdict(&verdict(vec![observed_later]));
 
         assert_eq!(first.paths[0].id, second.paths[0].id);
+    }
+
+    #[test]
+    fn path_identity_is_stable_when_relationships_reorder() {
+        let selected = relationship(
+            RelationshipKind::Detection,
+            RelationshipStrength::Strong,
+            "test_rule",
+            &[EvidenceRelation::DetectsIndicator],
+        );
+        let unrelated = relationship(
+            RelationshipKind::RiskBased,
+            RelationshipStrength::Weak,
+            "unrelated.exe",
+            &[EvidenceRelation::ContextualFilenameMatch],
+        );
+
+        let first = trace_verdict(&verdict(vec![selected.clone(), unrelated.clone()]));
+        let reordered = trace_verdict(&verdict(vec![unrelated, selected]));
+
+        let first_selected = first
+            .paths
+            .iter()
+            .find(|path| path.target == "test_rule")
+            .unwrap();
+        let reordered_selected = reordered
+            .paths
+            .iter()
+            .find(|path| path.target == "test_rule")
+            .unwrap();
+
+        assert_eq!(first_selected.relationship_index, 0);
+        assert_eq!(reordered_selected.relationship_index, 1);
+        assert_eq!(first_selected.id, reordered_selected.id);
     }
 
     #[test]
