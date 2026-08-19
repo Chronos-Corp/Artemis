@@ -368,8 +368,8 @@ pub async fn resolve(
     // freshness context either way.
     let intel_freshness = db::all_sync_states(pool).await?;
 
-    // The RELATE-stage structured relationship view (Apollo Constitution
-    // §6): most kinds are pure-derived from the provenance entries already
+    // The RELATE-stage structured relationship view (Artemis Product
+    // Constitution §7): most kinds are pure-derived from the provenance entries already
     // gathered above, but malware-family attribution and CVE relationships
     // each have their own edge tables with their own provenance (populated
     // by ingestion, not derivable from provenance entries alone) so they

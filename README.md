@@ -1,18 +1,20 @@
 # 4NSIC
 
-DFIR triage and threat hunting tool -- codenamed **Apollo**, the first
-committed product of the Chronos Corp portfolio thesis. See
-[`docs/apollo-constitution.md`](docs/apollo-constitution.md) for the
-product-level source of truth on what Apollo is, what it isn't, and what's
-still genuinely open (and
+DFIR triage and threat hunting tool -- **Artemis**, the first committed
+product of the Chronos Corp portfolio thesis (codenamed Apollo during early
+development; see `docs/apollo-constitution.md`, retained as retired,
+historical product doctrine, not current authority). See
+[`docs/artemis-product-constitution.md`](docs/artemis-product-constitution.md)
+for the current product-level source of truth on what Artemis is, what it
+isn't, and what's still genuinely open (and
 [`docs/chronos-constitution.md`](docs/chronos-constitution.md) for the
 company-level thesis it sits under); this README covers the technical
 state of the repo, kept consistent with those documents rather than
 repeating them. "4NSIC" is this repo's working name and shows up in the
-crate names (`nsic-core`/`nsic-agent`/`nsic-console`); "Apollo" is the
+crate names (`nsic-core`/`nsic-agent`/`nsic-console`); "Artemis" is the
 product name.
 
-**Apollo's non-negotiable product promise:** selecting a file should
+**Artemis's non-negotiable product promise:** selecting a file should
 progressively answer what it is, what it's for, whether it's expected here,
 and whether it's related to known IOCs, CVEs, APTs, campaigns, malware, or
 other risk-based threats. Selecting one of those relationships should let
@@ -20,7 +22,7 @@ an analyst hunt the chosen recursive scope for associated evidence, then
 see what the combined evidence means. File &rarr; understand &rarr; relate
 &rarr; pivot &rarr; hunt &rarr; explain. An analyst-facing correlation
 layer that sits alongside existing EDR, not a replacement for it -- EDR
-tells you a file is bad, Apollo tells you which campaign it belongs to,
+tells you a file is bad, Artemis tells you which campaign it belongs to,
 which CVE it relates to, and what else on the host clusters with it.
 
 ## Current phase: Phase 0, with Phase 1 scaffolding underway
@@ -62,7 +64,7 @@ What works today:
   the *selected* path -- a symlink never inherits its target's package
   identity), product context (owning package/version), purpose (the
   package's real short description when one exists, worded explicitly as
-  package-level rather than claiming Apollo identified this specific
+  package-level rather than claiming Artemis identified this specific
   file's individual role), expectedness (a rollup with explicit reasons --
   checksum mismatch always wins; a same-directory masquerading check for
   near-miss filenames like `svch0st.exe` beside `svchost.exe` is treated
@@ -70,19 +72,19 @@ What works today:
   since legitimate tool families like `mount`/`umount` genuinely sit
   within a small edit distance of each other), and local context. This
   answers "what is this file and what's it for," independent of
-  `get_verdict`'s "is this file threat-relevant" -- see Apollo
-  Constitution &sect;5. v1 package-manager support is dpkg-only
+  `get_verdict`'s "is this file threat-relevant" -- see Artemis Product
+  Constitution &sect;6. v1 package-manager support is dpkg-only
   (Debian/Ubuntu); other platforms report authenticity as `unknown`
   rather than guessing -- see the module doc comment. Deliberately does
   not touch Postgres at all, so it keeps working even when the intel
   database is unreachable.
 - **Threat Relationship Model (PR #19).** `get_verdict` now also returns
   `threat_relationships: ThreatRelationship[]` (`crates/nsic-core/src/models.rs`)
-  -- the Apollo Constitution &sect;6 RELATE-stage structured view, distinct
+  -- the Artemis Product Constitution &sect;7 RELATE-stage structured view, distinct
   from `entries`' verdict-tier framing ("why did this file get flagged").
   Every relationship carries an explicit `kind` (IOC / CVE / threat actor /
   campaign / malware family / ATT&amp;CK technique / detection / risk-based)
-  and `strength` (direct/strong/contextual/weak -- Open &middot; 3's
+  and `strength` (direct/strong/contextual/weak -- Open &middot; 2's
   requested vocabulary). `strength` is set as a literal at each construction
   site based on the *evidence mechanism* -- an exact hash match is `Direct`,
   a YARA rule firing is a `Detection` (not an `Ioc`) at `Direct`, a
@@ -228,7 +230,7 @@ What works today:
   `RelationshipEvidence` also carries `timing: EvidenceTiming` (`Observed`
   or `ReceivedOnly`): every edge-backed tier has a genuine claimed
   observation window for `first_seen`/`last_seen`, but the `Contextual`
-  tier has no backing edge at all, so its timestamps are only Apollo's own
+  tier has no backing edge at all, so its timestamps are only Artemis's own
   report-receipt time (`report.ingested_at`) -- `ReceivedOnly` keeps that
   labeled honestly on the wire instead of letting one field name silently
   mean two different things depending on which tier produced it.
@@ -241,10 +243,10 @@ What works today:
   doesn't ingest either.
 
 What's stubbed or deliberately not built yet, in build order (see
-[`docs/apollo-constitution.md`](docs/apollo-constitution.md#12-current-product-build-doctrine)
+[`docs/artemis-product-constitution.md`](docs/artemis-product-constitution.md#17-current-build-interpretation)
 for the full sequencing rationale):
 
-- **Recursive Hunt Engine (PR #20) -- the other half of Apollo's core
+- **Recursive Hunt Engine (PR #20) -- the other half of Artemis's core
   product promise.** Today's verdict engine only goes one direction: file
   in, correlation out. There is no command that goes the other way --
   pick a relationship a file surfaced, and scan the chosen directory scope
@@ -446,8 +448,8 @@ redistribution rights before architecting around any new feed.
 There is no authoritative CVE-to-IOC feed; that mapping has to be curated.
 Curated relationship knowledge is a durable moat, but hunt packs
 themselves are machinery, not the product -- see
-[`docs/apollo-constitution.md`](docs/apollo-constitution.md#7-recursive-hunting-and-hunt-packs).
-What Apollo actually sells is the file &rarr; understand &rarr; relate
+[`docs/artemis-product-constitution.md`](docs/artemis-product-constitution.md#8-execute-guided-relational-and-analyst-defined-hunting).
+What Artemis actually sells is the file &rarr; understand &rarr; relate
 &rarr; pivot &rarr; hunt &rarr; explain loop; a hunt pack is one mechanism
 that feeds the pivot/hunt steps by turning a threat concept into an
 executable hunt. A hunt pack will be a per-CVE bundle (YARA rules, Sigma
@@ -486,7 +488,7 @@ Do not jump ahead; each phase de-risks the next.
   deliberately paused here rather than continued out of momentum -- see
   the roadmap correction below.
 - **Roadmap correction (current focus, superseded by
-  [`docs/apollo-constitution.md`](docs/apollo-constitution.md#12-current-product-build-doctrine)
+  [`docs/artemis-product-constitution.md`](docs/artemis-product-constitution.md#17-current-build-interpretation)
   -- read that first if this bullet and that document ever disagree):**
   an external review of the codebase pointed out that Phase 1 is the
   harder commercial sell -- "please deploy another endpoint agent" --
@@ -495,11 +497,13 @@ Do not jump ahead; each phase de-risks the next.
   the wedge. Two earlier passes at this correction each over-rotated:
   the first toward hunt packs specifically (corrected -- hunt packs are
   machinery, not the product); the second toward "agentless-first"
-  specifically, which the Apollo Constitution demotes from a decided
-  strategy to an open question -- external EDR/SIEM integration may
-  reduce adoption friction later, but it should not redefine Apollo's
+  specifically, which the retired Apollo Constitution (&sect;10) demotes from
+  a decided strategy to an open question -- not carried forward into the
+  current Artemis Product Constitution, which does not yet re-address
+  execution-backend choice explicitly -- external EDR/SIEM integration may
+  reduce adoption friction later, but it should not redefine Artemis's
   actual CORE wedge, which is the *local, single-machine* filesystem
-  experience. Apollo Sensor (the existing agent) is a PROVEN FOUNDATION
+  experience. Artemis Sensor (the existing agent) is a PROVEN FOUNDATION
   backend, not a rejected one; EDR/SIEM connectors are just an OPEN/LATER
   alternative backend, decided by customer evidence, not by assumption.
   Current build sequence, in order: intel freshness surfaced on every
@@ -520,7 +524,7 @@ Do not jump ahead; each phase de-risks the next.
   sequenced as near-term numbered work -- they scale the same hunt model
   only after the local product thesis is proven, per Expansion Gate 7.
   The endpoint agent remains infrastructure either way, not the
-  definition of Apollo -- the intel graph, provenance model, verdict
+  definition of Artemis -- the intel graph, provenance model, verdict
   engine, and console APIs all survive this sequencing change unchanged.
 - **Phase 2:** CVE hunt packs, KEV first -- see the roadmap correction
   above for sequencing relative to the core interaction loop.

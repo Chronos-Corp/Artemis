@@ -21,7 +21,7 @@
  */
 
 /**
- * The only schemes Apollo will turn into a clickable link. Allowlist, not
+ * The only schemes Artemis will turn into a clickable link. Allowlist, not
  * denylist: the set of dangerous schemes is open-ended, the set needed here is
  * exactly these two.
  */

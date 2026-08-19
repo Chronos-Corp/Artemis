@@ -3,14 +3,14 @@
 //!
 //! MalwareBazaar and ThreatFox content is partly community-submitted --
 //! ThreatFox's per-IOC `reference` field is supplied by whoever submitted
-//! the IOC. Values from there are stored in Apollo's own graph and later
+//! the IOC. Values from there are stored in Artemis's own graph and later
 //! rendered to the analyst, so they get validated here, at the crossing,
 //! rather than at whichever consumer happens to touch them later.
 
-/// URL schemes Apollo will store and show as a clickable provenance link.
+/// URL schemes Artemis will store and show as a clickable provenance link.
 /// Deliberately an allowlist: the set of dangerous schemes is open-ended
 /// (`javascript:`, `data:`, `vbscript:`, `file:`, plus whatever a given
-/// webview registers), while the set Apollo actually needs is exactly
+/// webview registers), while the set Artemis actually needs is exactly
 /// these two.
 const ALLOWED_URL_SCHEMES: [&str; 2] = ["http", "https"];
 
@@ -25,7 +25,7 @@ const ALLOWED_URL_SCHEMES: [&str; 2] = ["http", "https"];
 /// more forgiving than a naive `starts_with("http")` check.
 ///
 /// This does not attempt to judge whether the *host* is trustworthy -- a
-/// feed can legitimately reference any `https://` site, and Apollo shows
+/// feed can legitimately reference any `https://` site, and Artemis shows
 /// the link as provenance without fetching it. See the threat model's
 /// "known accepted risks".
 ///

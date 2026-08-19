@@ -17,7 +17,7 @@ use crate::models::{
 /// Not real pagination (there is no cursor) -- a bound, so one file can't
 /// produce an unbounded provenance list. The intel graph is populated from
 /// third-party feeds, so "how many reports observe this one hash" is not a
-/// number Apollo controls; without a cap, a hash that many reports
+/// number Artemis controls; without a cap, a hash that many reports
 /// reference inflates the IPC payload to the webview and the list an
 /// analyst has to scroll. `contextual_matches` already capped itself at 20;
 /// the other lookups did not, which was an inconsistency rather than a
@@ -54,7 +54,7 @@ const MAX_RELATIONSHIPS: i64 = 200;
 pub(crate) const MAX_EVIDENCE_PER_RELATIONSHIP: i64 = 20;
 
 /// The contextual tier's own row cap. Tighter than `MAX_VERDICT_ROWS`
-/// because this is the weakest evidence Apollo produces (a filename
+/// because this is the weakest evidence Artemis produces (a filename
 /// coincidence), so a long list of it is the least worth an analyst's
 /// scrolling. This was already 20 as a bare literal in the query; naming it
 /// keeps it visible alongside the other budgets.
@@ -637,7 +637,7 @@ struct MalwareFamilyMatchRow {
 }
 
 /// Malware-family attribution for this file, checked against both hash
-/// kinds Apollo actually computes for verdict matching -- ThreatFox can
+/// kinds Artemis actually computes for verdict matching -- ThreatFox can
 /// source an MD5 indicator with its own family edge, and checking sha256
 /// alone would silently omit it even though the sha256/md5 pair belongs
 /// to the same scanned file. Not derivable from `ProvenanceEntry` the way
@@ -1310,7 +1310,7 @@ pub async fn contextual_matches(
                     // edge-style observation timing for a tier with no backing
                     // evidence edge at all. A round-6 review caught that even
                     // `ingested_at` is the wrong *label*, though it's the right
-                    // *value*: it's when Apollo *received* this report, not any
+                    // *value*: it's when Artemis *received* this report, not any
                     // claimed first/last-observed window a source asserted --
                     // `timing: ReceivedOnly` below makes that distinction
                     // explicit on the wire instead of overloading

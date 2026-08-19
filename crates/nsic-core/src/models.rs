@@ -59,7 +59,7 @@ pub enum VerdictTier {
 /// `report.raw`) has no backing edge at all, so there is no observation
 /// window to report; a review caught an earlier version fabricating one
 /// with `Utc::now()` at lookup time, then a later one silently relabeling
-/// the report's own `ingested_at` (when Apollo *received* the report) as
+/// the report's own `ingested_at` (when Artemis *received* the report) as
 /// though it were first/last-seen observation timing -- receipt time and
 /// observation time are different facts, and a generic consumer (PR #20's
 /// hunt engine, an analyst reading the UI) cannot tell them apart from the
@@ -98,7 +98,7 @@ pub struct ProvenanceEntry {
     pub rule_fingerprint: Option<String>,
     /// Whether `first_seen`/`last_seen` above are a genuine observation
     /// window from a backing edge (`Observed`, the default for every
-    /// tier with real edge provenance), or merely when Apollo itself
+    /// tier with real edge provenance), or merely when Artemis itself
     /// received the underlying report (`ReceivedOnly`, used only by
     /// `Contextual` -- see `EvidenceTiming`'s doc comment).
     pub timing: EvidenceTiming,
@@ -177,7 +177,7 @@ pub struct VerdictBounds {
 }
 
 // ---------------------------------------------------------------------
-// Threat Relationship Intelligence (Apollo Constitution §6)
+// Threat Relationship Intelligence (Artemis Product Constitution §7)
 // ---------------------------------------------------------------------
 
 /// The category of security concept a file is related to. Deliberately
@@ -198,7 +198,7 @@ pub enum RelationshipKind {
     RiskBased,
 }
 
-/// Apollo Constitution §6, Open·3 ("Relationship strength"): an explicit
+/// Artemis Product Constitution §7, Open·2 ("Relationship strength"): an explicit
 /// vocabulary for direct evidence, strong association, contextual support,
 /// and weak association, so "related to" cannot flatten into an unbounded
 /// graph of technically-true but operationally-useless connections.
@@ -307,14 +307,14 @@ pub struct RelationshipEvidence {
     /// asserted against the current ruleset).
     pub rule_fingerprint: Option<String>,
     /// See `EvidenceTiming`'s doc comment -- whether `first_seen`/
-    /// `last_seen` above are a genuine observation window or only Apollo's
+    /// `last_seen` above are a genuine observation window or only Artemis's
     /// own receipt time. `Observed` for every hop with real edge
     /// provenance (every relation except `ContextualFilenameMatch`).
     pub timing: EvidenceTiming,
 }
 
 /// A single structured relationship between a file and a threat concept --
-/// the RELATE-stage object the Apollo Constitution's §6 calls for, distinct
+/// the RELATE-stage object the Artemis Product Constitution's §7 calls for, distinct
 /// from `ProvenanceEntry`'s verdict-tier framing ("why did this file get
 /// flagged"). `ThreatRelationship` answers a different question: "what
 /// threat concept is this file connected to, how strongly, and what would
@@ -632,7 +632,7 @@ mod tests {
     #[test]
     fn timing_propagates_from_provenance_entry_into_the_evidence_hop() {
         // Round 6 review finding: a contextual match's timestamps are only
-        // Apollo's own receipt time (no backing edge to source an
+        // Artemis's own receipt time (no backing edge to source an
         // observation window from), and that distinction must survive into
         // the wire-level RelationshipEvidence, not just ProvenanceEntry --
         // PR #20 and the UI both read the relationship layer, not the raw
