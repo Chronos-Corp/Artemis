@@ -87,16 +87,18 @@ wait, preventing a single hunt from combining different intelligence corpora.
 The resolver variant used inside that guard does not reacquire the fair lock,
 which avoids a self-deadlock behind a queued writer.
 
-Filesystem discovery is bounded and deterministic. Symbolic links are not
-followed, canonical paths must remain under the scope root, and each candidate
-is canonicalized again immediately before analysis. The existing file resolver
-then opens only a bounded regular file and rejects special or changed final
-objects.
+Filesystem discovery is bounded and deterministic. It descends through opened
+directory capabilities rooted at the authorized scope rather than resolving
+ambient pathnames. Symlink/reparse entries are not traversed. Each regular-file
+entry is opened once, without following a final link, and immediately copied
+into a bounded immutable byte snapshot. Hashing, YARA, RELATE, and Orion all
+consume that snapshot; none reopens the candidate pathname.
 
-The filesystem is nevertheless live, not an immutable snapshot. A concurrent
-rename or intermediate-path replacement can make a candidate change between
-checks. Such failures are returned as inconclusive. This version makes no
-race-free snapshot or complete-scope claim.
+Root-relative, no-follow metadata checks before and after analysis detect a
+replacement or mutation of the entry while the hunt is live. Failure to prove
+the same regular object remains bound to the entry is returned as inconclusive,
+and the acquired bytes never change to an external target. Bounds or directory
+enumeration uncertainty likewise prevent a complete-scope claim.
 
 ## 6. Result contract
 

@@ -200,9 +200,11 @@ defines graph semantics.
 
 One intelligence read guard spans seed reconstruction and every candidate, so
 a feed sync cannot split a hunt across different evidence corpora. Filesystem
-execution remains explicitly live rather than pretending to be an immutable
-snapshot: symbolic links are not followed, candidates are canonicalized and
-revalidated, and anything that changes or cannot be read is inconclusive.
+execution descends from an opened authorized-root capability, refuses
+symlink/reparse traversal, and opens each candidate once. Hashing and all
+analysis consume the same bounded immutable bytes. Root-relative no-follow
+stability checks make replacement, mutation, or boundary uncertainty
+inconclusive; candidate content is never reopened by pathname.
 
 Initial bounds are 1,000 candidate files, 20,000 walked entries, 100 returned
 findings, and 100 returned errors. Every fired bound and omitted count is

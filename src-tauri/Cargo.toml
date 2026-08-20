@@ -34,7 +34,8 @@ thiserror = "2"
 dirs = "6"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-walkdir = "2"
+cap-std = "4"
+cap-fs-ext = "4"
 
 [dev-dependencies]
 tempfile = "3"

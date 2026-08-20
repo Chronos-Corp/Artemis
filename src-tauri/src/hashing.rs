@@ -4,7 +4,10 @@ use sqlx::PgPool;
 use std::path::Path;
 
 pub use nsic_core::hashing::{hash_bytes, HashResult};
-use nsic_core::hashing::{read_regular_file_bounded, MAX_ANALYSIS_BYTES};
+use nsic_core::hashing::{
+    read_opened_regular_file_bounded, read_regular_file_bounded, FileSnapshot,
+    MAX_ANALYSIS_BYTES,
+};
 
 /// Reads one hostile-filesystem-safe snapshot, then hashes and returns those
 /// exact bytes. The shared `nsic_core` primitive performs nonblocking open
@@ -31,6 +34,23 @@ pub async fn hash_and_read_file(pool: &PgPool, path: &Path) -> Result<(HashResul
 
     store_cache(pool, &path_string, size, modified, &result).await?;
     Ok((result, snapshot.bytes))
+}
+
+pub async fn hash_opened_snapshot(
+    pool: &PgPool,
+    path: &Path,
+    snapshot: FileSnapshot,
+) -> Result<(HashResult, Vec<u8>)> {
+    let size = i64::try_from(snapshot.size_at_open)
+        .context("opened file size does not fit the desktop cache schema")?;
+    let modified: DateTime<Utc> = snapshot.modified_at_open.into();
+    let result = hash_bytes(&snapshot.bytes);
+    store_cache(pool, &path.to_string_lossy(), size, modified, &result).await?;
+    Ok((result, snapshot.bytes))
+}
+
+pub fn read_opened_snapshot(file: std::fs::File, path: &Path) -> Result<FileSnapshot> {
+    read_opened_regular_file_bounded(file, path, MAX_ANALYSIS_BYTES)
 }
 
 async fn store_cache(

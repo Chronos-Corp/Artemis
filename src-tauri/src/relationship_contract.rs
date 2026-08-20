@@ -77,25 +77,22 @@ pub async fn resolve(
     Ok(finalize_resolved(verdict, yara_coverage))
 }
 
-/// Resolves one file against a caller-owned coherent intel snapshot.
-/// `hunt::run` is the only intended caller: it holds `IntelGate::read()` for
-/// the entire bounded subtree execution, then uses this entry point for the
-/// seed and every candidate. Keeping finalization here preserves the rule
-/// that Orion/HUNT can consume only normalized RELATE plus analysis coverage.
-pub(crate) async fn resolve_in_intel_snapshot(
+pub(crate) async fn resolve_opened_snapshot_in_intel_snapshot(
     pool: &PgPool,
     bloom: &BloomState,
     yara: &Arc<YaraEngine>,
     yara_coverage: &YaraCoverage,
     observation_scope: &RecentYaraHits,
     path: &Path,
+    snapshot: nsic_core::hashing::FileSnapshot,
 ) -> Result<ResolvedVerdict> {
-    let verdict = raw_verdict::resolve_in_intel_snapshot(
+    let verdict = raw_verdict::resolve_opened_snapshot_in_intel_snapshot(
         pool,
         bloom,
         yara,
         observation_scope,
         path,
+        snapshot,
     )
     .await?;
     Ok(finalize_resolved(verdict, yara_coverage))

@@ -114,7 +114,27 @@ pub(super) async fn resolve_in_intel_snapshot(
     recent_yara_hits: &RecentYaraHits,
     path: &Path,
 ) -> Result<Verdict> {
-    resolve_in_intel_snapshot_inner(pool, bloom, yara, recent_yara_hits, path, None).await
+    resolve_in_intel_snapshot_inner(pool, bloom, yara, recent_yara_hits, path, None, None).await
+}
+
+pub(super) async fn resolve_opened_snapshot_in_intel_snapshot(
+    pool: &PgPool,
+    bloom: &BloomState,
+    yara: &Arc<YaraEngine>,
+    recent_yara_hits: &RecentYaraHits,
+    path: &Path,
+    snapshot: nsic_core::hashing::FileSnapshot,
+) -> Result<Verdict> {
+    resolve_in_intel_snapshot_inner(
+        pool,
+        bloom,
+        yara,
+        recent_yara_hits,
+        path,
+        None,
+        Some(snapshot),
+    )
+    .await
 }
 
 /// Hash-pinned variant for HUNT's selected seed. The expected digest is
@@ -135,6 +155,7 @@ pub(super) async fn resolve_in_intel_snapshot_with_expected_sha256(
         recent_yara_hits,
         path,
         Some(expected_sha256),
+        None,
     )
     .await
 }
@@ -146,13 +167,17 @@ async fn resolve_in_intel_snapshot_inner(
     recent_yara_hits: &RecentYaraHits,
     path: &Path,
     expected_sha256: Option<&str>,
+    opened_snapshot: Option<nsic_core::hashing::FileSnapshot>,
 ) -> Result<Verdict> {
     // Read the file's bytes exactly once and hash + YARA-scan the identical
     // buffer -- see `hashing::hash_and_read_file`'s doc comment for why:
     // two separate reads (one to hash, one to scan) can observe different
     // content if the file changes in between, silently binding a YARA hit's
     // persisted edge to the wrong hash.
-    let (hash, file_data) = hashing::hash_and_read_file(pool, path).await?;
+    let (hash, file_data) = match opened_snapshot {
+        Some(snapshot) => hashing::hash_opened_snapshot(pool, path, snapshot).await?,
+        None => hashing::hash_and_read_file(pool, path).await?,
+    };
     require_expected_sha256(&hash.sha256, expected_sha256)?;
     let mut entries = Vec::new();
     // Accumulates which parts of this verdict a cap made partial. Folded in
