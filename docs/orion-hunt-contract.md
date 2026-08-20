@@ -89,16 +89,30 @@ which avoids a self-deadlock behind a queued writer.
 
 Filesystem discovery is bounded and deterministic. It descends through opened
 directory capabilities rooted at the authorized scope rather than resolving
-ambient pathnames. Symlink/reparse entries are not traversed. Each regular-file
-entry is opened once, without following a final link, and immediately copied
-into a bounded immutable byte snapshot. Hashing, YARA, RELATE, and Orion all
-consume that snapshot; none reopens the candidate pathname.
+ambient pathnames. That original root handle is retained for both discovery
+and execution; it is never reopened by pathname. Symlink/reparse entries are
+not traversed. Discovery retains only bounded relative paths. Each candidate
+is then opened once, without following a final link, and copied into a bounded
+immutable byte snapshot immediately before analysis. Candidates are processed
+sequentially, so the 256 MiB per-file ceiling cannot multiply into a
+1,000-file in-memory retention. Hashing, YARA, RELATE, and Orion all consume
+the one accepted snapshot; none reopens the candidate content pathname.
 
-Root-relative, no-follow metadata checks before and after analysis detect a
-replacement or mutation of the entry while the hunt is live. Failure to prove
-the same regular object remains bound to the entry is returned as inconclusive,
-and the acquired bytes never change to an external target. Bounds or directory
-enumeration uncertainty likewise prevent a complete-scope claim.
+The open handle's device/inode identity, size, and modification time are
+captured, then compared with a root-relative no-follow metadata lookup after
+the snapshot read and before any hash-cache, YARA, or database side effect.
+Failure to prove the same regular object remains bound to the entry is returned
+as inconclusive. Once accepted, the snapshot itself is the evidence object;
+later pathname mutation cannot change its bytes or redirect analysis. Bounds
+or directory-enumeration uncertainty likewise prevent a complete-scope claim.
+
+The selected seed follows the same rule. After initial request authorization,
+it is opened root-relatively through the retained authorized-root capability,
+without following a final link, and converted into one stable immutable
+snapshot. Its expected SHA-256 is verified from those bytes before any hash
+cache, YARA observation, or intelligence-database effect. Seed reconstruction
+then consumes that exact snapshot; neither the original request pathname nor a
+canonicalized ambient pathname is reopened.
 
 ## 6. Result contract
 

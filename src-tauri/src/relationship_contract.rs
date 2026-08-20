@@ -102,21 +102,23 @@ pub(crate) async fn resolve_opened_snapshot_in_intel_snapshot(
 /// raw resolver enforces the pin immediately after its atomic file read and
 /// before YARA observation persistence, then this boundary still performs
 /// the mandatory RELATE normalization and Orion projection.
-pub(crate) async fn resolve_in_intel_snapshot_with_expected_sha256(
+pub(crate) async fn resolve_opened_snapshot_in_intel_snapshot_with_expected_sha256(
     pool: &PgPool,
     bloom: &BloomState,
     yara: &Arc<YaraEngine>,
     yara_coverage: &YaraCoverage,
     observation_scope: &RecentYaraHits,
     path: &Path,
+    snapshot: nsic_core::hashing::FileSnapshot,
     expected_sha256: &str,
 ) -> Result<ResolvedVerdict> {
-    let verdict = raw_verdict::resolve_in_intel_snapshot_with_expected_sha256(
+    let verdict = raw_verdict::resolve_opened_snapshot_in_intel_snapshot_with_expected_sha256(
         pool,
         bloom,
         yara,
         observation_scope,
         path,
+        snapshot,
         expected_sha256,
     )
     .await?;

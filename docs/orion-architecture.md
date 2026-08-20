@@ -200,11 +200,19 @@ defines graph semantics.
 
 One intelligence read guard spans seed reconstruction and every candidate, so
 a feed sync cannot split a hunt across different evidence corpora. Filesystem
-execution descends from an opened authorized-root capability, refuses
-symlink/reparse traversal, and opens each candidate once. Hashing and all
-analysis consume the same bounded immutable bytes. Root-relative no-follow
-stability checks make replacement, mutation, or boundary uncertainty
-inconclusive; candidate content is never reopened by pathname.
+execution descends from one retained authorized-root capability, refuses
+symlink/reparse traversal, and retains only bounded relative paths during
+discovery. Candidates are opened and snapshotted sequentially, bounding
+aggregate memory to one candidate snapshot rather than the complete scope.
+Hashing and all analysis consume the same immutable bytes. Handle identity
+plus a root-relative no-follow stability gate runs before analysis side
+effects, making replacement, mutation, or boundary uncertainty inconclusive;
+candidate content is never reopened by pathname.
+
+The selected seed is acquired through that same retained root capability and
+resolved from one immutable snapshot. Its hash pin is checked before any
+cache, YARA, or database effect, so seed-path replacement cannot redirect the
+hypothesis reconstruction even when external content has the expected bytes.
 
 Initial bounds are 1,000 candidate files, 20,000 walked entries, 100 returned
 findings, and 100 returned errors. Every fired bound and omitted count is

@@ -6,7 +6,7 @@
 //! a bounded non-symlink scope, and classifies only evidence-backed matches.
 
 use anyhow::{bail, Context, Result};
-use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+use cap_fs_ext::{FollowSymlinks, MetadataExt, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use chrono::Utc;
@@ -28,7 +28,8 @@ use crate::relationship_contract::{self, RecentYaraHits};
 use crate::yara_scan::YaraEngine;
 
 struct ScopeWalk {
-    files: Vec<CandidateSnapshot>,
+    root: Dir,
+    files: Vec<CandidatePath>,
     errors: Vec<HuntScanError>,
     files_discovered: usize,
     files_inconclusive: usize,
@@ -36,10 +37,23 @@ struct ScopeWalk {
     omitted_errors: usize,
 }
 
-struct CandidateSnapshot {
+struct CandidatePath {
     display_path: PathBuf,
     relative_path: PathBuf,
-    snapshot: nsic_core::hashing::FileSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObjectIdentity {
+    device: u64,
+    inode: u64,
+}
+
+struct OpenedCandidate {
+    candidate: CandidatePath,
+    file: cap_std::fs::File,
+    identity: ObjectIdentity,
+    size: u64,
+    modified: std::time::SystemTime,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -77,6 +91,10 @@ pub async fn run(
 
     let root_for_walk = canonical_root.clone();
     let seed_for_walk = canonical_seed.clone();
+    let seed_relative = canonical_seed
+        .strip_prefix(&canonical_root)
+        .context("derive root-relative hunt seed")?
+        .to_path_buf();
     let mut walked = tokio::task::spawn_blocking(move || {
         collect_scope_files_bounded(
             &root_for_walk,
@@ -89,25 +107,35 @@ pub async fn run(
     .await
     .context("hunt scope walk task panicked")??;
 
+    // Bind the seed to the same retained authorized-root capability used by
+    // discovery and candidate execution. The ambient request pathname is
+    // never reopened after authorization. The resulting immutable snapshot
+    // can safely outlive later pathname or root-name replacement.
+    let seed_opened = open_candidate(
+        &walked.root,
+        CandidatePath {
+            display_path: canonical_seed.clone(),
+            relative_path: seed_relative,
+        },
+    )
+    .context("open hunt seed through authorized root")?;
+    let seed_snapshot = acquire_stable_snapshot(&walked.root, seed_opened)
+        .context("acquire stable hunt seed snapshot")?;
+
     // One read guard spans seed reconstruction and every candidate. A feed
     // sync cannot make half the hunt use one corpus and half use another.
     // The specialized resolver below deliberately does not reacquire this
     // fair RwLock, avoiding self-deadlock behind a queued writer.
     let _intel_snapshot = intel_gate.read().await;
-    let revalidated_seed = tokio::fs::canonicalize(&requested_seed)
-        .await
-        .with_context(|| format!("revalidate hunt seed {}", requested_seed.display()))?;
-    if revalidated_seed != canonical_seed || !revalidated_seed.starts_with(&canonical_root) {
-        bail!("hunt seed changed after scope discovery; select the file again");
-    }
     let observation_scope = RecentYaraHits::new();
-    let seed = relationship_contract::resolve_in_intel_snapshot_with_expected_sha256(
+    let seed = relationship_contract::resolve_opened_snapshot_in_intel_snapshot_with_expected_sha256(
         pool,
         bloom,
         yara,
         yara_coverage,
         &observation_scope,
-        &requested_seed,
+        &canonical_seed,
+        seed_snapshot,
         &request.expected_seed_sha256,
     )
     .await
@@ -116,26 +144,42 @@ pub async fn run(
 
     let mut findings = Vec::new();
     let mut files_analyzed = 0usize;
-    let scope_root = Dir::open_ambient_dir(&canonical_root, ambient_authority())
-        .with_context(|| format!("open authorized hunt root {}", canonical_root.display()))?;
+    let scope_root = walked.root.try_clone()?;
     let candidates = std::mem::take(&mut walked.files);
     for candidate in candidates {
-        if let Err(error) = candidate_is_still_bound(&scope_root, &candidate) {
-            walked.files_inconclusive += 1;
-            push_error(
-                &mut walked.errors,
-                &mut walked.omitted_errors,
-                DEFAULT_MAX_HUNT_ERRORS,
-                HuntScanError {
-                    path: candidate.display_path.to_string_lossy().to_string(),
-                    error: format!("candidate is inconclusive before analysis: {error}"),
-                },
-            );
-            continue;
-        }
         let candidate_path = candidate.display_path.clone();
-        let expected_size = candidate.snapshot.size_at_open;
-        let expected_modified = candidate.snapshot.modified_at_open;
+        let opened = match open_candidate(&scope_root, candidate) {
+            Ok(opened) => opened,
+            Err(error) => {
+                walked.files_inconclusive += 1;
+                push_error(
+                    &mut walked.errors,
+                    &mut walked.omitted_errors,
+                    DEFAULT_MAX_HUNT_ERRORS,
+                    HuntScanError {
+                        path: candidate_path.to_string_lossy().to_string(),
+                        error: format!("candidate is inconclusive before snapshot: {error}"),
+                    },
+                );
+                continue;
+            }
+        };
+        let snapshot = match acquire_stable_snapshot(&scope_root, opened) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                walked.files_inconclusive += 1;
+                push_error(
+                    &mut walked.errors,
+                    &mut walked.omitted_errors,
+                    DEFAULT_MAX_HUNT_ERRORS,
+                    HuntScanError {
+                        path: candidate_path.to_string_lossy().to_string(),
+                        error: format!("candidate is inconclusive before analysis: {error}"),
+                    },
+                );
+                continue;
+            }
+        };
         match relationship_contract::resolve_opened_snapshot_in_intel_snapshot(
             pool,
             bloom,
@@ -143,29 +187,11 @@ pub async fn run(
             yara_coverage,
             &observation_scope,
             &candidate_path,
-            candidate.snapshot,
+            snapshot,
         )
         .await
         {
             Ok(resolved) => {
-                if let Err(error) = candidate_path_is_still_bound(
-                    &scope_root,
-                    &candidate.relative_path,
-                    expected_size,
-                    expected_modified,
-                ) {
-                    walked.files_inconclusive += 1;
-                    push_error(
-                        &mut walked.errors,
-                        &mut walked.omitted_errors,
-                        DEFAULT_MAX_HUNT_ERRORS,
-                        HuntScanError {
-                            path: candidate_path.to_string_lossy().to_string(),
-                            error: format!("candidate is inconclusive after analysis: {error}"),
-                        },
-                    );
-                    continue;
-                }
                 files_analyzed += 1;
                 let matching: Vec<&TracePath> = resolved
                     .orion_trace
@@ -335,12 +361,35 @@ fn collect_scope_files_bounded(
     let root_handle = Dir::open_ambient_dir(root, ambient_authority())
         .with_context(|| format!("open authorized hunt root {}", root.display()))?;
     let seed_relative = canonical_seed.strip_prefix(root).ok().map(Path::to_path_buf);
-    let mut pending = vec![(root_handle, PathBuf::new())];
+    let mut pending = vec![(root_handle.try_clone()?, PathBuf::new())];
     let mut walk_entries = 0usize;
 
     while let Some((directory, directory_relative)) = pending.pop() {
         let mut entries = match directory.entries() {
-            Ok(entries) => entries.filter_map(std::result::Result::ok).collect::<Vec<_>>(),
+            Ok(entries) => {
+                let mut collected = Vec::new();
+                for entry in entries {
+                    match entry {
+                        Ok(entry) => collected.push(entry),
+                        Err(error) => {
+                            files_inconclusive += 1;
+                            push_error(
+                                &mut errors,
+                                &mut omitted_errors,
+                                max_errors,
+                                HuntScanError {
+                                    path: root
+                                        .join(&directory_relative)
+                                        .to_string_lossy()
+                                        .to_string(),
+                                    error: format!("enumerate authorized directory entry: {error}"),
+                                },
+                            );
+                        }
+                    }
+                }
+                collected
+            }
             Err(error) => {
                 files_inconclusive += 1;
                 push_error(&mut errors, &mut omitted_errors, max_errors, HuntScanError {
@@ -396,34 +445,9 @@ fn collect_scope_files_bounded(
                 scope_truncated = true;
                 break;
             }
-            let mut options = OpenOptions::new();
-            options.read(true).follow(FollowSymlinks::No);
-            let opened = match entry.open_with(&options) {
-                Ok(file) => file.into_std(),
-                Err(error) => {
-                    files_inconclusive += 1;
-                    push_error(&mut errors, &mut omitted_errors, max_errors, HuntScanError {
-                        path: display_path.to_string_lossy().to_string(),
-                        error: format!("open candidate from authorized directory handle: {error}"),
-                    });
-                    continue;
-                }
-            };
-            let snapshot = match crate::hashing::read_opened_snapshot(opened, &display_path) {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    files_inconclusive += 1;
-                    push_error(&mut errors, &mut omitted_errors, max_errors, HuntScanError {
-                        path: display_path.to_string_lossy().to_string(),
-                        error: format!("acquire immutable candidate snapshot: {error}"),
-                    });
-                    continue;
-                }
-            };
-            files.push(CandidateSnapshot {
+            files.push(CandidatePath {
                 display_path,
                 relative_path: relative,
-                snapshot,
             });
         }
         if scope_truncated {
@@ -434,6 +458,7 @@ fn collect_scope_files_bounded(
     }
 
     Ok(ScopeWalk {
+        root: root_handle,
         files,
         errors,
         files_discovered,
@@ -443,32 +468,61 @@ fn collect_scope_files_bounded(
     })
 }
 
-fn candidate_is_still_bound(root: &Dir, candidate: &CandidateSnapshot) -> Result<()> {
-    candidate_path_is_still_bound(
-        root,
-        &candidate.relative_path,
-        candidate.snapshot.size_at_open,
-        candidate.snapshot.modified_at_open,
-    )?;
-    Ok(())
+fn open_candidate(root: &Dir, candidate: CandidatePath) -> Result<OpenedCandidate> {
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let file = root
+        .open_with(&candidate.relative_path, &options)
+        .with_context(|| {
+            format!(
+                "open {} beneath authorized root",
+                candidate.display_path.display()
+            )
+        })?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("fstat {}", candidate.display_path.display()))?;
+    if !metadata.is_file() {
+        bail!("{} is not a regular file", candidate.display_path.display());
+    }
+    Ok(OpenedCandidate {
+        candidate,
+        identity: metadata_identity(&metadata),
+        size: metadata.len(),
+        modified: metadata.modified()?.into_std(),
+        file,
+    })
 }
 
-fn candidate_path_is_still_bound(
+fn acquire_stable_snapshot(
     root: &Dir,
-    relative: &Path,
-    expected_size: u64,
-    expected_modified: std::time::SystemTime,
-) -> Result<()> {
+    opened: OpenedCandidate,
+) -> Result<nsic_core::hashing::FileSnapshot> {
+    let snapshot = crate::hashing::read_opened_snapshot(
+        opened.file.into_std(),
+        &opened.candidate.display_path,
+    )?;
+    if snapshot.size_at_open != opened.size || snapshot.modified_at_open != opened.modified {
+        bail!("opened object mutated before its immutable snapshot was acquired");
+    }
     let metadata = root
-        .symlink_metadata(relative)
+        .symlink_metadata(&opened.candidate.relative_path)
         .context("root-relative no-follow stability check failed")?;
     if !metadata.is_file()
-        || metadata.len() != expected_size
-        || metadata.modified()? != expected_modified
+        || metadata_identity(&metadata) != opened.identity
+        || metadata.len() != opened.size
+        || metadata.modified()?.into_std() != opened.modified
     {
-        bail!("candidate pathname was replaced or the opened object was mutated");
+        bail!("candidate pathname was replaced or mutated during snapshot acquisition");
     }
-    Ok(())
+    Ok(snapshot)
+}
+
+fn metadata_identity(metadata: &cap_std::fs::Metadata) -> ObjectIdentity {
+    ObjectIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
 }
 
 fn push_error(
@@ -540,6 +594,13 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn root_relative_path(root: &Path, path: &Path) -> CandidatePath {
+        CandidatePath {
+            display_path: path.to_path_buf(),
+            relative_path: path.strip_prefix(root).unwrap().to_path_buf(),
+        }
+    }
+
     #[test]
     fn scope_walk_is_bounded_deterministic_and_excludes_seed() {
         let temp = tempfile::tempdir().unwrap();
@@ -589,6 +650,129 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn candidate_access_uses_preserved_root_object_not_replaced_root_path() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("authorized-root");
+        let moved_root = parent.path().join("original-root");
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(&root).unwrap();
+        let seed = root.join("seed.bin");
+        let candidate = root.join("candidate.bin");
+        fs::write(&seed, b"seed").unwrap();
+        fs::write(&candidate, b"authorized-inside").unwrap();
+        fs::write(outside.path().join("candidate.bin"), b"outside").unwrap();
+
+        let canonical_root = root.canonicalize().unwrap();
+        let mut walked =
+            collect_scope_files_bounded(&canonical_root, &seed, 10, 100, 10).unwrap();
+        let candidate_path = walked.files.pop().unwrap();
+        fs::rename(&root, &moved_root).unwrap();
+        symlink(outside.path(), &root).unwrap();
+
+        let opened = open_candidate(&walked.root, candidate_path).unwrap();
+        let snapshot = acquire_stable_snapshot(&walked.root, opened).unwrap();
+        assert_eq!(snapshot.bytes, b"authorized-inside");
+        assert_ne!(snapshot.bytes, fs::read(root.join("candidate.bin")).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_seed_replaced_with_external_symlink_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let seed = root.join("seed.bin");
+        fs::write(&seed, b"authorized-seed").unwrap();
+        fs::write(outside.path(), b"external-seed").unwrap();
+
+        let walked = collect_scope_files_bounded(&root, &seed, 10, 100, 10).unwrap();
+        fs::remove_file(&seed).unwrap();
+        symlink(outside.path(), &seed).unwrap();
+
+        assert!(open_candidate(&walked.root, root_relative_path(&root, &seed)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_seed_with_same_expected_hash_is_still_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let seed = root.join("seed.bin");
+        let expected_bytes = b"same-hash-bytes";
+        let expected_sha256 = nsic_core::hashing::hash_bytes(expected_bytes).sha256;
+        fs::write(&seed, expected_bytes).unwrap();
+        fs::write(outside.path(), expected_bytes).unwrap();
+        assert_eq!(
+            nsic_core::hashing::hash_bytes(&fs::read(outside.path()).unwrap()).sha256,
+            expected_sha256
+        );
+
+        let walked = collect_scope_files_bounded(&root, &seed, 10, 100, 10).unwrap();
+        fs::remove_file(&seed).unwrap();
+        symlink(outside.path(), &seed).unwrap();
+
+        assert!(open_candidate(&walked.root, root_relative_path(&root, &seed)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn intermediate_seed_directory_replaced_with_external_symlink_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let seed_directory = root.join("seed-directory");
+        let seed = seed_directory.join("seed.bin");
+        fs::create_dir(&seed_directory).unwrap();
+        fs::write(&seed, b"authorized-seed").unwrap();
+        fs::write(outside.path().join("seed.bin"), b"external-seed").unwrap();
+
+        let walked = collect_scope_files_bounded(&root, &seed, 10, 100, 10).unwrap();
+        fs::remove_dir_all(&seed_directory).unwrap();
+        symlink(outside.path(), &seed_directory).unwrap();
+
+        assert!(open_candidate(&walked.root, root_relative_path(&root, &seed)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seed_access_uses_preserved_root_object_after_root_path_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("authorized-root");
+        let moved_root = parent.path().join("original-root");
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(&root).unwrap();
+        let seed = root.join("seed.bin");
+        fs::write(&seed, b"authorized-seed").unwrap();
+        fs::write(outside.path().join("seed.bin"), b"external-seed").unwrap();
+
+        let canonical_root = root.canonicalize().unwrap();
+        let walked = collect_scope_files_bounded(&canonical_root, &seed, 10, 100, 10).unwrap();
+        fs::rename(&root, &moved_root).unwrap();
+        symlink(outside.path(), &root).unwrap();
+
+        let opened = open_candidate(
+            &walked.root,
+            root_relative_path(&canonical_root, &seed),
+        )
+        .unwrap();
+        let snapshot = acquire_stable_snapshot(&walked.root, opened).unwrap();
+        assert_eq!(snapshot.bytes, b"authorized-seed");
+        assert_ne!(snapshot.bytes, fs::read(root.join("seed.bin")).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn final_candidate_replaced_with_external_symlink_is_inconclusive_and_external_is_unread() {
         use std::os::unix::fs::symlink;
 
@@ -602,14 +786,12 @@ mod tests {
         fs::write(&candidate, b"authorized-inside").unwrap();
 
         let mut walked = collect_scope_files_bounded(&root, &seed, 10, 100, 10).unwrap();
-        let acquired = walked.files.pop().unwrap();
+        let candidate_path = walked.files.pop().unwrap();
         fs::remove_file(&candidate).unwrap();
         symlink(outside.path(), &candidate).unwrap();
 
-        let root_handle = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
-        assert!(candidate_is_still_bound(&root_handle, &acquired).is_err());
-        assert_eq!(acquired.snapshot.bytes, b"authorized-inside");
-        assert_ne!(acquired.snapshot.bytes, fs::read(outside.path()).unwrap());
+        assert!(open_candidate(&walked.root, candidate_path).is_err());
+        assert_eq!(fs::read(outside.path()).unwrap(), b"OUTSIDE-MUST-NEVER-BE-ANALYZED");
     }
 
     #[cfg(unix)]
@@ -628,13 +810,11 @@ mod tests {
         fs::write(nested.join("candidate.bin"), b"inside").unwrap();
 
         let mut walked = collect_scope_files_bounded(&root, &seed, 10, 100, 10).unwrap();
-        let acquired = walked.files.pop().unwrap();
+        let candidate_path = walked.files.pop().unwrap();
         fs::remove_dir_all(&nested).unwrap();
         symlink(outside.path(), &nested).unwrap();
 
-        let root_handle = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
-        assert!(candidate_is_still_bound(&root_handle, &acquired).is_err());
-        assert_eq!(acquired.snapshot.bytes, b"inside");
+        assert!(open_candidate(&walked.root, candidate_path).is_err());
     }
 
     #[test]
@@ -647,12 +827,34 @@ mod tests {
         fs::write(&candidate, b"before").unwrap();
 
         let mut walked = collect_scope_files_bounded(&root, &seed, 10, 100, 10).unwrap();
-        let acquired = walked.files.pop().unwrap();
+        let candidate_path = walked.files.pop().unwrap();
+        let opened = open_candidate(&walked.root, candidate_path).unwrap();
         fs::write(&candidate, b"mutated-and-longer").unwrap();
 
-        let root_handle = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
-        assert!(candidate_is_still_bound(&root_handle, &acquired).is_err());
-        assert_eq!(acquired.snapshot.bytes, b"before");
+        assert!(acquire_stable_snapshot(&walked.root, opened).is_err());
+    }
+
+    #[test]
+    fn same_size_same_mtime_replacement_is_inconclusive_by_object_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let seed = root.join("seed.bin");
+        let candidate = root.join("candidate.bin");
+        fs::write(&seed, b"seed").unwrap();
+        fs::write(&candidate, b"before").unwrap();
+
+        let mut walked = collect_scope_files_bounded(&root, &seed, 10, 100, 10).unwrap();
+        let candidate_path = walked.files.pop().unwrap();
+        let opened = open_candidate(&walked.root, candidate_path).unwrap();
+        let original_modified = opened.modified;
+        fs::remove_file(&candidate).unwrap();
+        fs::write(&candidate, b"after!").unwrap();
+        std::fs::File::open(&candidate)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(original_modified))
+            .unwrap();
+
+        assert!(acquire_stable_snapshot(&walked.root, opened).is_err());
     }
 
     #[test]
@@ -665,9 +867,9 @@ mod tests {
         fs::write(&candidate, b"stable").unwrap();
 
         let mut walked = collect_scope_files_bounded(&root, &seed, 10, 100, 10).unwrap();
-        let acquired = walked.files.pop().unwrap();
-        let root_handle = Dir::open_ambient_dir(&root, ambient_authority()).unwrap();
-        candidate_is_still_bound(&root_handle, &acquired).unwrap();
-        assert_eq!(acquired.snapshot.bytes, b"stable");
+        let candidate_path = walked.files.pop().unwrap();
+        let opened = open_candidate(&walked.root, candidate_path).unwrap();
+        let snapshot = acquire_stable_snapshot(&walked.root, opened).unwrap();
+        assert_eq!(snapshot.bytes, b"stable");
     }
 }

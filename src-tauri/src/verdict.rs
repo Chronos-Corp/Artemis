@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use std::collections::HashSet;
@@ -140,12 +140,13 @@ pub(super) async fn resolve_opened_snapshot_in_intel_snapshot(
 /// Hash-pinned variant for HUNT's selected seed. The expected digest is
 /// checked immediately after the resolver's single file read, before YARA
 /// scanning or evidence persistence can observe a stale/replaced seed.
-pub(super) async fn resolve_in_intel_snapshot_with_expected_sha256(
+pub(super) async fn resolve_opened_snapshot_in_intel_snapshot_with_expected_sha256(
     pool: &PgPool,
     bloom: &BloomState,
     yara: &Arc<YaraEngine>,
     recent_yara_hits: &RecentYaraHits,
     path: &Path,
+    snapshot: nsic_core::hashing::FileSnapshot,
     expected_sha256: &str,
 ) -> Result<Verdict> {
     resolve_in_intel_snapshot_inner(
@@ -155,7 +156,7 @@ pub(super) async fn resolve_in_intel_snapshot_with_expected_sha256(
         recent_yara_hits,
         path,
         Some(expected_sha256),
-        None,
+        Some(snapshot),
     )
     .await
 }
@@ -174,11 +175,15 @@ async fn resolve_in_intel_snapshot_inner(
     // two separate reads (one to hash, one to scan) can observe different
     // content if the file changes in between, silently binding a YARA hit's
     // persisted edge to the wrong hash.
-    let (hash, file_data) = match opened_snapshot {
-        Some(snapshot) => hashing::hash_opened_snapshot(pool, path, snapshot).await?,
-        None => hashing::hash_and_read_file(pool, path).await?,
+    let (hash, file_data) = match (opened_snapshot, expected_sha256) {
+        (Some(snapshot), Some(expected)) => {
+            hashing::hash_opened_snapshot_with_expected_sha256(pool, path, snapshot, expected)
+                .await?
+        }
+        (Some(snapshot), None) => hashing::hash_opened_snapshot(pool, path, snapshot).await?,
+        (None, Some(_)) => bail!("hash-pinned resolution requires an opened immutable snapshot"),
+        (None, None) => hashing::hash_and_read_file(pool, path).await?,
     };
-    require_expected_sha256(&hash.sha256, expected_sha256)?;
     let mut entries = Vec::new();
     // Accumulates which parts of this verdict a cap made partial. Folded in
     // at each capped lookup rather than inferred at the end: "we returned
@@ -511,17 +516,6 @@ async fn record_yara_hit(
     Ok(())
 }
 
-fn require_expected_sha256(actual: &str, expected: Option<&str>) -> Result<()> {
-    if let Some(expected) = expected {
-        if actual != expected {
-            anyhow::bail!(
-                "hunt seed changed since TRACE: expected SHA-256 {expected}, observed {actual}; select the file again"
-            );
-        }
-    }
-    Ok(())
-}
-
 fn record_exact_hash_truncation(bounds: &mut VerdictBounds, truncated: bool) {
     if truncated {
         bounds.truncated_entry_tiers.push(VerdictTier::ExactHash);
@@ -539,14 +533,6 @@ mod tests {
     use crate::bloom::BloomState;
     use crate::yara_scan::YaraEngine;
     use std::io::Write;
-
-    #[test]
-    fn hash_pin_rejects_changed_seed_before_resolution_continues() {
-        let error = require_expected_sha256("observed", Some("expected")).unwrap_err();
-        assert!(error.to_string().contains("hunt seed changed since TRACE"));
-        assert!(require_expected_sha256("same", Some("same")).is_ok());
-        assert!(require_expected_sha256("anything", None).is_ok());
-    }
 
     /// Guards every test that mutates `feed_sync_state` rows for real
     /// configured sources (`malwarebazaar`, `threatfox`). Rust runs `#[test]`
