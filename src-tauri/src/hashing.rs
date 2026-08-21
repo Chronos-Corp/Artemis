@@ -5,8 +5,7 @@ use std::path::Path;
 
 pub use nsic_core::hashing::{hash_bytes, HashResult};
 use nsic_core::hashing::{
-    read_opened_regular_file_bounded, read_regular_file_bounded, FileSnapshot,
-    MAX_ANALYSIS_BYTES,
+    read_opened_regular_file_bounded, read_regular_file_bounded, FileSnapshot, MAX_ANALYSIS_BYTES,
 };
 
 /// Reads one hostile-filesystem-safe snapshot, then hashes and returns those
@@ -70,14 +69,7 @@ pub async fn hash_opened_snapshot_with_expected_sha256(
     let size = i64::try_from(snapshot.size_at_open)
         .context("opened file size does not fit the desktop cache schema")?;
     let modified: DateTime<Utc> = snapshot.modified_at_open.into();
-    store_cache(
-        pool,
-        &path.to_string_lossy(),
-        size,
-        modified,
-        &result,
-    )
-    .await?;
+    store_cache(pool, &path.to_string_lossy(), size, modified, &result).await?;
     Ok((result, snapshot.bytes))
 }
 

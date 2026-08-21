@@ -11,8 +11,8 @@ use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use chrono::Utc;
 use nsic_core::hunt::{
-    finding_role, same_hunt_concept, select_hypothesis, HuntBounds, HuntEvidenceRole,
-    HuntFinding, HuntRequest, HuntResult, HuntScanError, HuntScope, HuntScopeKind, HuntSummary,
+    finding_role, same_hunt_concept, select_hypothesis, HuntBounds, HuntEvidenceRole, HuntFinding,
+    HuntRequest, HuntResult, HuntScanError, HuntScope, HuntScopeKind, HuntSummary,
     DEFAULT_MAX_HUNT_ERRORS, DEFAULT_MAX_HUNT_FILES, DEFAULT_MAX_HUNT_FINDINGS,
     DEFAULT_MAX_HUNT_WALK_ENTRIES,
 };
@@ -189,18 +189,19 @@ pub async fn run(
     let _intel_snapshot = intel_gate.read().await;
     walked.root.ensure_path_stable()?;
     let observation_scope = RecentYaraHits::new();
-    let seed = relationship_contract::resolve_opened_snapshot_in_intel_snapshot_with_expected_sha256(
-        pool,
-        bloom,
-        yara,
-        yara_coverage,
-        &observation_scope,
-        &authorized_seed,
-        seed_snapshot,
-        &request.expected_seed_sha256,
-    )
-    .await
-    .with_context(|| format!("re-resolve hunt seed {}", requested_seed.display()))?;
+    let seed =
+        relationship_contract::resolve_opened_snapshot_in_intel_snapshot_with_expected_sha256(
+            pool,
+            bloom,
+            yara,
+            yara_coverage,
+            &observation_scope,
+            &authorized_seed,
+            seed_snapshot,
+            &request.expected_seed_sha256,
+        )
+        .await
+        .with_context(|| format!("re-resolve hunt seed {}", requested_seed.display()))?;
     let hypothesis = select_hypothesis(&seed.orion_trace, &request.trace_path_id)?;
 
     let mut findings = Vec::new();
@@ -418,7 +419,10 @@ fn collect_scope_files_bounded(
     }
     let expected_identity = std_metadata_identity(&expected_root);
     let authorized_root = open_authorized_root(root, expected_identity)?;
-    let seed_relative = canonical_seed.strip_prefix(root).ok().map(Path::to_path_buf);
+    let seed_relative = canonical_seed
+        .strip_prefix(root)
+        .ok()
+        .map(Path::to_path_buf);
     let mut pending = vec![(authorized_root.dir.try_clone()?, PathBuf::new())];
     let mut walk_entries = 0usize;
 
@@ -450,10 +454,15 @@ fn collect_scope_files_bounded(
             }
             Err(error) => {
                 files_inconclusive += 1;
-                push_error(&mut errors, &mut omitted_errors, max_errors, HuntScanError {
-                    path: root.join(&directory_relative).to_string_lossy().to_string(),
-                    error: format!("enumerate authorized directory handle: {error}"),
-                });
+                push_error(
+                    &mut errors,
+                    &mut omitted_errors,
+                    max_errors,
+                    HuntScanError {
+                        path: root.join(&directory_relative).to_string_lossy().to_string(),
+                        error: format!("enumerate authorized directory handle: {error}"),
+                    },
+                );
                 continue;
             }
         };
@@ -472,10 +481,15 @@ fn collect_scope_files_bounded(
                 Ok(file_type) => file_type,
                 Err(error) => {
                     files_inconclusive += 1;
-                    push_error(&mut errors, &mut omitted_errors, max_errors, HuntScanError {
-                        path: display_path.to_string_lossy().to_string(),
-                        error: format!("inspect root-relative directory entry: {error}"),
-                    });
+                    push_error(
+                        &mut errors,
+                        &mut omitted_errors,
+                        max_errors,
+                        HuntScanError {
+                            path: display_path.to_string_lossy().to_string(),
+                            error: format!("inspect root-relative directory entry: {error}"),
+                        },
+                    );
                     continue;
                 }
             };
@@ -487,10 +501,15 @@ fn collect_scope_files_bounded(
                     Ok(child) => child_directories.push((child, relative)),
                     Err(error) => {
                         files_inconclusive += 1;
-                        push_error(&mut errors, &mut omitted_errors, max_errors, HuntScanError {
-                            path: display_path.to_string_lossy().to_string(),
-                            error: format!("open child beneath authorized root: {error}"),
-                        });
+                        push_error(
+                            &mut errors,
+                            &mut omitted_errors,
+                            max_errors,
+                            HuntScanError {
+                                path: display_path.to_string_lossy().to_string(),
+                                error: format!("open child beneath authorized root: {error}"),
+                            },
+                        );
                     }
                 }
                 continue;
@@ -553,14 +572,12 @@ fn open_candidate(root: &AuthorizedRoot, candidate: CandidatePath) -> Result<Ope
         // snapshot is acquired. Windows enforces this lease in the kernel.
         options.share_mode(0x0000_0001);
     }
-    let file = parent
-        .open_with(file_name, &options)
-        .with_context(|| {
-            format!(
-                "open {} beneath authorized root",
-                candidate.display_path.display()
-            )
-        })?;
+    let file = parent.open_with(file_name, &options).with_context(|| {
+        format!(
+            "open {} beneath authorized root",
+            candidate.display_path.display()
+        )
+    })?;
     let metadata = file
         .metadata()
         .with_context(|| format!("fstat {}", candidate.display_path.display()))?;
@@ -605,10 +622,7 @@ fn acquire_stable_snapshot(
     if change_identity(&std_file.metadata()?) != opened.change {
         bail!("opened object changed before snapshot acquisition");
     }
-    let snapshot = crate::hashing::read_opened_snapshot(
-        std_file,
-        &opened.candidate.display_path,
-    )?;
+    let snapshot = crate::hashing::read_opened_snapshot(std_file, &opened.candidate.display_path)?;
     if change_identity(&proof_file.metadata()?) != opened.change {
         bail!("opened object mutated while its immutable snapshot was acquired");
     }
@@ -716,9 +730,7 @@ fn candidate_evaluation_is_partial(
             .verdict
             .threat_relationships
             .iter()
-            .any(|relationship| {
-                relationship.kind == target_kind && relationship.target == target
-            })
+            .any(|relationship| relationship.kind == target_kind && relationship.target == target)
         || resolved
             .orion_trace
             .untraced_relationships
@@ -774,7 +786,10 @@ mod tests {
         assert_eq!(names, vec!["a.bin", "b.bin"]);
         assert_eq!(walked.files_discovered, 3);
         assert!(walked.scope_truncated);
-        assert!(!walked.files.iter().any(|candidate| candidate.display_path == seed));
+        assert!(!walked
+            .files
+            .iter()
+            .any(|candidate| candidate.display_path == seed));
     }
 
     #[cfg(unix)]
@@ -812,8 +827,7 @@ mod tests {
         fs::write(outside.path().join("candidate.bin"), b"outside").unwrap();
 
         let canonical_root = root.canonicalize().unwrap();
-        let mut walked =
-            collect_scope_files_bounded(&canonical_root, &seed, 10, 100, 10).unwrap();
+        let mut walked = collect_scope_files_bounded(&canonical_root, &seed, 10, 100, 10).unwrap();
         let candidate_path = walked.files.pop().unwrap();
         fs::rename(&root, &moved_root).unwrap();
         symlink(outside.path(), &root).unwrap();
@@ -947,11 +961,7 @@ mod tests {
         fs::rename(&root, &moved_root).unwrap();
         symlink(outside.path(), &root).unwrap();
 
-        assert!(open_candidate(
-            &walked.root,
-            root_relative_path(&canonical_root, &seed),
-        )
-        .is_err());
+        assert!(open_candidate(&walked.root, root_relative_path(&canonical_root, &seed),).is_err());
         assert_eq!(fs::read(root.join("seed.bin")).unwrap(), b"external-seed");
     }
 
@@ -975,7 +985,10 @@ mod tests {
         symlink(outside.path(), &candidate).unwrap();
 
         assert!(open_candidate(&walked.root, candidate_path).is_err());
-        assert_eq!(fs::read(outside.path()).unwrap(), b"OUTSIDE-MUST-NEVER-BE-ANALYZED");
+        assert_eq!(
+            fs::read(outside.path()).unwrap(),
+            b"OUTSIDE-MUST-NEVER-BE-ANALYZED"
+        );
     }
 
     #[cfg(unix)]

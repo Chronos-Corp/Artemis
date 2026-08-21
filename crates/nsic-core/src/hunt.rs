@@ -127,9 +127,7 @@ pub fn select_hypothesis(
     trace_path_id: &str,
 ) -> Result<HuntHypothesis, HuntSelectionError> {
     let mut matching = trace.paths.iter().filter(|path| path.id == trace_path_id);
-    let selected_path = matching
-        .next()
-        .ok_or(HuntSelectionError::MissingPath)?;
+    let selected_path = matching.next().ok_or(HuntSelectionError::MissingPath)?;
     if matching.next().is_some() {
         return Err(HuntSelectionError::AmbiguousPath);
     }
@@ -209,61 +207,68 @@ mod tests {
     #[test]
     fn exact_selector_returns_authoritative_path() {
         let mut verdict = empty_verdict();
-        verdict.threat_relationships.push(crate::models::ThreatRelationship {
-            kind: RelationshipKind::RiskBased,
-            strength: RelationshipStrength::Weak,
-            target: "seed".to_string(),
-            explanation: "contextual filename match".to_string(),
-            evidence_paths: vec![vec![crate::models::RelationshipEvidence {
-                relation: crate::models::EvidenceRelation::ContextualFilenameMatch,
-                source: "test".to_string(),
-                confidence: 10,
-                first_seen: Utc::now(),
-                last_seen: Utc::now(),
-                report_id: None,
-                report_title: None,
-                report_url: None,
-                indicator_kind: None,
-                indicator_value: None,
-                detection_name: None,
-                rule_fingerprint: None,
-                timing: crate::models::EvidenceTiming::ReceivedOnly,
-            }]],
-            has_more_evidence: false,
-        });
+        verdict
+            .threat_relationships
+            .push(crate::models::ThreatRelationship {
+                kind: RelationshipKind::RiskBased,
+                strength: RelationshipStrength::Weak,
+                target: "seed".to_string(),
+                explanation: "contextual filename match".to_string(),
+                evidence_paths: vec![vec![crate::models::RelationshipEvidence {
+                    relation: crate::models::EvidenceRelation::ContextualFilenameMatch,
+                    source: "test".to_string(),
+                    confidence: 10,
+                    first_seen: Utc::now(),
+                    last_seen: Utc::now(),
+                    report_id: None,
+                    report_title: None,
+                    report_url: None,
+                    indicator_kind: None,
+                    indicator_value: None,
+                    detection_name: None,
+                    rule_fingerprint: None,
+                    timing: crate::models::EvidenceTiming::ReceivedOnly,
+                }]],
+                has_more_evidence: false,
+            });
         let trace = trace_verdict(&verdict);
         let selected = select_hypothesis(&trace, &trace.paths[0].id).unwrap();
 
         assert_eq!(selected.seed_artifact, trace.start);
         assert_eq!(selected.selected_path.id, trace.paths[0].id);
-        assert_eq!(finding_role(&selected.selected_path), HuntEvidenceRole::Contextual);
+        assert_eq!(
+            finding_role(&selected.selected_path),
+            HuntEvidenceRole::Contextual
+        );
     }
 
     #[test]
     fn selector_becomes_stale_when_authoritative_partiality_changes() {
         let mut verdict = empty_verdict();
-        verdict.threat_relationships.push(crate::models::ThreatRelationship {
-            kind: RelationshipKind::RiskBased,
-            strength: RelationshipStrength::Weak,
-            target: "seed".to_string(),
-            explanation: "contextual filename match".to_string(),
-            evidence_paths: vec![vec![crate::models::RelationshipEvidence {
-                relation: crate::models::EvidenceRelation::ContextualFilenameMatch,
-                source: "test".to_string(),
-                confidence: 10,
-                first_seen: Utc::now(),
-                last_seen: Utc::now(),
-                report_id: None,
-                report_title: None,
-                report_url: None,
-                indicator_kind: None,
-                indicator_value: None,
-                detection_name: None,
-                rule_fingerprint: None,
-                timing: crate::models::EvidenceTiming::ReceivedOnly,
-            }]],
-            has_more_evidence: false,
-        });
+        verdict
+            .threat_relationships
+            .push(crate::models::ThreatRelationship {
+                kind: RelationshipKind::RiskBased,
+                strength: RelationshipStrength::Weak,
+                target: "seed".to_string(),
+                explanation: "contextual filename match".to_string(),
+                evidence_paths: vec![vec![crate::models::RelationshipEvidence {
+                    relation: crate::models::EvidenceRelation::ContextualFilenameMatch,
+                    source: "test".to_string(),
+                    confidence: 10,
+                    first_seen: Utc::now(),
+                    last_seen: Utc::now(),
+                    report_id: None,
+                    report_title: None,
+                    report_url: None,
+                    indicator_kind: None,
+                    indicator_value: None,
+                    detection_name: None,
+                    rule_fingerprint: None,
+                    timing: crate::models::EvidenceTiming::ReceivedOnly,
+                }]],
+                has_more_evidence: false,
+            });
         let complete = trace_verdict(&verdict);
         let selected_id = complete.paths[0].id.clone();
 

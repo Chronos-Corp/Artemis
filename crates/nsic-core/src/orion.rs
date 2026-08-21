@@ -498,15 +498,7 @@ fn project_path(
         weakest_source_confidence,
         hop_count: edges.len(),
     };
-    let id = trace_path_id(
-        start,
-        relationship,
-        state,
-        &rank,
-        &nodes,
-        &edges,
-        proof,
-    );
+    let id = trace_path_id(start, relationship, state, &rank, &nodes, &edges, proof);
     Ok(TracePath {
         id,
         relationship_index,
@@ -566,7 +558,9 @@ fn trace_path_id(
         );
         hash_optional_component(
             &mut digest,
-            edge.proof_hop_index.map(|index| index.to_string()).as_deref(),
+            edge.proof_hop_index
+                .map(|index| index.to_string())
+                .as_deref(),
         );
     }
     for hop in proof {
@@ -577,10 +571,7 @@ fn trace_path_id(
             &mut digest,
             hop.report_id.map(|id| id.to_string()).as_deref(),
         );
-        hash_optional_component(
-            &mut digest,
-            hop.indicator_kind.map(indicator_kind_key),
-        );
+        hash_optional_component(&mut digest, hop.indicator_kind.map(indicator_kind_key));
         hash_optional_component(&mut digest, hop.indicator_value.as_deref());
         hash_optional_component(&mut digest, hop.detection_name.as_deref());
         hash_optional_component(&mut digest, hop.rule_fingerprint.as_deref());
