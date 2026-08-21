@@ -145,8 +145,8 @@ mod tests {
 
     #[test]
     fn parses_legacy_timestamp_without_suffix() {
-        let parsed = parse_abusech_time(Some("2026-08-13 15:04:05"))
-            .expect("legacy timestamp should parse");
+        let parsed =
+            parse_abusech_time(Some("2026-08-13 15:04:05")).expect("legacy timestamp should parse");
         assert_eq!(parsed.to_rfc3339(), "2026-08-13T15:04:05+00:00");
     }
 

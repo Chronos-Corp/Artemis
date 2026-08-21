@@ -131,17 +131,19 @@ pub async fn malware_family_matches(
 
     let items = grouped
         .into_iter()
-        .map(|(target, (evidence_paths, has_more_evidence))| ThreatRelationship {
-            kind: RelationshipKind::MalwareFamily,
-            strength: RelationshipStrength::Direct,
-            target,
-            explanation:
-                "This file's hash is attributed to a known malware family -- look for other \
+        .map(
+            |(target, (evidence_paths, has_more_evidence))| ThreatRelationship {
+                kind: RelationshipKind::MalwareFamily,
+                strength: RelationshipStrength::Direct,
+                target,
+                explanation:
+                    "This file's hash is attributed to a known malware family -- look for other \
                  variants, configs, payloads, and family-specific detections."
-                    .to_string(),
-            evidence_paths,
-            has_more_evidence,
-        })
+                        .to_string(),
+                evidence_paths,
+                has_more_evidence,
+            },
+        )
         .collect();
 
     Ok(Bounded { items, truncated })
@@ -278,18 +280,21 @@ pub async fn cve_matches_via_report(
 
     let items = grouped
         .into_iter()
-        .map(|(target, (evidence_paths, has_more_evidence))| ThreatRelationship {
-            kind: RelationshipKind::Cve,
-            strength: RelationshipStrength::Contextual,
-            target,
-            explanation: "This file was observed in one or more reports that also reference this \
+        .map(
+            |(target, (evidence_paths, has_more_evidence))| ThreatRelationship {
+                kind: RelationshipKind::Cve,
+                strength: RelationshipStrength::Contextual,
+                target,
+                explanation:
+                    "This file was observed in one or more reports that also reference this \
                  CVE -- an inferred association through report co-occurrence, not a direct \
                  per-file CVE assertion. Assess exposure and hunt for exploitation evidence \
                  before treating this as confirmed."
-                .to_string(),
-            evidence_paths,
-            has_more_evidence,
-        })
+                        .to_string(),
+                evidence_paths,
+                has_more_evidence,
+            },
+        )
         .collect();
 
     Ok(Bounded { items, truncated })
@@ -397,10 +402,8 @@ pub async fn cve_matches_via_detection(
         .iter()
         .any(|row| row.get::<i64, _>("concept_rank") > MAX_RELATIONSHIP_CONCEPTS);
 
-    let mut grouped: BTreeMap<
-        String,
-        (Vec<Vec<RelationshipEvidence>>, BTreeSet<String>, bool),
-    > = BTreeMap::new();
+    let mut grouped: BTreeMap<String, (Vec<Vec<RelationshipEvidence>>, BTreeSet<String>, bool)> =
+        BTreeMap::new();
     for row in rows {
         let rank: i64 = row.try_get("concept_rank")?;
         if rank > MAX_RELATIONSHIP_CONCEPTS {

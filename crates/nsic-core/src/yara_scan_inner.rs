@@ -69,9 +69,8 @@ impl YaraEngine {
 
         let mut rule_files = Vec::new();
         for entry in WalkDir::new(rules_dir) {
-            let entry = entry.with_context(|| {
-                format!("walking YARA rules directory {}", rules_dir.display())
-            })?;
+            let entry = entry
+                .with_context(|| format!("walking YARA rules directory {}", rules_dir.display()))?;
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -564,7 +563,10 @@ mod tests {
         .unwrap();
 
         let result = YaraEngine::load(dir.path());
-        assert!(result.is_err(), "disabled include directive must fail compilation");
+        assert!(
+            result.is_err(),
+            "disabled include directive must fail compilation"
+        );
     }
 
     #[test]
@@ -698,7 +700,10 @@ mod tests {
         let expected = hex::encode(Sha256::digest(
             std::fs::read(dir.path().join("a_target.yar")).unwrap(),
         ));
-        assert_eq!(engine.rule_fingerprint("TargetRule"), Some(expected.as_str()));
+        assert_eq!(
+            engine.rule_fingerprint("TargetRule"),
+            Some(expected.as_str())
+        );
     }
 
     #[test]
@@ -711,7 +716,10 @@ mod tests {
 
         std::fs::write(&path, "rule Scoped { condition: true }").unwrap();
         let ordinary = YaraEngine::load(dir.path()).unwrap();
-        assert_ne!(ordinary.rule_fingerprint("Scoped"), Some(private_fp.as_str()));
+        assert_ne!(
+            ordinary.rule_fingerprint("Scoped"),
+            Some(private_fp.as_str())
+        );
     }
 
     #[test]
