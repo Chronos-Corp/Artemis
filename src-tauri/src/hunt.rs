@@ -1037,6 +1037,34 @@ mod tests {
         assert!(open_candidate(&walked.root, candidate_path).is_err());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn intermediate_directory_replaced_with_in_scope_junction_is_inconclusive() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let seed = root.join("seed.bin");
+        let nested = root.join("nested");
+        let alternate = root.join("alternate");
+        fs::create_dir(&nested).unwrap();
+        fs::create_dir(&alternate).unwrap();
+        fs::write(&seed, b"seed").unwrap();
+        fs::write(nested.join("candidate.bin"), b"inside").unwrap();
+        fs::write(alternate.join("candidate.bin"), b"different-inside").unwrap();
+
+        let mut walked = collect_scope_files_bounded(&root, &seed, 10, 100, 10).unwrap();
+        let candidate_path = walked.files.pop().unwrap();
+        fs::remove_dir_all(&nested).unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&nested)
+            .arg(&alternate)
+            .status()
+            .unwrap();
+        assert!(status.success(), "create in-scope test junction");
+
+        assert!(open_candidate(&walked.root, candidate_path).is_err());
+    }
+
     #[test]
     fn mutation_between_snapshot_and_analysis_is_inconclusive() {
         let temp = tempfile::tempdir().unwrap();
