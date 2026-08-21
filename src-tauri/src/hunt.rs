@@ -653,10 +653,9 @@ fn metadata_identity(metadata: &cap_std::fs::Metadata) -> ObjectIdentity {
 
 #[cfg(unix)]
 fn std_metadata_identity(metadata: &std::fs::Metadata) -> ObjectIdentity {
-    use std::os::unix::fs::MetadataExt;
     ObjectIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
+        device: std::os::unix::fs::MetadataExt::dev(metadata),
+        inode: std::os::unix::fs::MetadataExt::ino(metadata),
     }
 }
 
