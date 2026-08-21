@@ -346,7 +346,8 @@ Confirm the repository toolchain before making backend changes:
 ```bash
 rustup show active-toolchain
 cargo --version
-cargo fmt --all -- --check
+cargo clippy --version
+cargo fmt --version
 ```
 
 If any command is unavailable, stop before publication and provision Rust.

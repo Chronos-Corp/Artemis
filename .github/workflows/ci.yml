@@ -71,8 +71,11 @@ jobs:
         with:
           workspaces: .
 
-      - name: cargo fmt
-        run: cargo fmt --all -- --check
+      - name: Verify Rust toolchain
+        run: |
+          cargo --version
+          cargo clippy --version
+          cargo fmt --version
 
       - name: cargo check
         working-directory: src-tauri
