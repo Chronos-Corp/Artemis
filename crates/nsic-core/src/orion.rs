@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::models::{
-    EvidenceRelation, EvidenceTiming, IndicatorKind, RelationshipEvidence,
-    RelationshipKind, RelationshipStrength, ThreatRelationship, Verdict,
+    EvidenceRelation, EvidenceTiming, IndicatorKind, RelationshipEvidence, RelationshipKind,
+    RelationshipStrength, ThreatRelationship, Verdict,
 };
 
 /// Orion's independent path budget. RELATE has its own concept and evidence
@@ -203,11 +203,7 @@ fn trace_verdict_bounded(verdict: &Verdict, max_paths: usize) -> OrionTrace {
             // Reject the relationship as a unit rather than silently showing
             // only the paths that happened to project successfully.
             paths.clear();
-            untraced_relationships.push(untraced(
-                relationship_index,
-                relationship,
-                reason,
-            ));
+            untraced_relationships.push(untraced(relationship_index, relationship, reason));
         } else if paths.is_empty() {
             untraced_relationships.push(untraced(
                 relationship_index,
@@ -228,7 +224,10 @@ fn trace_verdict_bounded(verdict: &Verdict, max_paths: usize) -> OrionTrace {
     // but distinct pivots are budgeted independently first.
     let mut relationship_order: Vec<usize> = (0..by_relationship.len()).collect();
     relationship_order.sort_by(|left, right| {
-        match (by_relationship[*left].first(), by_relationship[*right].first()) {
+        match (
+            by_relationship[*left].first(),
+            by_relationship[*right].first(),
+        ) {
             (Some(left_path), Some(right_path)) => compare_paths(left_path, right_path),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
@@ -281,7 +280,10 @@ fn compare_paths(left: &TracePath, right: &TracePath) -> std::cmp::Ordering {
                 .cmp(&left.rank.weakest_source_confidence)
         })
         .then_with(|| left.rank.hop_count.cmp(&right.rank.hop_count))
-        .then_with(|| left.target_kind_sort_key().cmp(&right.target_kind_sort_key()))
+        .then_with(|| {
+            left.target_kind_sort_key()
+                .cmp(&right.target_kind_sort_key())
+        })
         .then_with(|| left.target.cmp(&right.target))
         .then_with(|| left.relationship_index.cmp(&right.relationship_index))
 }
@@ -386,7 +388,12 @@ fn project_path(
             }
             let cve = concept_node(TraceNodeKind::Cve, "cve", &relationship.target);
             (
-                vec![start.clone(), indicator.clone(), report.clone(), cve.clone()],
+                vec![
+                    start.clone(),
+                    indicator.clone(),
+                    report.clone(),
+                    cve.clone(),
+                ],
                 vec![
                     synthetic_edge(start, &indicator, TraceEdgeRelation::ArtifactHasIndicator),
                     proof_edge(
@@ -416,7 +423,12 @@ fn project_path(
             validate_detection_coverage_endpoint(&proof[0], &proof[1])?;
             let cve = concept_node(TraceNodeKind::Cve, "cve", &relationship.target);
             (
-                vec![start.clone(), indicator.clone(), detection.clone(), cve.clone()],
+                vec![
+                    start.clone(),
+                    indicator.clone(),
+                    detection.clone(),
+                    cve.clone(),
+                ],
                 vec![
                     synthetic_edge(start, &indicator, TraceEdgeRelation::ArtifactHasIndicator),
                     proof_edge(
@@ -437,10 +449,7 @@ fn project_path(
                 TracePathState::Observed,
             )
         }
-        (
-            RelationshipKind::MalwareFamily,
-            [EvidenceRelation::AttributedToMalwareFamily],
-        ) => {
+        (RelationshipKind::MalwareFamily, [EvidenceRelation::AttributedToMalwareFamily]) => {
             let indicator = indicator_from_evidence(&proof[0])?;
             let family = concept_node(
                 TraceNodeKind::MalwareFamily,
@@ -463,11 +472,7 @@ fn project_path(
             )
         }
         (RelationshipKind::RiskBased, [EvidenceRelation::ContextualFilenameMatch]) => {
-            let risk = concept_node(
-                TraceNodeKind::RiskConcept,
-                "risk",
-                &relationship.target,
-            );
+            let risk = concept_node(TraceNodeKind::RiskConcept, "risk", &relationship.target);
             (
                 vec![start.clone(), risk.clone()],
                 vec![proof_edge(
@@ -692,9 +697,7 @@ fn artifact_node(sha256: &str, path: &str) -> TraceNode {
     }
 }
 
-fn indicator_from_evidence(
-    evidence: &RelationshipEvidence,
-) -> Result<TraceNode, UntracedReason> {
+fn indicator_from_evidence(evidence: &RelationshipEvidence) -> Result<TraceNode, UntracedReason> {
     let kind = evidence
         .indicator_kind
         .ok_or(UntracedReason::MissingNodeIdentity)?;
@@ -724,9 +727,7 @@ fn report_from_evidence(evidence: &RelationshipEvidence) -> Result<TraceNode, Un
     })
 }
 
-fn detection_from_evidence(
-    evidence: &RelationshipEvidence,
-) -> Result<TraceNode, UntracedReason> {
+fn detection_from_evidence(evidence: &RelationshipEvidence) -> Result<TraceNode, UntracedReason> {
     let name = evidence
         .detection_name
         .as_deref()
@@ -928,7 +929,10 @@ mod tests {
         assert_eq!(path.nodes[1].kind, TraceNodeKind::Indicator);
         assert_eq!(path.nodes[2].kind, TraceNodeKind::Report);
         assert_eq!(path.nodes[3].kind, TraceNodeKind::Cve);
-        assert_eq!(path.edges[1].assertion_orientation, AssertionOrientation::Native);
+        assert_eq!(
+            path.edges[1].assertion_orientation,
+            AssertionOrientation::Native
+        );
         assert_eq!(path.edges[2].proof_hop_index, Some(1));
         assert_eq!(path.supporting_proof.len(), 2);
     }
@@ -1063,9 +1067,18 @@ mod tests {
 
         let path = &trace.paths[0];
         assert_eq!(path.nodes[2].kind, TraceNodeKind::Detection);
-        assert_eq!(path.edges[1].relation, TraceEdgeRelation::IndicatorMatchedByDetection);
-        assert_eq!(path.edges[1].assertion_orientation, AssertionOrientation::Reversed);
-        assert_eq!(path.edges[2].assertion_orientation, AssertionOrientation::Native);
+        assert_eq!(
+            path.edges[1].relation,
+            TraceEdgeRelation::IndicatorMatchedByDetection
+        );
+        assert_eq!(
+            path.edges[1].assertion_orientation,
+            AssertionOrientation::Reversed
+        );
+        assert_eq!(
+            path.edges[2].assertion_orientation,
+            AssertionOrientation::Native
+        );
     }
 
     #[test]
@@ -1118,7 +1131,10 @@ mod tests {
         )]));
 
         assert_eq!(trace.paths[0].state, TracePathState::Possible);
-        assert_eq!(trace.paths[0].edges[0].assertion_orientation, AssertionOrientation::Synthetic);
+        assert_eq!(
+            trace.paths[0].edges[0].assertion_orientation,
+            AssertionOrientation::Synthetic
+        );
     }
 
     #[test]
@@ -1157,7 +1173,10 @@ mod tests {
             .iter()
             .find(|path| path.target_kind == RelationshipKind::Detection)
             .unwrap();
-        assert_eq!(detection.nodes.last().unwrap().kind, TraceNodeKind::Detection);
+        assert_eq!(
+            detection.nodes.last().unwrap().kind,
+            TraceNodeKind::Detection
+        );
         assert_eq!(
             detection.edges.last().unwrap().assertion_orientation,
             AssertionOrientation::Reversed
@@ -1168,7 +1187,10 @@ mod tests {
             .iter()
             .find(|path| path.target_kind == RelationshipKind::MalwareFamily)
             .unwrap();
-        assert_eq!(family.nodes.last().unwrap().kind, TraceNodeKind::MalwareFamily);
+        assert_eq!(
+            family.nodes.last().unwrap().kind,
+            TraceNodeKind::MalwareFamily
+        );
         assert_eq!(
             family.edges.last().unwrap().assertion_orientation,
             AssertionOrientation::Native
@@ -1186,7 +1208,9 @@ mod tests {
                 EvidenceRelation::ReportReferencesCve,
             ],
         );
-        malformed.evidence_paths.push(vec![hop(EvidenceRelation::DetectsIndicator)]);
+        malformed
+            .evidence_paths
+            .push(vec![hop(EvidenceRelation::DetectsIndicator)]);
 
         let trace = trace_verdict(&verdict(vec![malformed]));
         assert!(trace.paths.is_empty());
@@ -1232,9 +1256,10 @@ mod tests {
         let trace = trace_verdict(&verdict(vec![ioc, detection]));
         assert!(trace.paths.is_empty());
         assert_eq!(trace.untraced_relationships.len(), 2);
-        assert!(trace.untraced_relationships.iter().all(|untraced| {
-            untraced.reason == UntracedReason::InconsistentProofEndpoints
-        }));
+        assert!(trace
+            .untraced_relationships
+            .iter()
+            .all(|untraced| { untraced.reason == UntracedReason::InconsistentProofEndpoints }));
     }
 
     #[test]
@@ -1301,7 +1326,9 @@ mod tests {
             "abc123",
             &[EvidenceRelation::ObservedInReport],
         );
-        noisy.evidence_paths.push(vec![hop(EvidenceRelation::ObservedInReport)]);
+        noisy
+            .evidence_paths
+            .push(vec![hop(EvidenceRelation::ObservedInReport)]);
         let second = relationship(
             RelationshipKind::RiskBased,
             RelationshipStrength::Weak,
@@ -1355,9 +1382,15 @@ mod tests {
         direct.evidence_paths[0][0].confidence = 20;
 
         let trace = trace_verdict(&verdict(vec![weak, direct]));
-        assert_eq!(trace.paths[0].rank.relationship_strength, RelationshipStrength::Direct);
+        assert_eq!(
+            trace.paths[0].rank.relationship_strength,
+            RelationshipStrength::Direct
+        );
         assert_eq!(trace.paths[0].rank.weakest_source_confidence, 20);
-        assert_eq!(trace.paths[1].rank.relationship_strength, RelationshipStrength::Weak);
+        assert_eq!(
+            trace.paths[1].rank.relationship_strength,
+            RelationshipStrength::Weak
+        );
         assert_eq!(trace.paths[1].rank.weakest_source_confidence, 80);
     }
 }

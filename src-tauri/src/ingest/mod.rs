@@ -38,7 +38,7 @@ const FEED_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 ///
 /// `Response::json()` materializes the entire body in memory before
 /// deserializing, and the body length is chosen by the remote feed, not by
-/// Apollo -- so an unexpectedly (or maliciously) large response is an
+/// Artemis -- so an unexpectedly (or maliciously) large response is an
 /// availability problem on the analyst's workstation. Enforced while
 /// streaming, so an oversized body is abandoned partway rather than fully
 /// buffered and then rejected.
@@ -106,7 +106,7 @@ pub(crate) fn parse_abusech_time(s: Option<&str>) -> Option<DateTime<Utc>> {
 }
 
 /// The configured feed set -- the source of truth for "which feeds does
-/// Apollo know about," independent of `feed_sync_state`, which only gains
+/// Artemis know about," independent of `feed_sync_state`, which only gains
 /// a row for a source once it has completed at least one successful sync
 /// (see `db::indicators::set_sync_cursor`). A feed that has never
 /// succeeded has no row there at all, so anything reading feed coverage
@@ -145,8 +145,8 @@ mod tests {
 
     #[test]
     fn parses_legacy_timestamp_without_suffix() {
-        let parsed = parse_abusech_time(Some("2026-08-13 15:04:05"))
-            .expect("legacy timestamp should parse");
+        let parsed =
+            parse_abusech_time(Some("2026-08-13 15:04:05")).expect("legacy timestamp should parse");
         assert_eq!(parsed.to_rfc3339(), "2026-08-13T15:04:05+00:00");
     }
 

@@ -64,15 +64,8 @@ pub async fn resolve(
     path: &Path,
 ) -> Result<ResolvedVerdict> {
     let observation_scope = RecentYaraHits::new();
-    let verdict = raw_verdict::resolve(
-        pool,
-        bloom,
-        intel_gate,
-        yara,
-        &observation_scope,
-        path,
-    )
-    .await?;
+    let verdict =
+        raw_verdict::resolve(pool, bloom, intel_gate, yara, &observation_scope, path).await?;
 
     Ok(finalize_resolved(verdict, yara_coverage))
 }
@@ -102,6 +95,7 @@ pub(crate) async fn resolve_opened_snapshot_in_intel_snapshot(
 /// raw resolver enforces the pin immediately after its atomic file read and
 /// before YARA observation persistence, then this boundary still performs
 /// the mandatory RELATE normalization and Orion projection.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_opened_snapshot_in_intel_snapshot_with_expected_sha256(
     pool: &PgPool,
     bloom: &BloomState,
@@ -199,9 +193,7 @@ fn is_contextual_filename_relationship(relationship: &ThreatRelationship) -> boo
         && proof_shape(relationship) == Some(vec![EvidenceRelation::ContextualFilenameMatch])
 }
 
-pub fn coalesce_relationships(
-    relationships: Vec<ThreatRelationship>,
-) -> Vec<ThreatRelationship> {
+pub fn coalesce_relationships(relationships: Vec<ThreatRelationship>) -> Vec<ThreatRelationship> {
     let evidence_limit = MAX_EVIDENCE_PER_RELATIONSHIP.max(0) as usize;
     let mut normalized: Vec<ThreatRelationship> = Vec::new();
 
@@ -526,7 +518,10 @@ mod tests {
 
         let finalized = finalize_verdict(verdict);
         assert_eq!(finalized.threat_relationships.len(), 1);
-        assert_eq!(finalized.threat_relationships[0].evidence_paths.len(), limit);
+        assert_eq!(
+            finalized.threat_relationships[0].evidence_paths.len(),
+            limit
+        );
         assert!(
             finalized.threat_relationships[0].has_more_evidence,
             "row 21 is known to exist from VerdictBounds, so the coalesced contextual relationship must not claim exhaustive evidence"
@@ -553,7 +548,10 @@ mod tests {
         let finalized = finalize_verdict(verdict);
         assert_eq!(finalized.threat_relationships.len(), 1);
         assert_eq!(finalized.threat_relationships[0].target, "foo.exe");
-        assert_eq!(finalized.threat_relationships[0].evidence_paths.len(), limit);
+        assert_eq!(
+            finalized.threat_relationships[0].evidence_paths.len(),
+            limit
+        );
         assert!(finalized.threat_relationships[0].has_more_evidence);
         assert!(!finalized.bounds.relationships_truncated);
     }
@@ -586,7 +584,12 @@ mod tests {
         );
 
         assert_eq!(resolved.verdict.threat_relationships.len(), 1);
-        assert_eq!(resolved.verdict.threat_relationships[0].evidence_paths.len(), 2);
+        assert_eq!(
+            resolved.verdict.threat_relationships[0]
+                .evidence_paths
+                .len(),
+            2
+        );
         assert_eq!(resolved.yara_coverage, coverage);
         // This deliberately incomplete CVE proof shape is normalized by
         // RELATE but not safe to direct. Orion travels with the same result

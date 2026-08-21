@@ -90,17 +90,23 @@ which avoids a self-deadlock behind a queued writer.
 Filesystem discovery is bounded and deterministic. It descends through opened
 directory capabilities rooted at the authorized scope rather than resolving
 ambient pathnames. That original root handle is retained for both discovery
-and execution; it is never reopened by pathname. Symlink/reparse entries are
-not traversed. Discovery retains only bounded relative paths. Each candidate
+and execution. Its pathname-to-object binding is revalidated before analysis
+effects; replacement makes the hunt inconclusive. Symlink/reparse entries are
+not traversed, and every intermediate candidate component is opened with
+no-follow semantics. Discovery retains only bounded relative paths. Each candidate
 is then opened once, without following a final link, and copied into a bounded
 immutable byte snapshot immediately before analysis. Candidates are processed
 sequentially, so the 256 MiB per-file ceiling cannot multiply into a
-1,000-file in-memory retention. Hashing, YARA, RELATE, and Orion all consume
+1,000-file in-memory retention. File open/read/stability work runs on Tokio's
+blocking pool rather than the asynchronous HUNT worker. Hashing, YARA, RELATE, and Orion all consume
 the one accepted snapshot; none reopens the candidate content pathname.
 
-The open handle's device/inode identity, size, and modification time are
+The open handle's device/inode identity, size, modification time, and, where
+the platform exposes it, change identity are
 captured, then compared with a root-relative no-follow metadata lookup after
 the snapshot read and before any hash-cache, YARA, or database side effect.
+On Windows the opened file also denies write and delete sharing until snapshot
+acquisition and stability validation complete.
 Failure to prove the same regular object remains bound to the entry is returned
 as inconclusive. Once accepted, the snapshot itself is the evidence object;
 later pathname mutation cannot change its bytes or redirect analysis. Bounds

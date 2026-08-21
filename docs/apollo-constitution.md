@@ -2,6 +2,8 @@
 
 *Product Constitution · Apollo / 4NSIC · Rev. 0.1 · 16 August 2026*
 
+> **RETIRED — Superseded by [Artemis Product Constitution v0.3](artemis-product-constitution.md).** This document is retained as implementation history, not living product doctrine. Section numbers below are unchanged from Rev. 0.1 and remain valid for existing citations into this file, but they no longer correspond to the current constitution's numbering — do not use this document, or its section numbers, as current authority. See `artemis-product-constitution.md` for the governing product identity, and `docs/chronos-constitution.md` (or its own successor, Chronos Strategic Constitution v0.3, not yet landed in this repository) for company-level doctrine.
+
 > *Start with a file. Follow the evidence. Hunt outward.*
 
 **Relationship to the Chronos Constitution.** The Chronos Corp Strategic Constitution (`docs/chronos-constitution.md`) defines why the company exists and the principles every product must obey. This document applies those principles to Apollo. It defines what Apollo is, which user problem it owns, what must remain true as the product grows, and which strategic questions are still open.

@@ -35,7 +35,7 @@ pub struct BoundedYaraMatches {
 /// dimension, fingerprints the exact bytes handed to libyara, and disables
 /// YARA `include` handling on the compiler before any source is added. The
 /// latter is important: include resolution would otherwise let libyara
-/// perform an implicit second filesystem traversal outside Apollo's file,
+/// perform an implicit second filesystem traversal outside Artemis's file,
 /// byte, opened-handle, and fingerprint controls.
 pub struct YaraEngine {
     rules: Option<yara::Rules>,
@@ -69,9 +69,8 @@ impl YaraEngine {
 
         let mut rule_files = Vec::new();
         for entry in WalkDir::new(rules_dir) {
-            let entry = entry.with_context(|| {
-                format!("walking YARA rules directory {}", rules_dir.display())
-            })?;
+            let entry = entry
+                .with_context(|| format!("walking YARA rules directory {}", rules_dir.display()))?;
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -97,7 +96,7 @@ impl YaraEngine {
         let mut compiler = yara::Compiler::new().context("initializing YARA compiler")?;
         // yara 0.29 exposes this exact control. It installs no include
         // callback on the underlying libyara compiler, so an `include`
-        // directive cannot cause a filesystem read behind Apollo's back.
+        // directive cannot cause a filesystem read behind Artemis's back.
         // This happens before the first add_rules_str and therefore protects
         // the exact source bytes actually compiled, with no check/use gap.
         compiler.disable_include_directive();
@@ -564,7 +563,10 @@ mod tests {
         .unwrap();
 
         let result = YaraEngine::load(dir.path());
-        assert!(result.is_err(), "disabled include directive must fail compilation");
+        assert!(
+            result.is_err(),
+            "disabled include directive must fail compilation"
+        );
     }
 
     #[test]
@@ -698,7 +700,10 @@ mod tests {
         let expected = hex::encode(Sha256::digest(
             std::fs::read(dir.path().join("a_target.yar")).unwrap(),
         ));
-        assert_eq!(engine.rule_fingerprint("TargetRule"), Some(expected.as_str()));
+        assert_eq!(
+            engine.rule_fingerprint("TargetRule"),
+            Some(expected.as_str())
+        );
     }
 
     #[test]
@@ -711,12 +716,15 @@ mod tests {
 
         std::fs::write(&path, "rule Scoped { condition: true }").unwrap();
         let ordinary = YaraEngine::load(dir.path()).unwrap();
-        assert_ne!(ordinary.rule_fingerprint("Scoped"), Some(private_fp.as_str()));
+        assert_ne!(
+            ordinary.rule_fingerprint("Scoped"),
+            Some(private_fp.as_str())
+        );
     }
 
     #[test]
     fn missing_rules_dir_is_empty_not_error() {
-        let engine = YaraEngine::load(Path::new("/nonexistent/apollo-yara-test")).unwrap();
+        let engine = YaraEngine::load(Path::new("/nonexistent/artemis-yara-test")).unwrap();
         assert_eq!(engine.rule_count, 0);
     }
 }

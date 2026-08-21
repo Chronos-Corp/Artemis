@@ -272,9 +272,10 @@ async fn resolve_in_intel_snapshot_inner(
     // The YARA engine separately bounds the active ruleset itself, so this
     // verdict cap is not merely applied after unbounded work has happened.
     let yara_for_scan = Arc::clone(yara);
-    let yara_scan = tokio::task::spawn_blocking(move || yara_for_scan.scan_bytes_bounded(&file_data))
-        .await
-        .context("yara scan task panicked")??;
+    let yara_scan =
+        tokio::task::spawn_blocking(move || yara_for_scan.scan_bytes_bounded(&file_data))
+            .await
+            .context("yara scan task panicked")??;
     let yara_truncated = yara_scan.truncated;
     let yara_hits = yara_scan.matches;
     if yara_truncated {
@@ -415,12 +416,9 @@ async fn resolve_in_intel_snapshot_inner(
             .iter()
             .map(|entry| entry.matched_value.clone())
             .collect();
-        bounds.relationships_truncated |= bounded_relationships::path_relationships_incomplete(
-            pool,
-            &path_str,
-            &visible_targets,
-        )
-        .await?;
+        bounds.relationships_truncated |=
+            bounded_relationships::path_relationships_incomplete(pool, &path_str, &visible_targets)
+                .await?;
     }
     entries.extend(path_matches.items);
 
@@ -446,8 +444,8 @@ async fn resolve_in_intel_snapshot_inner(
     // freshness context either way.
     let intel_freshness = db::all_sync_states(pool).await?;
 
-    // The RELATE-stage structured relationship view (Apollo Constitution
-    // §6): most kinds are pure-derived from the provenance entries already
+    // The RELATE-stage structured relationship view (Artemis Product
+    // Constitution §7): most kinds are pure-derived from the provenance entries already
     // gathered above, but malware-family attribution and CVE relationships
     // each have their own edge tables with their own provenance (populated
     // by ingestion, not derivable from provenance entries alone) so they
@@ -1083,17 +1081,26 @@ mod tests {
         assert_eq!(via_report.evidence_paths.len(), 1);
         let path = &via_report.evidence_paths[0];
         assert_eq!(path.len(), 2);
-        assert_eq!(path[0].relation, crate::models::EvidenceRelation::ObservedInReport);
+        assert_eq!(
+            path[0].relation,
+            crate::models::EvidenceRelation::ObservedInReport
+        );
         assert_eq!(path[0].source, "parent-edge-source");
         assert_eq!(path[0].confidence, 20);
         assert_eq!(path[0].first_seen, parent_first_seen);
         assert_eq!(path[0].last_seen, parent_last_seen);
-        assert_eq!(path[1].relation, crate::models::EvidenceRelation::ReportReferencesCve);
+        assert_eq!(
+            path[1].relation,
+            crate::models::EvidenceRelation::ReportReferencesCve
+        );
         assert_eq!(path[1].source, "cve-edge-source");
         assert_eq!(path[1].confidence, 77);
         assert_eq!(path[1].first_seen, cve_first_seen);
         assert_eq!(path[1].last_seen, cve_last_seen);
-        assert_eq!(via_report.strength, crate::models::RelationshipStrength::Contextual);
+        assert_eq!(
+            via_report.strength,
+            crate::models::RelationshipStrength::Contextual
+        );
 
         let exact_hash_entry = verdict_report
             .entries
@@ -1158,19 +1165,33 @@ mod tests {
             .unwrap();
         let path = &via_detection.evidence_paths[0];
         assert_eq!(path.len(), 2);
-        assert_eq!(path[0].relation, crate::models::EvidenceRelation::DetectsIndicator);
+        assert_eq!(
+            path[0].relation,
+            crate::models::EvidenceRelation::DetectsIndicator
+        );
         assert_eq!(path[0].source, "local:yara_scan");
         assert_eq!(path[0].confidence, 65);
         assert_eq!(path[0].indicator_kind, Some(IndicatorKind::Sha256));
-        assert_eq!(path[0].indicator_value, Some(verdict_detection.sha256.clone()));
-        assert_eq!(path[1].relation, crate::models::EvidenceRelation::DetectionCoversCve);
+        assert_eq!(
+            path[0].indicator_value,
+            Some(verdict_detection.sha256.clone())
+        );
+        assert_eq!(
+            path[1].relation,
+            crate::models::EvidenceRelation::DetectionCoversCve
+        );
         assert_eq!(path[1].source, "covers-edge-source");
         assert_eq!(path[1].confidence, 88);
         assert_eq!(path[1].first_seen, cve_first_seen);
         assert_eq!(path[1].last_seen, cve_last_seen);
         assert_eq!(path[1].rule_fingerprint, None);
-        assert_eq!(via_detection.strength, crate::models::RelationshipStrength::Strong);
-        assert!(via_detection.explanation.contains("Example_EICAR_Test_File"));
+        assert_eq!(
+            via_detection.strength,
+            crate::models::RelationshipStrength::Strong
+        );
+        assert!(via_detection
+            .explanation
+            .contains("Example_EICAR_Test_File"));
     }
 
     #[tokio::test]
@@ -1234,12 +1255,10 @@ mod tests {
         .await
         .expect("resolve verdict");
 
-        assert!(
-            verdict
-                .threat_relationships
-                .iter()
-                .any(|r| r.kind == crate::models::RelationshipKind::Cve && r.target == cve_id)
-        );
+        assert!(verdict
+            .threat_relationships
+            .iter()
+            .any(|r| r.kind == crate::models::RelationshipKind::Cve && r.target == cve_id));
     }
 
     #[tokio::test]
@@ -1351,8 +1370,14 @@ mod tests {
         assert_eq!(matches[0].evidence_paths.len(), 2);
         for path in &matches[0].evidence_paths {
             assert_eq!(path.len(), 2);
-            assert_eq!(path[0].relation, crate::models::EvidenceRelation::ObservedInReport);
-            assert_eq!(path[1].relation, crate::models::EvidenceRelation::ReportReferencesCve);
+            assert_eq!(
+                path[0].relation,
+                crate::models::EvidenceRelation::ObservedInReport
+            );
+            assert_eq!(
+                path[1].relation,
+                crate::models::EvidenceRelation::ReportReferencesCve
+            );
         }
         let observed_values: Vec<Option<String>> = matches[0]
             .evidence_paths
@@ -1588,12 +1613,20 @@ mod tests {
             let recent_yara_hits = RecentYaraHits::new();
 
             let mut tmp = tempfile::NamedTempFile::new().expect("create temp file");
-            tmp.write_all(b"irrelevant content, still not eicar").unwrap();
+            tmp.write_all(b"irrelevant content, still not eicar")
+                .unwrap();
             tmp.flush().unwrap();
 
-            let verdict = resolve(&body_pool, &bloom, &intel_gate, &yara, &recent_yara_hits, tmp.path())
-                .await
-                .expect("resolve verdict");
+            let verdict = resolve(
+                &body_pool,
+                &bloom,
+                &intel_gate,
+                &yara,
+                &recent_yara_hits,
+                tmp.path(),
+            )
+            .await
+            .expect("resolve verdict");
 
             let malwarebazaar = verdict
                 .intel_freshness
@@ -1800,12 +1833,10 @@ mod tests {
         .await
         .expect("resolve verdict");
 
-        assert!(
-            !verdict
-                .threat_relationships
-                .iter()
-                .any(|r| r.kind == crate::models::RelationshipKind::Cve && r.target == cve_id)
-        );
+        assert!(!verdict
+            .threat_relationships
+            .iter()
+            .any(|r| r.kind == crate::models::RelationshipKind::Cve && r.target == cve_id));
     }
 
     #[tokio::test]
@@ -1878,12 +1909,10 @@ mod tests {
         )
         .await
         .expect("path pattern lookup");
-        assert!(
-            genuinely_matching
-                .items
-                .iter()
-                .any(|e| e.matched_value == literal_value)
-        );
+        assert!(genuinely_matching
+            .items
+            .iter()
+            .any(|e| e.matched_value == literal_value));
     }
 
     /// Round 9: a row-level path cap can hide a different path indicator
@@ -1911,7 +1940,8 @@ mod tests {
 
         let marker = uuid::Uuid::new_v4();
         let mut tmp = tempfile::NamedTempFile::new().expect("create temp file");
-        tmp.write_all(format!("path-bound-{marker}").as_bytes()).unwrap();
+        tmp.write_all(format!("path-bound-{marker}").as_bytes())
+            .unwrap();
         tmp.flush().unwrap();
         let path_text = tmp.path().to_string_lossy().to_string();
         let noisy_pattern = "/";
@@ -1923,20 +1953,14 @@ mod tests {
             .to_string();
         assert!(path_text.contains(noisy_pattern) && path_text.contains(&hidden_pattern));
 
-        let (noisy_id, _) = crate::db::indicators::upsert_indicator(
-            &pool,
-            IndicatorKind::Path,
-            noisy_pattern,
-        )
-        .await
-        .expect("seed noisy path indicator");
-        let (hidden_id, _) = crate::db::indicators::upsert_indicator(
-            &pool,
-            IndicatorKind::Path,
-            &hidden_pattern,
-        )
-        .await
-        .expect("seed hidden path indicator");
+        let (noisy_id, _) =
+            crate::db::indicators::upsert_indicator(&pool, IndicatorKind::Path, noisy_pattern)
+                .await
+                .expect("seed noisy path indicator");
+        let (hidden_id, _) =
+            crate::db::indicators::upsert_indicator(&pool, IndicatorKind::Path, &hidden_pattern)
+                .await
+                .expect("seed hidden path indicator");
 
         let now = Utc::now();
         for n in 0..=crate::db::indicators::MAX_VERDICT_ROWS {
@@ -1999,12 +2023,10 @@ mod tests {
         .await
         .expect("resolve path-bound verdict");
 
-        assert!(
-            verdict
-                .bounds
-                .truncated_entry_tiers
-                .contains(&VerdictTier::PathPattern)
-        );
+        assert!(verdict
+            .bounds
+            .truncated_entry_tiers
+            .contains(&VerdictTier::PathPattern));
         assert!(
             verdict.bounds.relationships_truncated,
             "the omitted path target means the RELATE pivot set is incomplete"
@@ -2083,26 +2105,20 @@ mod tests {
         .await
         .expect("resolve verdict");
 
-        assert!(
-            verdict
-                .entries
-                .iter()
-                .any(|e| e.tier == VerdictTier::YaraHit
-                    && e.detection_name.as_deref() == Some("Example_EICAR_Test_File"))
-        );
-        assert!(
-            !verdict
-                .entries
-                .iter()
-                .any(|e| e.detection_name.as_deref() == Some(stale_rule_name.as_str()))
-        );
-        assert!(
-            !verdict
-                .threat_relationships
-                .iter()
-                .any(|r| r.kind == crate::models::RelationshipKind::Detection
-                    && r.target == stale_rule_name)
-        );
+        assert!(verdict
+            .entries
+            .iter()
+            .any(|e| e.tier == VerdictTier::YaraHit
+                && e.detection_name.as_deref() == Some("Example_EICAR_Test_File")));
+        assert!(!verdict
+            .entries
+            .iter()
+            .any(|e| e.detection_name.as_deref() == Some(stale_rule_name.as_str())));
+        assert!(!verdict
+            .threat_relationships
+            .iter()
+            .any(|r| r.kind == crate::models::RelationshipKind::Detection
+                && r.target == stale_rule_name));
     }
 
     #[tokio::test]
@@ -2191,14 +2207,15 @@ mod tests {
         .await
         .expect("resolve verdict");
 
-        assert!(verdict.entries.iter().any(|e| e.tier == VerdictTier::ExactHash));
-        assert!(
-            verdict
-                .threat_relationships
-                .iter()
-                .any(|r| r.kind == crate::models::RelationshipKind::MalwareFamily
-                    && r.target == family_name)
-        );
+        assert!(verdict
+            .entries
+            .iter()
+            .any(|e| e.tier == VerdictTier::ExactHash));
+        assert!(verdict
+            .threat_relationships
+            .iter()
+            .any(|r| r.kind == crate::models::RelationshipKind::MalwareFamily
+                && r.target == family_name));
     }
 
     #[tokio::test]
@@ -2306,12 +2323,10 @@ mod tests {
             e.tier == VerdictTier::YaraHit
                 && e.detection_name.as_deref() == Some(rule_name.as_str())
         }));
-        assert!(
-            !verdict_v2
-                .threat_relationships
-                .iter()
-                .any(|r| r.kind == crate::models::RelationshipKind::Cve && r.target == cve_id)
-        );
+        assert!(!verdict_v2
+            .threat_relationships
+            .iter()
+            .any(|r| r.kind == crate::models::RelationshipKind::Cve && r.target == cve_id));
     }
 
     #[tokio::test]

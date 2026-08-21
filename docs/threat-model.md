@@ -1,4 +1,4 @@
-# Apollo / 4NSIC threat model and security review checklist
+# Artemis / 4NSIC threat model and security review checklist
 
 This document exists because of a process failure worth naming: PR #19
 went through seven rounds of external review, each round surfacing
@@ -12,9 +12,9 @@ pre-emptive*: the trust boundaries below are the things every PR touching
 the verdict, ingest, or relationship path gets checked against, by the
 author, before review.
 
-## What Apollo is, in security terms
+## What Artemis is, in security terms
 
-Apollo is DFIR tooling. Its defining assumption -- see the Constitution's
+Artemis is DFIR tooling. Its defining assumption -- see the Constitution's
 locked decision #1, "live agent model" -- is that it runs **on hosts that
 may already be compromised**, and analyzes **content supplied by
 attackers**. That inverts the usual desktop-app trust posture: the
@@ -55,7 +55,7 @@ anyone who can submit an IOC.
 - Every feed string that becomes a **pattern** (LIKE, regex, glob) must be
   escaped for that pattern language.
 - Feed-claimed timestamps and confidences are claims, not facts; store
-  them as the source's own values on the edge, never merged into Apollo's.
+  them as the source's own values on the edge, never merged into Artemis's.
 
 *Current controls:* `nsic_core::sanitize::safe_external_url` at both ingest
 sites, and `sanitize_stored_url` on every read path (ingest validation alone
@@ -195,10 +195,10 @@ history shows single instances get fixed while siblings survive.
   permissive wildcard, never to a silently wrong identity. Revisit if
   per-rule identity ever gates something stricter than CVE coverage.
 - **Feed URLs are shown to the analyst.** Even scheme-validated, a feed can
-  reference an attacker-chosen `https://` host. Apollo shows it as
+  reference an attacker-chosen `https://` host. Artemis shows it as
   provenance, does not fetch it, and the analyst opens it deliberately.
 - **RUSTSEC-2023-0071 (`rsa`, Marvin timing sidechannel), not reachable.**
-  Pulled in only by `sqlx-mysql`; Apollo enables solely sqlx's `postgres`
+  Pulled in only by `sqlx-mysql`; Artemis enables solely sqlx's `postgres`
   driver in all three consuming crates, so the crate is a `Cargo.lock`
   entry that is never compiled or linked (`cargo tree -i rsa -e normal
   --target all` resolves to nothing). No patched version exists upstream.

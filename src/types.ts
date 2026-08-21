@@ -47,7 +47,7 @@ export type IndicatorKind =
   | "Ip";
 
 // Whether first_seen/last_seen below are a genuine observation window from
-// a backing edge ("observed"), or only when Apollo itself received the
+// a backing edge ("observed"), or only when Artemis itself received the
 // underlying report ("received_only") -- see the matching Rust doc
 // comment on EvidenceTiming. Only Contextual entries are "received_only";
 // every other tier has real edge provenance to source a timestamp from.
@@ -75,7 +75,7 @@ export interface IntelSourceFreshness {
 }
 
 // ---------------------------------------------------------------------
-// Threat Relationship Intelligence (Apollo Constitution §6) -- the
+// Threat Relationship Intelligence (Artemis Product Constitution §7) -- the
 // RELATE-stage structured view, distinct from ProvenanceEntry's
 // verdict-tier framing ("why did this file get flagged").
 // ---------------------------------------------------------------------
@@ -409,7 +409,7 @@ export interface YaraStatus {
 }
 
 // ---------------------------------------------------------------------
-// File Intelligence Model (Apollo Constitution §5) -- the FILE/UNDERSTAND
+// File Intelligence Model (Artemis Product Constitution §6) -- the FILE/UNDERSTAND
 // stages, independent of `Verdict`'s RELATE-stage threat-intel lookup.
 // ---------------------------------------------------------------------
 

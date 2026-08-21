@@ -17,7 +17,10 @@ pub fn default_start_dir() -> String {
 }
 
 #[tauri::command]
-pub async fn list_directory(state: State<'_, AppState>, path: String) -> Result<Vec<FileEntry>, String> {
+pub async fn list_directory(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<Vec<FileEntry>, String> {
     let _ = &state;
     crate::fs_browse::list_dir(std::path::Path::new(&path))
         .await
