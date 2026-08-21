@@ -208,7 +208,10 @@ fn validate_ruleset_source_boundary(rules_dir: &Path) -> Result<()> {
         }
 
         let source = std::str::from_utf8(&bytes).with_context(|| {
-            format!("YARA rule file {} is not valid UTF-8", entry.path().display())
+            format!(
+                "YARA rule file {} is not valid UTF-8",
+                entry.path().display()
+            )
         })?;
         if contains_source_token(source, "include") {
             bail!(
@@ -379,7 +382,8 @@ mod tests {
 
         let err = YaraEngine::load(dir.path()).expect_err("include must fail closed");
         assert!(
-            err.to_string().contains("include directives are not supported"),
+            err.to_string()
+                .contains("include directives are not supported"),
             "expected Artemis include-boundary rejection, got: {err:#}"
         );
     }
@@ -500,8 +504,14 @@ mod tests {
         .expect("write v2 rules");
         let after = YaraEngine::load(dir.path()).expect("load v2 rules");
 
-        assert_eq!(after.rule_source_fingerprint("RuleA"), Some(source_before.as_str()));
-        assert_ne!(after.rule_fingerprint("RuleA"), Some(effective_before.as_str()));
+        assert_eq!(
+            after.rule_source_fingerprint("RuleA"),
+            Some(source_before.as_str())
+        );
+        assert_ne!(
+            after.rule_fingerprint("RuleA"),
+            Some(effective_before.as_str())
+        );
     }
 
     #[test]

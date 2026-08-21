@@ -625,7 +625,9 @@ mod tests {
         tmp.write_all(&[0u8; 4096]).unwrap();
         let error = read_bounded_sample(tmp.path(), 1024)
             .expect_err("a file well over the limit must still be rejected");
-        assert!(error.to_string().contains("larger than the 1024 byte limit"));
+        assert!(error
+            .to_string()
+            .contains("larger than the 1024 byte limit"));
     }
 
     #[test]
