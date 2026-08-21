@@ -326,7 +326,10 @@ Every verdict carries provenance back to the source that produced it.
 
 ### Prerequisites
 
-- Rust (stable) and Cargo.
+- [rustup](https://rustup.rs/). The checked-in `rust-toolchain.toml`
+  automatically selects Rust stable with Cargo, Clippy, and rustfmt. A shell
+  with no `rustup`/`cargo` is not an Artemis verification environment; install
+  rustup before changing or publishing Rust code.
 - Node.js 18+ and npm.
 - Postgres 16+, or Docker to run the bundled `docker-compose.yml`.
 - `libyara-dev` (Linux) so the `yara` crate can bind to libyara.
@@ -337,6 +340,19 @@ Every verdict carries provenance back to the source that produced it.
   Register at https://auth.abuse.ch/ and set `ABUSECH_API_KEY`.
 
 ### Run it
+
+Confirm the repository toolchain before making backend changes:
+
+```bash
+rustup show active-toolchain
+cargo --version
+cargo clippy --version
+cargo fmt --version
+```
+
+If any command is unavailable, stop before publication and provision Rust.
+Remote CI is still mandatory, but it must not be treated as a substitute for
+every locally available compilation and formatting check.
 
 ```bash
 docker compose up -d          # starts Postgres on localhost:5432
