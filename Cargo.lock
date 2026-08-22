@@ -682,6 +682,7 @@ dependencies = [
  "byteorder",
  "fnv",
  "uuid",
+ "yara-sys",
 ]
 
 [[package]]
@@ -6516,6 +6517,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbeb5b2ed726cb3786945423539732a681ce2eb9911ee5e7548fad7ca96b0731"
 dependencies = [
  "bindgen",
+ "cc",
+ "fs_extra",
+ "glob",
 ]
 
 [[package]]

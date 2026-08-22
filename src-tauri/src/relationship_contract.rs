@@ -79,6 +79,10 @@ pub(crate) async fn resolve_opened_snapshot_in_intel_snapshot(
     path: &Path,
     snapshot: nsic_core::hashing::FileSnapshot,
 ) -> Result<ResolvedVerdict> {
+    // Opened-snapshot HUNT resolution is deliberately read-only. The final
+    // authorized-root stability gate therefore cannot discover that path-
+    // keyed cache or YARA observation effects were already committed under
+    // provenance that changed during analysis.
     let verdict = raw_verdict::resolve_opened_snapshot_in_intel_snapshot(
         pool,
         bloom,
@@ -92,9 +96,10 @@ pub(crate) async fn resolve_opened_snapshot_in_intel_snapshot(
 }
 
 /// Hash-pinned snapshot resolution for the analyst-selected HUNT seed. The
-/// raw resolver enforces the pin immediately after its atomic file read and
-/// before YARA observation persistence, then this boundary still performs
-/// the mandatory RELATE normalization and Orion projection.
+/// raw resolver enforces the pin immediately after its atomic file read. HUNT
+/// snapshot resolution is read-only, then this boundary performs the mandatory
+/// RELATE normalization and Orion projection before the caller's final root
+/// stability gate.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_opened_snapshot_in_intel_snapshot_with_expected_sha256(
     pool: &PgPool,

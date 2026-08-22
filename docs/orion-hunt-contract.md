@@ -108,8 +108,12 @@ the snapshot read and before any hash-cache, YARA, or database side effect.
 On Windows the opened file also denies write and delete sharing until snapshot
 acquisition and stability validation complete.
 Failure to prove the same regular object remains bound to the entry is returned
-as inconclusive. Once accepted, the snapshot itself is the evidence object;
-later pathname mutation cannot change its bytes or redirect analysis. Bounds
+as inconclusive. HUNT snapshot resolution is read-only: it does not write the
+path-keyed hash cache or persist live YARA observations. A final authorized-root
+stability gate runs after seed/candidate analysis and before accepting the
+result, so provenance rejection cannot occur after those effects have already
+escaped. Once accepted, the snapshot itself is the evidence object; later
+pathname mutation cannot change its bytes or redirect analysis. Bounds
 or directory-enumeration uncertainty likewise prevent a complete-scope claim.
 
 The selected seed follows the same rule. After initial request authorization,

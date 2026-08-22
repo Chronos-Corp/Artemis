@@ -114,7 +114,7 @@ pub(super) async fn resolve_in_intel_snapshot(
     recent_yara_hits: &RecentYaraHits,
     path: &Path,
 ) -> Result<Verdict> {
-    resolve_in_intel_snapshot_inner(pool, bloom, yara, recent_yara_hits, path, None, None).await
+    resolve_in_intel_snapshot_inner(pool, bloom, yara, recent_yara_hits, path, None, None, true).await
 }
 
 pub(super) async fn resolve_opened_snapshot_in_intel_snapshot(
@@ -133,13 +133,15 @@ pub(super) async fn resolve_opened_snapshot_in_intel_snapshot(
         path,
         None,
         Some(snapshot),
+        false,
     )
     .await
 }
 
 /// Hash-pinned variant for HUNT's selected seed. The expected digest is
-/// checked immediately after the resolver's single file read, before YARA
-/// scanning or evidence persistence can observe a stale/replaced seed.
+/// checked immediately after the resolver's single file read. Opened-snapshot
+/// HUNT resolution is read-only, so a later root-provenance rejection cannot
+/// leave path-keyed cache or YARA observation effects behind.
 pub(super) async fn resolve_opened_snapshot_in_intel_snapshot_with_expected_sha256(
     pool: &PgPool,
     bloom: &BloomState,
@@ -157,6 +159,7 @@ pub(super) async fn resolve_opened_snapshot_in_intel_snapshot_with_expected_sha2
         path,
         Some(expected_sha256),
         Some(snapshot),
+        false,
     )
     .await
 }
@@ -169,18 +172,20 @@ async fn resolve_in_intel_snapshot_inner(
     path: &Path,
     expected_sha256: Option<&str>,
     opened_snapshot: Option<nsic_core::hashing::FileSnapshot>,
+    persist_observations: bool,
 ) -> Result<Verdict> {
     // Read the file's bytes exactly once and hash + YARA-scan the identical
     // buffer -- see `hashing::hash_and_read_file`'s doc comment for why:
     // two separate reads (one to hash, one to scan) can observe different
     // content if the file changes in between, silently binding a YARA hit's
-    // persisted edge to the wrong hash.
+    // persisted edge to the wrong hash. Opened snapshots are HUNT inputs and
+    // use the read-only analysis boundary; normal path resolution retains its
+    // existing cache and live-observation persistence.
     let (hash, file_data) = match (opened_snapshot, expected_sha256) {
         (Some(snapshot), Some(expected)) => {
-            hashing::hash_opened_snapshot_with_expected_sha256(pool, path, snapshot, expected)
-                .await?
+            hashing::analyze_opened_snapshot_with_expected_sha256(snapshot, expected).await?
         }
-        (Some(snapshot), None) => hashing::hash_opened_snapshot(pool, path, snapshot).await?,
+        (Some(snapshot), None) => hashing::analyze_opened_snapshot(snapshot).await?,
         (None, Some(_)) => bail!("hash-pinned resolution requires an opened immutable snapshot"),
         (None, None) => hashing::hash_and_read_file(pool, path).await?,
     };
@@ -293,7 +298,8 @@ async fn resolve_in_intel_snapshot_inner(
     // says another" for what is definitionally the same event.
     let now = Utc::now();
     for hit in &yara_hits {
-        if !recent_yara_hits
+        if persist_observations
+            && !recent_yara_hits
             .contains(&hash.sha256, &hit.rule_name)
             .await
         {

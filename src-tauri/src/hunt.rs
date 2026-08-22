@@ -39,6 +39,8 @@ struct ScopeWalk {
 
 struct AuthorizedRoot {
     dir: Dir,
+    parent: Dir,
+    name: std::ffi::OsString,
     path: PathBuf,
     identity: ObjectIdentity,
 }
@@ -47,18 +49,39 @@ impl AuthorizedRoot {
     fn try_clone(&self) -> Result<Self> {
         Ok(Self {
             dir: self.dir.try_clone()?,
+            parent: self.parent.try_clone()?,
+            name: self.name.clone(),
             path: self.path.clone(),
             identity: self.identity,
         })
     }
 
     fn ensure_path_stable(&self) -> Result<()> {
-        let metadata = std::fs::symlink_metadata(&self.path)
+        let metadata = self
+            .parent
+            .symlink_metadata(&self.name)
             .with_context(|| format!("revalidate authorized root {}", self.path.display()))?;
         if metadata.file_type().is_symlink()
             || !metadata.is_dir()
-            || std_metadata_identity(&metadata) != self.identity
+            || metadata_identity(&metadata) != self.identity
         {
+            bail!("authorized root pathname was replaced; hunt result is inconclusive");
+        }
+        let current_parent_path = self
+            .path
+            .parent()
+            .context("authorized hunt root needs a parent")?;
+        let current_parent = Dir::open_ambient_dir(current_parent_path, ambient_authority())
+            .with_context(|| {
+                format!(
+                    "reopen current authorized-root parent {}",
+                    current_parent_path.display()
+                )
+            })?;
+        let current_root = current_parent
+            .open_dir_nofollow(&self.name)
+            .with_context(|| format!("revalidate authorized root {}", self.path.display()))?;
+        if metadata_identity(&current_root.dir_metadata()?) != self.identity {
             bail!("authorized root pathname was replaced; hunt result is inconclusive");
         }
         Ok(())
@@ -120,15 +143,10 @@ pub async fn run(
         .await
         .with_context(|| format!("canonicalize hunt scope parent {}", root_parent.display()))?
         .join(root_name);
-    let root_metadata = tokio::fs::symlink_metadata(&canonical_root)
-        .await
-        .with_context(|| format!("stat hunt scope {}", canonical_root.display()))?;
-    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
-        bail!(
-            "hunt scope {} is not a non-symlink directory",
-            canonical_root.display()
-        );
-    }
+    // The authoritative validation is the later root-relative no-follow
+    // capability open. Do not validate one root object here and reopen the
+    // pathname later; that would recreate the acquisition race this contract
+    // exists to remove.
     let authorized_seed = if requested_seed.is_absolute() {
         requested_seed.clone()
     } else {
@@ -202,6 +220,7 @@ pub async fn run(
         )
         .await
         .with_context(|| format!("re-resolve hunt seed {}", requested_seed.display()))?;
+    final_root_stability_gate(&walked.root, || {})?;
     let hypothesis = select_hypothesis(&seed.orion_trace, &request.trace_path_id)?;
 
     let mut findings = Vec::new();
@@ -234,7 +253,7 @@ pub async fn run(
             }
         };
         scope_root.ensure_path_stable()?;
-        match relationship_contract::resolve_opened_snapshot_in_intel_snapshot(
+        let resolution = relationship_contract::resolve_opened_snapshot_in_intel_snapshot(
             pool,
             bloom,
             yara,
@@ -243,8 +262,9 @@ pub async fn run(
             &candidate_path,
             snapshot,
         )
-        .await
-        {
+        .await;
+        final_root_stability_gate(&scope_root, || {})?;
+        match resolution {
             Ok(resolved) => {
                 files_analyzed += 1;
                 let matching: Vec<&TracePath> = resolved
@@ -344,6 +364,7 @@ pub async fn run(
         );
     }
 
+    final_root_stability_gate(&scope_root, || {})?;
     Ok(HuntResult {
         hypothesis,
         scope: HuntScope {
@@ -375,6 +396,14 @@ pub async fn run(
         started_at,
         completed_at: Utc::now(),
     })
+}
+
+fn final_root_stability_gate(
+    root: &AuthorizedRoot,
+    before_check: impl FnOnce(),
+) -> Result<()> {
+    before_check();
+    root.ensure_path_stable()
 }
 
 fn validate_request(request: &HuntRequest) -> Result<()> {
@@ -412,13 +441,7 @@ fn collect_scope_files_bounded(
     let mut scope_truncated = false;
     let mut omitted_errors = 0usize;
 
-    let expected_root = std::fs::symlink_metadata(root)
-        .with_context(|| format!("validate authorized hunt root {}", root.display()))?;
-    if expected_root.file_type().is_symlink() || !expected_root.is_dir() {
-        bail!("authorized hunt root must be a non-symlink directory");
-    }
-    let expected_identity = std_metadata_identity(&expected_root);
-    let authorized_root = open_authorized_root(root, expected_identity)?;
+    let authorized_root = open_authorized_root(root)?;
     let seed_relative = canonical_seed
         .strip_prefix(root)
         .ok()
@@ -545,16 +568,24 @@ fn collect_scope_files_bounded(
     })
 }
 
-fn open_authorized_root(root: &Path, expected_identity: ObjectIdentity) -> Result<AuthorizedRoot> {
-    let root_handle = Dir::open_ambient_dir(root, ambient_authority())
-        .with_context(|| format!("open authorized hunt root {}", root.display()))?;
-    if metadata_identity(&root_handle.dir_metadata()?) != expected_identity {
-        bail!("authorized root changed during capability acquisition");
-    }
+fn open_authorized_root(root: &Path) -> Result<AuthorizedRoot> {
+    let parent_path = root.parent().context("authorized hunt root needs a parent")?;
+    let name = root
+        .file_name()
+        .context("filesystem-root hunt scopes are not supported")?
+        .to_os_string();
+    let parent = Dir::open_ambient_dir(parent_path, ambient_authority())
+        .with_context(|| format!("open authorized hunt root parent {}", parent_path.display()))?;
+    let root_handle = parent
+        .open_dir_nofollow(&name)
+        .with_context(|| format!("open authorized hunt root {} without following links", root.display()))?;
+    let identity = metadata_identity(&root_handle.dir_metadata()?);
     let authorized_root = AuthorizedRoot {
         dir: root_handle,
+        parent,
+        name,
         path: root.to_path_buf(),
-        identity: expected_identity,
+        identity,
     };
     authorized_root.ensure_path_stable()?;
     Ok(authorized_root)
@@ -648,23 +679,6 @@ fn metadata_identity(metadata: &cap_std::fs::Metadata) -> ObjectIdentity {
     ObjectIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
-    }
-}
-
-#[cfg(unix)]
-fn std_metadata_identity(metadata: &std::fs::Metadata) -> ObjectIdentity {
-    ObjectIdentity {
-        device: std::os::unix::fs::MetadataExt::dev(metadata),
-        inode: std::os::unix::fs::MetadataExt::ino(metadata),
-    }
-}
-
-#[cfg(windows)]
-fn std_metadata_identity(metadata: &std::fs::Metadata) -> ObjectIdentity {
-    use std::os::windows::fs::MetadataExt;
-    ObjectIdentity {
-        device: metadata.volume_serial_number().unwrap_or(0) as u64,
-        inode: metadata.file_index().unwrap_or(0),
     }
 }
 
@@ -845,13 +859,37 @@ mod tests {
         let root = parent.path().join("authorized-root");
         let moved_root = parent.path().join("validated-root");
         fs::create_dir(&root).unwrap();
-        let validated = fs::symlink_metadata(&root).unwrap();
-        let expected_identity = std_metadata_identity(&validated);
-
         fs::rename(&root, &moved_root).unwrap();
         symlink(outside.path(), &root).unwrap();
 
-        assert!(open_authorized_root(&root, expected_identity).is_err());
+        assert!(open_authorized_root(&root).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_replacement_after_analysis_before_final_acceptance_is_inconclusive() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = parent.path().join("authorized-root");
+        let moved_root = parent.path().join("analyzed-root");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("candidate.bin"), b"authorized-snapshot").unwrap();
+        fs::write(outside.path().join("candidate.bin"), b"external-content").unwrap();
+        let authorized_root = open_authorized_root(&root).unwrap();
+
+        let error = final_root_stability_gate(&authorized_root, || {
+            fs::rename(&root, &moved_root).unwrap();
+            symlink(outside.path(), &root).unwrap();
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("authorized root pathname was replaced"));
+        assert_eq!(
+            fs::read(root.join("candidate.bin")).unwrap(),
+            b"external-content"
+        );
     }
 
     #[cfg(unix)]

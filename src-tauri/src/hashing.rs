@@ -29,48 +29,44 @@ pub async fn hash_and_read_file(pool: &PgPool, path: &Path) -> Result<(HashResul
     let size = i64::try_from(snapshot.size_at_open)
         .context("opened file size does not fit the desktop cache schema")?;
     let modified: DateTime<Utc> = snapshot.modified_at_open.into();
-    let result = hash_bytes(&snapshot.bytes);
+    let (result, snapshot) = hash_snapshot(snapshot).await?;
 
     store_cache(pool, &path_string, size, modified, &result).await?;
     Ok((result, snapshot.bytes))
 }
 
-pub async fn hash_opened_snapshot(
-    pool: &PgPool,
-    path: &Path,
-    snapshot: FileSnapshot,
-) -> Result<(HashResult, Vec<u8>)> {
-    let size = i64::try_from(snapshot.size_at_open)
-        .context("opened file size does not fit the desktop cache schema")?;
-    let modified: DateTime<Utc> = snapshot.modified_at_open.into();
-    let result = hash_bytes(&snapshot.bytes);
-    store_cache(pool, &path.to_string_lossy(), size, modified, &result).await?;
+/// Hashes a previously accepted immutable snapshot without performing any
+/// path-keyed persistence. HUNT uses this read-only boundary so filesystem
+/// provenance can be validated after analysis without leaving cache or YARA
+/// effects behind for a root pathname that changed during the resolve.
+pub async fn analyze_opened_snapshot(snapshot: FileSnapshot) -> Result<(HashResult, Vec<u8>)> {
+    let (result, snapshot) = hash_snapshot(snapshot).await?;
     Ok((result, snapshot.bytes))
 }
 
-/// Hash-pin an already-opened immutable snapshot before any cache write.
-///
-/// HUNT uses this for its selected seed so a mismatched or attacker-replaced
-/// object cannot produce even a hash-cache observation before the request is
-/// rejected.
-pub async fn hash_opened_snapshot_with_expected_sha256(
-    pool: &PgPool,
-    path: &Path,
+/// Read-only hash-pinned HUNT seed analysis. The pin remains before YARA or
+/// database work, while digest computation runs on Tokio's blocking pool.
+pub async fn analyze_opened_snapshot_with_expected_sha256(
     snapshot: FileSnapshot,
     expected_sha256: &str,
 ) -> Result<(HashResult, Vec<u8>)> {
-    let result = hash_bytes(&snapshot.bytes);
+    let (result, snapshot) = hash_snapshot(snapshot).await?;
     if result.sha256 != expected_sha256 {
         bail!(
             "hunt seed changed since TRACE: expected SHA-256 {expected_sha256}, observed {}; select the file again",
             result.sha256
         );
     }
-    let size = i64::try_from(snapshot.size_at_open)
-        .context("opened file size does not fit the desktop cache schema")?;
-    let modified: DateTime<Utc> = snapshot.modified_at_open.into();
-    store_cache(pool, &path.to_string_lossy(), size, modified, &result).await?;
     Ok((result, snapshot.bytes))
+}
+
+async fn hash_snapshot(snapshot: FileSnapshot) -> Result<(HashResult, FileSnapshot)> {
+    tokio::task::spawn_blocking(move || {
+        let result = hash_bytes(&snapshot.bytes);
+        (result, snapshot)
+    })
+    .await
+    .context("snapshot hash task panicked")
 }
 
 pub fn read_opened_snapshot(file: std::fs::File, path: &Path) -> Result<FileSnapshot> {
@@ -111,18 +107,13 @@ mod tests {
 
     #[tokio::test]
     async fn seed_hash_pin_failure_returns_before_cache_access() {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://nsic:nsic@127.0.0.1:1/nsic")
-            .expect("construct deliberately unreachable lazy pool");
         let snapshot = FileSnapshot {
             bytes: b"observed seed".to_vec(),
             size_at_open: 13,
             modified_at_open: std::time::SystemTime::UNIX_EPOCH,
         };
 
-        let error = hash_opened_snapshot_with_expected_sha256(
-            &pool,
-            Path::new("seed.bin"),
+        let error = analyze_opened_snapshot_with_expected_sha256(
             snapshot,
             "0000000000000000000000000000000000000000000000000000000000000000",
         )
@@ -134,6 +125,23 @@ mod tests {
             !error.to_string().contains("Connection refused"),
             "a failed pin must return before attempting the hash-cache write"
         );
+    }
+
+    #[tokio::test]
+    async fn read_only_snapshot_analysis_hashes_without_a_cache_dependency() {
+        let bytes = b"read-only hunt snapshot".to_vec();
+        let snapshot = FileSnapshot {
+            size_at_open: bytes.len() as u64,
+            modified_at_open: std::time::SystemTime::UNIX_EPOCH,
+            bytes: bytes.clone(),
+        };
+
+        let (hash, returned_bytes) = analyze_opened_snapshot(snapshot)
+            .await
+            .expect("hash read-only snapshot");
+
+        assert_eq!(returned_bytes, bytes);
+        assert_eq!(hash, hash_bytes(&returned_bytes));
     }
 
     #[tokio::test]
