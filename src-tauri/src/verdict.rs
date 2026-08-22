@@ -114,7 +114,8 @@ pub(super) async fn resolve_in_intel_snapshot(
     recent_yara_hits: &RecentYaraHits,
     path: &Path,
 ) -> Result<Verdict> {
-    resolve_in_intel_snapshot_inner(pool, bloom, yara, recent_yara_hits, path, None, None, true).await
+    resolve_in_intel_snapshot_inner(pool, bloom, yara, recent_yara_hits, path, None, None, true)
+        .await
 }
 
 pub(super) async fn resolve_opened_snapshot_in_intel_snapshot(
@@ -300,8 +301,8 @@ async fn resolve_in_intel_snapshot_inner(
     for hit in &yara_hits {
         if persist_observations
             && !recent_yara_hits
-            .contains(&hash.sha256, &hit.rule_name)
-            .await
+                .contains(&hash.sha256, &hit.rule_name)
+                .await
         {
             // "" (the wildcard/version-unknown value, never fabricated as
             // a real fingerprint) if the lightweight rule-declaration

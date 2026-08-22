@@ -398,10 +398,7 @@ pub async fn run(
     })
 }
 
-fn final_root_stability_gate(
-    root: &AuthorizedRoot,
-    before_check: impl FnOnce(),
-) -> Result<()> {
+fn final_root_stability_gate(root: &AuthorizedRoot, before_check: impl FnOnce()) -> Result<()> {
     before_check();
     root.ensure_path_stable()
 }
@@ -569,16 +566,21 @@ fn collect_scope_files_bounded(
 }
 
 fn open_authorized_root(root: &Path) -> Result<AuthorizedRoot> {
-    let parent_path = root.parent().context("authorized hunt root needs a parent")?;
+    let parent_path = root
+        .parent()
+        .context("authorized hunt root needs a parent")?;
     let name = root
         .file_name()
         .context("filesystem-root hunt scopes are not supported")?
         .to_os_string();
     let parent = Dir::open_ambient_dir(parent_path, ambient_authority())
         .with_context(|| format!("open authorized hunt root parent {}", parent_path.display()))?;
-    let root_handle = parent
-        .open_dir_nofollow(&name)
-        .with_context(|| format!("open authorized hunt root {} without following links", root.display()))?;
+    let root_handle = parent.open_dir_nofollow(&name).with_context(|| {
+        format!(
+            "open authorized hunt root {} without following links",
+            root.display()
+        )
+    })?;
     let identity = metadata_identity(&root_handle.dir_metadata()?);
     let authorized_root = AuthorizedRoot {
         dir: root_handle,
@@ -885,7 +887,9 @@ mod tests {
         })
         .unwrap_err();
 
-        assert!(error.to_string().contains("authorized root pathname was replaced"));
+        assert!(error
+            .to_string()
+            .contains("authorized root pathname was replaced"));
         assert_eq!(
             fs::read(root.join("candidate.bin")).unwrap(),
             b"external-content"
