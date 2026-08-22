@@ -165,6 +165,7 @@ pub(super) async fn resolve_opened_snapshot_in_intel_snapshot_with_expected_sha2
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn resolve_in_intel_snapshot_inner(
     pool: &PgPool,
     bloom: &BloomState,
