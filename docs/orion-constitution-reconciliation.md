@@ -94,7 +94,7 @@ of unused labels.
 An Orion edge is a directed traversal statement. It is not automatically the
 same thing as the source assertion that supports traversal.
 
-Every edge must expose:
+Every reusable edge envelope must make available:
 
 - typed `from` and `to` node identities;
 - a typed relation;
@@ -104,13 +104,14 @@ Every edge must expose:
 - the path state contributed by that edge;
 - partiality inherited from its evidence.
 
-The current `TraceEdge.proof_hop_index` satisfies this requirement inside one
-`TracePath`: it points to the complete sourced proof retained beside the path.
-It is not yet a reusable graph-edge envelope because the reference is local to
-one path. Before Orion merges edges across paths, sessions, hosts, or retained
-history, the implementation must replace path-local indexes with durable
-evidence references and preserve each assertion's source, time, confidence,
-freshness, method, version, and scope.
+The current wire representation satisfies these semantics in the context of
+one `TracePath`: `TraceEdge.proof_hop_index` points to the complete sourced
+proof retained beside the path, while the containing path carries state and
+partiality. It is not yet a reusable graph-edge envelope because those values
+and references are path-local. Before Orion merges edges across paths,
+sessions, hosts, or retained history, the implementation must replace
+path-local indexes with durable evidence references and preserve each
+assertion's source, time, confidence, freshness, method, version, and scope.
 
 ### Assertion classes
 
@@ -131,9 +132,10 @@ claim that the UI wording is permanently settled.
 
 ## 5. Trace and selector identity
 
-`TracePath.id` is an opaque capability-safe selector for an exact reconstructed
-path. It is not a database primary key, user-authored identifier, or promise
-that a changed evidentiary claim remains selectable.
+`TracePath.id` is an integrity-sensitive opaque selector for an exact
+reconstructed path. It is not an authorization capability, database primary
+key, user-authored identifier, or promise that a changed evidentiary claim
+remains selectable.
 
 The identity rules are:
 
@@ -230,4 +232,3 @@ this reconciliation:
 - commercial packaging;
 - whether practitioner demand justifies adopting an existing textual query
   language in addition to the structured contract.
-
