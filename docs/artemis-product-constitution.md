@@ -6,7 +6,7 @@
 
 > **NOTE — Revision 0.3 formalizes the ARTEMIS operating framework.** Revision 0.3 preserves the Artemis product identity and architecture established in v0.2 and formalizes its seven responsibilities as the ARTEMIS framework: Analyze, Relate, Trace, Execute, Model, Interpret, Sustain. Hunt remains the product-level verb, while Execute names the action pillar inside that hunt lifecycle.
 
-> **NOTE — Relationship to Chronos.** The Chronos Corp Strategic Constitution remains the parent doctrine. Artemis is the first committed Chronos product and the first proof that the company can advance security posture through specialized, evidence-driven tools.
+> **NOTE — Relationship to Chronos.** The [Chronos Corp Strategic Constitution](https://github.com/Chronos-Corp/Chronos/blob/main/docs/STRATEGIC-CONSTITUTION.md) is the parent doctrine. Artemis is the committed Chronos threat-hunting platform and the first proof that the company can advance security posture through specialized, evidence-driven tools.
 
 ## 1. Product Identity
 
@@ -16,7 +16,7 @@
 
 > **LOCKED — Filesystem-first, not filesystem-only.** The filesystem remains Artemis's primary starting surface because files and directories provide a concrete, understandable entry point into an investigation. As a hunt expands, Artemis may incorporate process, identity, network, cloud, vulnerability, and external telemetry evidence without abandoning the artifact-centric workflow.
 
-> **DECIDED — Apollo is reserved for a future Chronos capability.** The former Project Apollo name should not be reused for this threat-hunting product after the Artemis transition. Apollo remains available for a future Chronos product whose purpose better matches its mythology.
+> **DECIDED — Artemis is the live product identity.** Historical codenames do not reserve future portfolio identity. Any future Chronos capability must pass the parent Strategic Constitution's product test and receive an explicit identity decision.
 
 ### The Artemis promise
 
@@ -282,7 +282,7 @@ The Orion Graph is the evidence-aware, temporal relationship graph used by the O
 
 | **Capability block**                       | **Working objective**                                                                                                                   | **Why now**                                              |
 |--------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------|
-| Naming transition                          | Rename Project Apollo/product references to Artemis in a dedicated PR without pretending the architecture changed because the name did. | Keeps product identity and repository history clear.     |
+| Artemis identity baseline                 | Maintain Artemis as the live product identity and confine historical names to archive material and repository history.                 | Keeps product identity and repository history clear.     |
 | File Intelligence                          | Formalize the artifact model for purpose, expectedness, ownership, authenticity, version, and evidence.                                 | Completes Analyze and the original wedge.                |
 | Threat Relationship Model                  | Represent CVE/IOC/APT/campaign/malware/ATT&CK/risk relationships explicitly.                                                            | Enables Relate and Orion.                                |
 | Orion Graph Foundation                     | Define node/edge ontology, evidence metadata, strength semantics, and basic graph traversal.                                            | Enables Trace without waiting for every evidence source. |

@@ -1,18 +1,17 @@
 # 4NSIC
 
-DFIR triage and threat hunting tool -- **Artemis**, the first committed
-product of the Chronos Corp portfolio thesis (codenamed Apollo during early
-development; see `docs/apollo-constitution.md`, retained as retired,
-historical product doctrine, not current authority). See
+DFIR triage and threat hunting tool -- **Artemis**, the committed
+threat-hunting platform of Chronos Corp. See
 [`docs/artemis-product-constitution.md`](docs/artemis-product-constitution.md)
-for the current product-level source of truth on what Artemis is, what it
-isn't, and what's still genuinely open (and
-[`docs/chronos-constitution.md`](docs/chronos-constitution.md) for the
-company-level thesis it sits under); this README covers the technical
-state of the repo, kept consistent with those documents rather than
-repeating them. "4NSIC" is this repo's working name and shows up in the
-crate names (`nsic-core`/`nsic-agent`/`nsic-console`); "Artemis" is the
-product name.
+for the current product-level source of truth.
+
+Company and portfolio doctrine is governed by the
+[Chronos Corp Strategic Constitution](https://github.com/Chronos-Corp/Chronos/blob/main/docs/STRATEGIC-CONSTITUTION.md).
+The local `docs/chronos-constitution.md` file is a retired compatibility
+pointer, not current authority. This README covers the repository's technical
+state without restating either Constitution. "4NSIC" is the repository's
+working name and appears in crate names
+(`nsic-core`/`nsic-agent`/`nsic-console`); Artemis is the product name.
 
 **Artemis's non-negotiable product promise:** selecting a file should
 progressively answer what it is, what it's for, whether it's expected here,
@@ -513,9 +512,9 @@ Do not jump ahead; each phase de-risks the next.
   the wedge. Two earlier passes at this correction each over-rotated:
   the first toward hunt packs specifically (corrected -- hunt packs are
   machinery, not the product); the second toward "agentless-first"
-  specifically, which the retired Apollo Constitution (&sect;10) demotes from
-  a decided strategy to an open question -- not carried forward into the
-  current Artemis Product Constitution, which does not yet re-address
+  specifically, which an earlier retired product-constitution revision treated
+  as an open question -- not carried forward into the current Artemis Product
+  Constitution, which does not yet re-address
   execution-backend choice explicitly -- external EDR/SIEM integration may
   reduce adoption friction later, but it should not redefine Artemis's
   actual CORE wedge, which is the *local, single-machine* filesystem
