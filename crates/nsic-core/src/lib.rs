@@ -6,6 +6,7 @@
 //! neither) doesn't pull either in; enable `db` or `yara-scan` per consumer.
 
 pub mod hashing;
+pub mod hunt;
 pub mod models;
 pub mod orion;
 pub mod proto;

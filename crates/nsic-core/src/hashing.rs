@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use md5::Md5;
 use sha2::{Digest, Sha256};
+use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::time::SystemTime;
@@ -41,24 +42,36 @@ pub struct FileSnapshot {
 /// This is the shared trust-boundary primitive for desktop analysis, agent
 /// hashing/YARA scanning, sample retrieval, and future recursive hunts.
 pub fn read_regular_file_bounded(path: &Path, max_bytes: u64) -> Result<FileSnapshot> {
+    let file = open_nonblocking(path).with_context(|| format!("open {}", path.display()))?;
+    read_opened_regular_file_bounded(file, path, max_bytes)
+}
+
+/// Reads an already-opened object without consulting its pathname again.
+/// The caller owns path resolution; hashing and every later analyzer consume
+/// the returned immutable bytes rather than reopening attacker-controlled
+/// filesystem state.
+pub fn read_opened_regular_file_bounded(
+    file: File,
+    display_path: &Path,
+    max_bytes: u64,
+) -> Result<FileSnapshot> {
     let read_limit = max_bytes
         .checked_add(1)
         .context("file read limit must be smaller than u64::MAX")?;
-    let file = open_nonblocking(path).with_context(|| format!("open {}", path.display()))?;
     let metadata = file
         .metadata()
-        .with_context(|| format!("fstat {}", path.display()))?;
+        .with_context(|| format!("fstat {}", display_path.display()))?;
 
     if !metadata.is_file() {
         bail!(
             "{} is not a regular file, refusing to read it (directories, FIFOs, device nodes,              sockets, and other special files are rejected)",
-            path.display()
+            display_path.display()
         );
     }
     if metadata.len() > max_bytes {
         bail!(
             "{} is {} bytes, larger than the {} byte limit; not read",
-            path.display(),
+            display_path.display(),
             metadata.len(),
             max_bytes
         );
@@ -66,16 +79,16 @@ pub fn read_regular_file_bounded(path: &Path, max_bytes: u64) -> Result<FileSnap
 
     let modified_at_open = metadata
         .modified()
-        .with_context(|| format!("mtime for {}", path.display()))?;
+        .with_context(|| format!("mtime for {}", display_path.display()))?;
     let mut bytes = Vec::new();
     file.take(read_limit)
         .read_to_end(&mut bytes)
-        .with_context(|| format!("read {}", path.display()))?;
+        .with_context(|| format!("read {}", display_path.display()))?;
 
     if bytes.len() as u64 > max_bytes {
         bail!(
             "{} grew past the {} byte limit while being read; not accepted",
-            path.display(),
+            display_path.display(),
             max_bytes
         );
     }

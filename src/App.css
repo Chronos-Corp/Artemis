@@ -597,6 +597,137 @@ body {
   padding: 0.45rem 0.55rem;
 }
 
+.hunt-action {
+  align-items: flex-start;
+  border-top: 1px solid #d9dfe8;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+}
+
+.hunt-action button {
+  background: #315b9a;
+  border: 0;
+  border-radius: 4px;
+  color: #fff;
+  cursor: pointer;
+  font-size: 0.72rem;
+  font-weight: 600;
+  padding: 0.35rem 0.65rem;
+}
+
+.hunt-action button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.hunt-action span,
+.hunt-running,
+.hunt-summary,
+.hunt-finding-meta,
+.hunt-no-findings,
+.hunt-errors,
+.hunt-limitations {
+  color: #666;
+  font-size: 0.68rem;
+}
+
+.hunt-action code,
+.hunt-finding code,
+.hunt-errors code {
+  overflow-wrap: anywhere;
+}
+
+.hunt-running {
+  margin-top: 0.45rem;
+}
+
+.hunt-result {
+  background: #fff;
+  border: 1px solid #cbd6e6;
+  border-radius: 4px;
+  margin-top: 0.55rem;
+  padding: 0.55rem;
+}
+
+.hunt-result-title {
+  color: #244873;
+  font-size: 0.75rem;
+  font-weight: 700;
+  margin-bottom: 0.2rem;
+}
+
+.hunt-findings {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  list-style: none;
+  margin: 0.5rem 0;
+  padding: 0;
+}
+
+.hunt-finding {
+  border-left: 3px solid #5279b7;
+  padding: 0.35rem 0.45rem;
+}
+
+.hunt-finding-contextual {
+  border-left-color: #a27a35;
+}
+
+.hunt-finding-contradicting {
+  border-left-color: #9a3b3b;
+}
+
+.hunt-finding-header {
+  align-items: baseline;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.hunt-role {
+  border-radius: 3px;
+  font-size: 0.6rem;
+  font-weight: 700;
+  padding: 0.05rem 0.3rem;
+  text-transform: uppercase;
+}
+
+.hunt-role-confirming {
+  background: #d9f2e3;
+  color: #146c3f;
+}
+
+.hunt-role-contextual {
+  background: #fdeecb;
+  color: #8a5a00;
+}
+
+.hunt-role-contradicting {
+  background: #f7dede;
+  color: #8d2929;
+}
+
+.hunt-errors,
+.hunt-limitations {
+  margin-top: 0.45rem;
+}
+
+.hunt-errors summary,
+.hunt-limitations summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.hunt-errors ul,
+.hunt-limitations ul {
+  margin: 0.3rem 0 0;
+  padding-left: 1.2rem;
+}
+
 .provenance-list {
   list-style: none;
   margin: 0;
@@ -862,6 +993,29 @@ button:disabled {
 
   .orion-reversed {
     color: #e3b96a;
+  }
+
+  .hunt-action {
+    border-color: #465064;
+  }
+
+  .hunt-action span,
+  .hunt-running,
+  .hunt-summary,
+  .hunt-finding-meta,
+  .hunt-no-findings,
+  .hunt-errors,
+  .hunt-limitations {
+    color: #aaa;
+  }
+
+  .hunt-result {
+    background: #202020;
+    border-color: #465064;
+  }
+
+  .hunt-result-title {
+    color: #8fb3e8;
   }
 
   .relationship-entry {

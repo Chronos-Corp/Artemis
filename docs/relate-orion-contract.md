@@ -148,3 +148,21 @@ possible paths, and carries both RELATE and Orion bounds forward.
 
 See `docs/orion-architecture.md` for the governing Orion decisions and the
 next Hunt/Execute boundary.
+
+## 11. Executable HUNT consumer
+
+The first executable HUNT pivot does not accept a relationship target or proof
+chain from the UI. Its request carries only the selected artifact path, the
+artifact SHA-256 observed by TRACE, the exact opaque `TracePath.id`, and an
+explicit subtree root. The backend re-runs this authoritative RELATE contract,
+reconstructs Orion TRACE, verifies the hash, and selects exactly one matching
+path identity before scanning any candidate.
+
+Every candidate is processed through the same RELATE-to-Orion boundary. HUNT
+matches typed `(relationship kind, canonical target)` concepts and returns the
+best safe directed path with its complete supporting proof. It does not parse
+explanation prose, accept graph direction over IPC, or turn a non-match into a
+negative assertion.
+
+See `docs/orion-hunt-contract.md` for request, result, bounds, and failure
+semantics.

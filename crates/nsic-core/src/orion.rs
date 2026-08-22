@@ -7,10 +7,11 @@
 //! from an `EvidenceRelation` name.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::models::{
-    EvidenceRelation, IndicatorKind, RelationshipEvidence, RelationshipKind, RelationshipStrength,
-    ThreatRelationship, Verdict,
+    EvidenceRelation, EvidenceTiming, IndicatorKind, RelationshipEvidence, RelationshipKind,
+    RelationshipStrength, ThreatRelationship, Verdict,
 };
 
 /// Orion's independent path budget. RELATE has its own concept and evidence
@@ -97,6 +98,13 @@ pub struct TracePathRank {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TracePath {
+    /// Stable identity for this exact seed, relationship, traversal, and
+    /// supporting proof identity. Observation-window timestamps and display
+    /// labels are excluded so a new live observation of unchanged evidence
+    /// does not make an analyst's just-selected path stale. HUNT accepts this
+    /// opaque selector and reconstructs it server-side rather than trusting
+    /// target/proof fields supplied over IPC.
+    pub id: String,
     /// Index in `Verdict.threat_relationships`, retained so an analyst can
     /// open the trace for the exact RELATE concept they selected.
     pub relationship_index: usize,
@@ -485,21 +493,188 @@ fn project_path(
         .map(|hop| hop.confidence)
         .min()
         .ok_or(UntracedReason::EmptyProof)?;
+    let rank = TracePathRank {
+        relationship_strength: relationship.strength,
+        weakest_source_confidence,
+        hop_count: edges.len(),
+    };
+    let id = trace_path_id(start, relationship, state, &rank, &nodes, &edges, proof);
     Ok(TracePath {
+        id,
         relationship_index,
         target_kind: relationship.kind,
         target: relationship.target.clone(),
         state,
-        rank: TracePathRank {
-            relationship_strength: relationship.strength,
-            weakest_source_confidence,
-            hop_count: edges.len(),
-        },
+        rank,
         nodes,
         edges,
         supporting_proof: proof.to_vec(),
         supporting_evidence_partial: relationship.has_more_evidence,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_path_id(
+    start: &TraceNode,
+    relationship: &ThreatRelationship,
+    state: TracePathState,
+    rank: &TracePathRank,
+    nodes: &[TraceNode],
+    edges: &[TraceEdge],
+    proof: &[RelationshipEvidence],
+) -> String {
+    let mut digest = Sha256::new();
+    hash_component(&mut digest, "orion-trace-path-v2");
+    hash_component(&mut digest, &start.id);
+    hash_component(&mut digest, relationship_kind_key(relationship.kind));
+    hash_component(&mut digest, &relationship.target);
+    hash_component(&mut digest, trace_path_state_key(state));
+    hash_component(
+        &mut digest,
+        relationship_strength_key(rank.relationship_strength),
+    );
+    hash_component(&mut digest, &rank.weakest_source_confidence.to_string());
+    hash_component(&mut digest, &rank.hop_count.to_string());
+    hash_component(
+        &mut digest,
+        if relationship.has_more_evidence {
+            "partial"
+        } else {
+            "complete"
+        },
+    );
+
+    for node in nodes {
+        hash_component(&mut digest, trace_node_kind_key(node.kind));
+        hash_component(&mut digest, &node.id);
+    }
+    for edge in edges {
+        hash_component(&mut digest, &edge.from);
+        hash_component(&mut digest, &edge.to);
+        hash_component(&mut digest, trace_edge_relation_key(edge.relation));
+        hash_component(
+            &mut digest,
+            assertion_orientation_key(edge.assertion_orientation),
+        );
+        hash_optional_component(
+            &mut digest,
+            edge.proof_hop_index
+                .map(|index| index.to_string())
+                .as_deref(),
+        );
+    }
+    for hop in proof {
+        hash_component(&mut digest, evidence_relation_key(hop.relation));
+        hash_component(&mut digest, &hop.source);
+        hash_component(&mut digest, &hop.confidence.to_string());
+        hash_optional_component(
+            &mut digest,
+            hop.report_id.map(|id| id.to_string()).as_deref(),
+        );
+        hash_optional_component(&mut digest, hop.indicator_kind.map(indicator_kind_key));
+        hash_optional_component(&mut digest, hop.indicator_value.as_deref());
+        hash_optional_component(&mut digest, hop.detection_name.as_deref());
+        hash_optional_component(&mut digest, hop.rule_fingerprint.as_deref());
+        hash_component(&mut digest, evidence_timing_key(hop.timing));
+    }
+
+    format!("trace_path:{}", hex::encode(digest.finalize()))
+}
+
+fn hash_component(digest: &mut Sha256, value: &str) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value.as_bytes());
+}
+
+fn hash_optional_component(digest: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hash_component(digest, "some");
+            hash_component(digest, value);
+        }
+        None => hash_component(digest, "none"),
+    }
+}
+
+fn relationship_kind_key(kind: RelationshipKind) -> &'static str {
+    match kind {
+        RelationshipKind::Ioc => "ioc",
+        RelationshipKind::Detection => "detection",
+        RelationshipKind::Cve => "cve",
+        RelationshipKind::MalwareFamily => "malware_family",
+        RelationshipKind::ThreatActor => "threat_actor",
+        RelationshipKind::Campaign => "campaign",
+        RelationshipKind::AttackTechnique => "attack_technique",
+        RelationshipKind::RiskBased => "risk_based",
+    }
+}
+
+fn relationship_strength_key(strength: RelationshipStrength) -> &'static str {
+    match strength {
+        RelationshipStrength::Weak => "weak",
+        RelationshipStrength::Contextual => "contextual",
+        RelationshipStrength::Strong => "strong",
+        RelationshipStrength::Direct => "direct",
+    }
+}
+
+fn trace_node_kind_key(kind: TraceNodeKind) -> &'static str {
+    match kind {
+        TraceNodeKind::Artifact => "artifact",
+        TraceNodeKind::Indicator => "indicator",
+        TraceNodeKind::Report => "report",
+        TraceNodeKind::Detection => "detection",
+        TraceNodeKind::Cve => "cve",
+        TraceNodeKind::MalwareFamily => "malware_family",
+        TraceNodeKind::RiskConcept => "risk_concept",
+    }
+}
+
+fn trace_edge_relation_key(relation: TraceEdgeRelation) -> &'static str {
+    match relation {
+        TraceEdgeRelation::ArtifactHasIndicator => "artifact_has_indicator",
+        TraceEdgeRelation::IndicatorObservedInReport => "indicator_observed_in_report",
+        TraceEdgeRelation::ReportReferencesCve => "report_references_cve",
+        TraceEdgeRelation::IndicatorMatchedByDetection => "indicator_matched_by_detection",
+        TraceEdgeRelation::DetectionCoversCve => "detection_covers_cve",
+        TraceEdgeRelation::IndicatorAttributedToMalwareFamily => {
+            "indicator_attributed_to_malware_family"
+        }
+        TraceEdgeRelation::ContextualFilenameMatch => "contextual_filename_match",
+    }
+}
+
+fn assertion_orientation_key(orientation: AssertionOrientation) -> &'static str {
+    match orientation {
+        AssertionOrientation::Native => "native",
+        AssertionOrientation::Reversed => "reversed",
+        AssertionOrientation::Synthetic => "synthetic",
+    }
+}
+
+fn trace_path_state_key(state: TracePathState) -> &'static str {
+    match state {
+        TracePathState::Observed => "observed",
+        TracePathState::Possible => "possible",
+    }
+}
+
+fn evidence_relation_key(relation: EvidenceRelation) -> &'static str {
+    match relation {
+        EvidenceRelation::ObservedInReport => "observed_in_report",
+        EvidenceRelation::ReportReferencesCve => "report_references_cve",
+        EvidenceRelation::DetectsIndicator => "detects_indicator",
+        EvidenceRelation::DetectionCoversCve => "detection_covers_cve",
+        EvidenceRelation::AttributedToMalwareFamily => "attributed_to_malware_family",
+        EvidenceRelation::ContextualFilenameMatch => "contextual_filename_match",
+    }
+}
+
+fn evidence_timing_key(timing: EvidenceTiming) -> &'static str {
+    match timing {
+        EvidenceTiming::Observed => "observed",
+        EvidenceTiming::ReceivedOnly => "received_only",
+    }
 }
 
 fn artifact_node(sha256: &str, path: &str) -> TraceNode {
@@ -677,7 +852,7 @@ fn untraced(
 mod tests {
     use super::*;
     use crate::models::{EvidenceTiming, VerdictBounds};
-    use chrono::Utc;
+    use chrono::{Duration, Utc};
     use uuid::Uuid;
 
     fn hop(relation: EvidenceRelation) -> RelationshipEvidence {
@@ -751,6 +926,122 @@ mod tests {
         );
         assert_eq!(path.edges[2].proof_hop_index, Some(1));
         assert_eq!(path.supporting_proof.len(), 2);
+    }
+
+    #[test]
+    fn path_identity_is_stable_across_observation_window_updates() {
+        let relationship = relationship(
+            RelationshipKind::Cve,
+            RelationshipStrength::Contextual,
+            "CVE-2026-0001",
+            &[
+                EvidenceRelation::ObservedInReport,
+                EvidenceRelation::ReportReferencesCve,
+            ],
+        );
+        let first = trace_verdict(&verdict(vec![relationship.clone()]));
+
+        let mut observed_later = relationship;
+        for hop in &mut observed_later.evidence_paths[0] {
+            hop.first_seen += Duration::minutes(1);
+            hop.last_seen += Duration::minutes(2);
+            hop.report_title = Some("Renamed report title".to_string());
+        }
+        let second = trace_verdict(&verdict(vec![observed_later]));
+
+        assert_eq!(first.paths[0].id, second.paths[0].id);
+    }
+
+    #[test]
+    fn path_identity_is_stable_when_relationships_reorder() {
+        let selected = relationship(
+            RelationshipKind::Detection,
+            RelationshipStrength::Strong,
+            "test_rule",
+            &[EvidenceRelation::DetectsIndicator],
+        );
+        let unrelated = relationship(
+            RelationshipKind::RiskBased,
+            RelationshipStrength::Weak,
+            "unrelated.exe",
+            &[EvidenceRelation::ContextualFilenameMatch],
+        );
+
+        let first = trace_verdict(&verdict(vec![selected.clone(), unrelated.clone()]));
+        let reordered = trace_verdict(&verdict(vec![unrelated, selected]));
+
+        let first_selected = first
+            .paths
+            .iter()
+            .find(|path| path.target == "test_rule")
+            .unwrap();
+        let reordered_selected = reordered
+            .paths
+            .iter()
+            .find(|path| path.target == "test_rule")
+            .unwrap();
+
+        assert_eq!(first_selected.relationship_index, 0);
+        assert_eq!(reordered_selected.relationship_index, 1);
+        assert_eq!(first_selected.id, reordered_selected.id);
+    }
+
+    #[test]
+    fn path_identity_changes_when_effective_detection_identity_changes() {
+        let relationship = relationship(
+            RelationshipKind::Detection,
+            RelationshipStrength::Strong,
+            "test_rule",
+            &[EvidenceRelation::DetectsIndicator],
+        );
+        let first = trace_verdict(&verdict(vec![relationship.clone()]));
+
+        let mut changed = relationship;
+        changed.evidence_paths[0][0].rule_fingerprint = Some("rule-v2".to_string());
+        let second = trace_verdict(&verdict(vec![changed]));
+
+        assert_ne!(first.paths[0].id, second.paths[0].id);
+    }
+
+    #[test]
+    fn path_identity_changes_when_supporting_evidence_becomes_partial() {
+        let relationship = relationship(
+            RelationshipKind::Detection,
+            RelationshipStrength::Strong,
+            "test_rule",
+            &[EvidenceRelation::DetectsIndicator],
+        );
+        let complete = trace_verdict(&verdict(vec![relationship.clone()]));
+
+        let mut partial_relationship = relationship;
+        partial_relationship.has_more_evidence = true;
+        let partial = trace_verdict(&verdict(vec![partial_relationship]));
+
+        assert_ne!(complete.paths[0].id, partial.paths[0].id);
+        assert!(!complete.paths[0].supporting_evidence_partial);
+        assert!(partial.paths[0].supporting_evidence_partial);
+        assert!(partial.bounds.input_evidence_truncated);
+    }
+
+    #[test]
+    fn trace_discloses_relationship_and_evidence_input_partiality_separately() {
+        let mut partial_relationship = relationship(
+            RelationshipKind::Ioc,
+            RelationshipStrength::Direct,
+            "abc123",
+            &[EvidenceRelation::ObservedInReport],
+        );
+        partial_relationship.has_more_evidence = true;
+        let mut partial_verdict = verdict(vec![partial_relationship]);
+        partial_verdict.bounds.relationships_truncated = true;
+
+        let trace = trace_verdict(&partial_verdict);
+
+        assert!(trace.bounds.input_relationships_truncated);
+        assert!(trace.bounds.input_evidence_truncated);
+        assert!(!trace.bounds.paths_truncated);
+        assert_eq!(trace.bounds.omitted_paths, 0);
+        assert!(trace.paths[0].supporting_evidence_partial);
     }
 
     #[test]

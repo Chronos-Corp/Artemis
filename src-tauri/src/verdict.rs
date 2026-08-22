@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use std::collections::HashSet;
@@ -98,12 +98,99 @@ pub async fn resolve(
     // consistent corpus.
     let _intel_read_guard = intel_gate.read().await;
 
+    resolve_in_intel_snapshot(pool, bloom, yara, recent_yara_hits, path).await
+}
+
+/// Resolves one file while the caller already holds `IntelGate`'s read side.
+/// Kept visible only to the parent relationship-contract module so a bounded
+/// multi-file hunt can use one coherent intel snapshot without attempting a
+/// nested read acquisition (which can deadlock behind a queued writer on a
+/// fair `RwLock`). All external consumers still go through the normalized
+/// relationship contract.
+pub(super) async fn resolve_in_intel_snapshot(
+    pool: &PgPool,
+    bloom: &BloomState,
+    yara: &Arc<YaraEngine>,
+    recent_yara_hits: &RecentYaraHits,
+    path: &Path,
+) -> Result<Verdict> {
+    resolve_in_intel_snapshot_inner(pool, bloom, yara, recent_yara_hits, path, None, None, true)
+        .await
+}
+
+pub(super) async fn resolve_opened_snapshot_in_intel_snapshot(
+    pool: &PgPool,
+    bloom: &BloomState,
+    yara: &Arc<YaraEngine>,
+    recent_yara_hits: &RecentYaraHits,
+    path: &Path,
+    snapshot: nsic_core::hashing::FileSnapshot,
+) -> Result<Verdict> {
+    resolve_in_intel_snapshot_inner(
+        pool,
+        bloom,
+        yara,
+        recent_yara_hits,
+        path,
+        None,
+        Some(snapshot),
+        false,
+    )
+    .await
+}
+
+/// Hash-pinned variant for HUNT's selected seed. The expected digest is
+/// checked immediately after the resolver's single file read. Opened-snapshot
+/// HUNT resolution is read-only, so a later root-provenance rejection cannot
+/// leave path-keyed cache or YARA observation effects behind.
+pub(super) async fn resolve_opened_snapshot_in_intel_snapshot_with_expected_sha256(
+    pool: &PgPool,
+    bloom: &BloomState,
+    yara: &Arc<YaraEngine>,
+    recent_yara_hits: &RecentYaraHits,
+    path: &Path,
+    snapshot: nsic_core::hashing::FileSnapshot,
+    expected_sha256: &str,
+) -> Result<Verdict> {
+    resolve_in_intel_snapshot_inner(
+        pool,
+        bloom,
+        yara,
+        recent_yara_hits,
+        path,
+        Some(expected_sha256),
+        Some(snapshot),
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_in_intel_snapshot_inner(
+    pool: &PgPool,
+    bloom: &BloomState,
+    yara: &Arc<YaraEngine>,
+    recent_yara_hits: &RecentYaraHits,
+    path: &Path,
+    expected_sha256: Option<&str>,
+    opened_snapshot: Option<nsic_core::hashing::FileSnapshot>,
+    persist_observations: bool,
+) -> Result<Verdict> {
     // Read the file's bytes exactly once and hash + YARA-scan the identical
     // buffer -- see `hashing::hash_and_read_file`'s doc comment for why:
     // two separate reads (one to hash, one to scan) can observe different
     // content if the file changes in between, silently binding a YARA hit's
-    // persisted edge to the wrong hash.
-    let (hash, file_data) = hashing::hash_and_read_file(pool, path).await?;
+    // persisted edge to the wrong hash. Opened snapshots are HUNT inputs and
+    // use the read-only analysis boundary; normal path resolution retains its
+    // existing cache and live-observation persistence.
+    let (hash, file_data) = match (opened_snapshot, expected_sha256) {
+        (Some(snapshot), Some(expected)) => {
+            hashing::analyze_opened_snapshot_with_expected_sha256(snapshot, expected).await?
+        }
+        (Some(snapshot), None) => hashing::analyze_opened_snapshot(snapshot).await?,
+        (None, Some(_)) => bail!("hash-pinned resolution requires an opened immutable snapshot"),
+        (None, None) => hashing::hash_and_read_file(pool, path).await?,
+    };
     let mut entries = Vec::new();
     // Accumulates which parts of this verdict a cap made partial. Folded in
     // at each capped lookup rather than inferred at the end: "we returned
@@ -147,9 +234,7 @@ pub async fn resolve(
             VerdictTier::ExactHash,
             IndicatorKind::Md5,
         ));
-        if exact_hash_truncated {
-            bounds.truncated_entry_tiers.push(VerdictTier::ExactHash);
-        }
+        record_exact_hash_truncation(&mut bounds, exact_hash_truncated);
 
         // Malware-family attribution and CVE-via-report relationships can
         // only exist for a hash the bloom filter already knows about: both
@@ -215,9 +300,10 @@ pub async fn resolve(
     // says another" for what is definitionally the same event.
     let now = Utc::now();
     for hit in &yara_hits {
-        if !recent_yara_hits
-            .contains(&hash.sha256, &hit.rule_name)
-            .await
+        if persist_observations
+            && !recent_yara_hits
+                .contains(&hash.sha256, &hit.rule_name)
+                .await
         {
             // "" (the wildcard/version-unknown value, never fabricated as
             // a real fingerprint) if the lightweight rule-declaration
@@ -434,6 +520,17 @@ async fn record_yara_hit(
         bloom.insert(sha256).await;
     }
     Ok(())
+}
+
+fn record_exact_hash_truncation(bounds: &mut VerdictBounds, truncated: bool) {
+    if truncated {
+        bounds.truncated_entry_tiers.push(VerdictTier::ExactHash);
+        // Exact-hash provenance rows are also the source of IOC
+        // relationships. Omitted rows may contain distinct pivots that were
+        // never materialized, so HUNT must treat a non-match as inconclusive
+        // rather than as evidence of absence.
+        bounds.relationships_truncated = true;
+    }
 }
 
 #[cfg(test)]
@@ -2366,7 +2463,14 @@ mod tests {
         );
         assert!(rel_a.has_more_evidence);
         assert!(!find(&cve_b).unwrap().has_more_evidence);
-        assert!(!verdict.bounds.relationships_truncated);
+        assert!(
+            verdict.bounds.relationships_truncated,
+            "the exact-hash row cap omitted relationship source rows"
+        );
+        assert!(verdict
+            .bounds
+            .truncated_entry_tiers
+            .contains(&VerdictTier::ExactHash));
         for path in &rel_a.evidence_paths {
             assert_eq!(path.len(), 2);
         }
@@ -2531,5 +2635,19 @@ mod tests {
         f.write_all(br"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*")
             .expect("write eicar bytes");
         f
+    }
+
+    #[test]
+    fn exact_hash_truncation_marks_relationships_partial() {
+        let mut bounds = VerdictBounds::default();
+        record_exact_hash_truncation(&mut bounds, true);
+
+        assert!(bounds
+            .truncated_entry_tiers
+            .contains(&VerdictTier::ExactHash));
+        assert!(
+            bounds.relationships_truncated,
+            "omitted exact-hash rows may hide IOC pivots"
+        );
     }
 }

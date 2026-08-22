@@ -1241,6 +1241,7 @@ mod tests {
         assert_eq!(resolved, std::fs::canonicalize(&target).unwrap());
     }
 
+    #[cfg(unix)]
     #[test]
     fn ownership_lookup_path_does_not_resolve_the_final_symlink() {
         // This is the exact fix for the review's finding: a symlink's own
@@ -1525,6 +1526,7 @@ mod tests {
         parse_dpkg_search_output(&String::from_utf8_lossy(&output.stdout), path)
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_symlink_to_a_packaged_binary_does_not_inherit_its_package_identity() {
         // The review's other merge-blocking finding, reproduced live: a
@@ -1554,6 +1556,7 @@ mod tests {
         assert!(intel.product_context.package.is_none());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_new_symlink_to_an_old_file_reports_its_own_recent_timestamp() {
         // The review's merge-blocking finding, reproduced live: creates a

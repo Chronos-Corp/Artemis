@@ -5,6 +5,7 @@ mod db;
 mod file_intel;
 mod fs_browse;
 mod hashing;
+mod hunt;
 mod ingest;
 mod models;
 mod relationship_contract;
@@ -97,6 +98,7 @@ pub fn run() {
             commands::list_directory,
             commands::get_verdict,
             commands::get_file_intelligence,
+            commands::run_hunt,
             commands::sync_feeds,
             commands::yara_status,
             commands::db_status,

@@ -10,7 +10,9 @@ import type {
   FeedSyncResult,
   FileEntry,
   FileIntelligence,
+  HuntResult,
   IntelSourceFreshness,
+  TracePath,
 } from "./types";
 import { parentPath, pathSegments } from "./format";
 
@@ -29,6 +31,11 @@ function App() {
   const [fileIntelLoading, setFileIntelLoading] = useState(false);
   const [fileIntelError, setFileIntelError] = useState<string | null>(null);
 
+  const [huntResult, setHuntResult] = useState<HuntResult | null>(null);
+  const [huntingPathId, setHuntingPathId] = useState<string | null>(null);
+  const [huntSubjectPathId, setHuntSubjectPathId] = useState<string | null>(null);
+  const [huntError, setHuntError] = useState<string | null>(null);
+
   const [dbStatus, setDbStatus] = useState<DbStatus | null>(null);
   const [yaraStatus, setYaraStatus] = useState<YaraStatusWithCoverage | null>(null);
   const [syncStates, setSyncStates] = useState<IntelSourceFreshness[]>([]);
@@ -41,6 +48,7 @@ function App() {
   // Evidence attribution must follow the request that produced it, not the
   // order promises happen to resolve.
   const analysisRequestEpoch = useRef(0);
+  const huntRequestEpoch = useRef(0);
 
   const refreshStatus = useCallback(async () => {
     const [db, yara, sync] = await Promise.all([
@@ -78,6 +86,7 @@ function App() {
   useEffect(() => {
     if (currentDir) {
       analysisRequestEpoch.current += 1;
+      huntRequestEpoch.current += 1;
       loadDir(currentDir);
       setSelectedFile(null);
       setVerdict(null);
@@ -86,11 +95,16 @@ function App() {
       setFileIntel(null);
       setFileIntelError(null);
       setFileIntelLoading(false);
+      setHuntResult(null);
+      setHuntError(null);
+      setHuntingPathId(null);
+      setHuntSubjectPathId(null);
     }
   }, [currentDir, loadDir]);
 
   function handleSelectFile(entry: FileEntry) {
     const requestEpoch = ++analysisRequestEpoch.current;
+    huntRequestEpoch.current += 1;
     const isCurrentRequest = () => analysisRequestEpoch.current === requestEpoch;
 
     setSelectedFile(entry);
@@ -100,6 +114,10 @@ function App() {
     setFileIntel(null);
     setFileIntelError(null);
     setFileIntelLoading(true);
+    setHuntResult(null);
+    setHuntError(null);
+    setHuntingPathId(null);
+    setHuntSubjectPathId(null);
 
     // Independent requests, independent failure: get_file_intelligence
     // never touches the database (see its Rust doc comment), so it can
@@ -127,6 +145,38 @@ function App() {
       })
       .finally(() => {
         if (isCurrentRequest()) setFileIntelLoading(false);
+      });
+  }
+
+  function handleRunHunt(path: TracePath) {
+    if (!selectedFile || !verdict || !currentDir) return;
+
+    const requestEpoch = ++huntRequestEpoch.current;
+    const isCurrentRequest = () => huntRequestEpoch.current === requestEpoch;
+    setHuntingPathId(path.id);
+    setHuntSubjectPathId(path.id);
+    setHuntResult(null);
+    setHuntError(null);
+
+    invoke<HuntResult>("run_hunt", {
+      request: {
+        seed_path: selectedFile.path,
+        expected_seed_sha256: verdict.sha256,
+        trace_path_id: path.id,
+        scope: {
+          kind: "subtree",
+          root: currentDir,
+        },
+      },
+    })
+      .then((result) => {
+        if (isCurrentRequest()) setHuntResult(result);
+      })
+      .catch((error) => {
+        if (isCurrentRequest()) setHuntError(String(error));
+      })
+      .finally(() => {
+        if (isCurrentRequest()) setHuntingPathId(null);
       });
   }
 
@@ -202,6 +252,12 @@ function App() {
             fileIntel={fileIntel}
             fileIntelLoading={fileIntelLoading}
             fileIntelError={fileIntelError}
+            huntResult={huntResult}
+            huntingPathId={huntingPathId}
+            huntSubjectPathId={huntSubjectPathId}
+            huntError={huntError}
+            huntScopeRoot={currentDir}
+            onRunHunt={handleRunHunt}
           />
         </section>
       </main>
