@@ -1,6 +1,6 @@
 # Orion Architecture
 
-*Architecture Constitution · Orion / Artemis · Rev. 0.1 · 18 August 2026*
+*Architecture Constitution · Orion / Artemis · Rev. 0.2 · 22 August 2026*
 
 > **Artemis hunts. Orion traces. Evidence proves.**
 
@@ -239,18 +239,39 @@ exact relationship selected by the analyst.
 No migration, new database, external graph service, AI inference, Hunt Pack
 language, remote execution backend, or fleet scope is introduced by this slice.
 
-## 11. Next architecture gate
+## 11. Post-merge architecture gate
 
-The next gate is the first reusable Hunt Pack:
+PR #23 is merged on Artemis `main` at
+`31e41e98f6cc643de2a2ae7f8ac58cf60b423231`. The First Executable HUNT
+Pivot is the accepted guided-pivot baseline.
 
-1. preserve the current exact path and evidence doctrine;
-2. define an authorized, serializable execution plan for another host or data
-   source;
-3. add a typed falsification mechanism before emitting contradiction;
-4. retain scope, resource bounds, provenance, and execution auditability;
-5. measure usefulness and cost before selecting graph persistence or fleet
-   infrastructure.
+The constitutional reconciliation is recorded in
+`docs/orion-constitution-reconciliation.md`. It classifies the merged slice
+as conforming with declared partial scope and establishes the admission rules
+for future nodes, edges, evidence references, trace identities, and selectors.
 
-The local executable pivot proves that TRACE can safely drive HUNT without
-prematurely deciding fleet scale, graph persistence, or the commercial
-deployment model.
+The next Orion gate is the proposed structured Hunt Query contract in
+`docs/orion-hunt-query-contract.md`:
+
+1. preserve the current exact-path, server-reconstruction, and evidence
+   doctrine;
+2. represent analyst intent as a strict versioned data contract, not a new
+   practitioner query language;
+3. separate request, authorized execution plan, observation, evidence role,
+   and interpretation;
+4. require typed fields and operators, three-outcome evaluation, deterministic
+   bounds, corpus receipts, and fail-closed backend capability negotiation;
+5. retain provenance and partiality when query observations enter Orion;
+6. allow YARA, Sigma, SQL, KQL, EQL, osquery, and external systems to remain
+   native standards or backend languages behind explicit adapters;
+7. prohibit implementation until the proposed contract is reviewed and
+   accepted.
+
+Artemis Threat Intelligence may prepare the first governed KEV-backed Hunt
+Pack in parallel. Threat Intelligence owns the truth and qualification of that
+content. OA owns only its graph, selector, evidence-role, and execution-contract
+compatibility. Artemis Engineering owns implementation after acceptance.
+
+A dedicated graph database, cross-host execution, Retrotrace retention,
+practitioner-facing textual syntax, and commercial entitlements remain open.
+They require evidence and separate authorization.
